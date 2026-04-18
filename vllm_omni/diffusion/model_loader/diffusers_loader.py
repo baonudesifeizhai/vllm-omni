@@ -31,6 +31,9 @@ from vllm.utils.torch_utils import set_default_torch_dtype
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.hsdp import HSDPInferenceConfig
+from vllm_omni.diffusion.model_loader.checkpoint_adapters import (
+    get_checkpoint_adapter,
+)
 from vllm_omni.diffusion.model_loader.gguf_adapters import get_gguf_adapter
 from vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter import DiffusersAdapterPipeline
 from vllm_omni.diffusion.registry import initialize_model
@@ -209,7 +212,34 @@ class DiffusersPipelineLoader:
         if self.counter_before_loading_weights == 0.0:
             self.counter_before_loading_weights = time.perf_counter()
         # Apply the prefix.
-        return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
+        prefixed_weights_iterator = ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
+        if model is not None:
+            checkpoint_adapter = self._get_checkpoint_adapter(model, source, use_safetensors)
+            if checkpoint_adapter is not None:
+                return checkpoint_adapter.adapt(prefixed_weights_iterator)
+        return prefixed_weights_iterator
+
+    def _get_source_quant_config(self, source: "ComponentSource") -> object | None:
+        if self.od_config is None:
+            return None
+
+        quant_config = self.od_config.quantization_config
+        if hasattr(quant_config, "resolve"):
+            return quant_config.resolve(source.prefix.rstrip("."))
+        return quant_config
+
+    def _get_checkpoint_adapter(
+        self,
+        model: nn.Module,
+        source: "ComponentSource",
+        use_safetensors: bool,
+    ):
+        return get_checkpoint_adapter(
+            model=model,
+            source=source,
+            quant_config=self._get_source_quant_config(source),
+            use_safetensors=use_safetensors,
+        )
 
     def get_all_weights(
         self,
@@ -217,7 +247,7 @@ class DiffusersPipelineLoader:
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         sources = self._get_weight_sources(model)
         for source in sources:
-            yield from self._get_weights_iterator(source)
+            yield from self._get_weights_iterator(source, model=model)
 
     def _get_weight_sources(self, model: nn.Module) -> tuple["ComponentSource", ...]:
         return tuple(
