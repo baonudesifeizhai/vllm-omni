@@ -17,7 +17,6 @@ import requests
 from PIL import Image
 
 from tests.conftest import OmniServer, OmniServerParams, assert_image_valid
-from tests.utils import hardware_marks
 
 MODEL = "feizhai123/flux2-dev-modelopt-fp8"
 STAGE_CONFIG = str(Path(__file__).parent.parent / "stage_configs" / "flux2_dev_dit_2gpu_fp8.yaml")
@@ -72,7 +71,12 @@ def _post_image_request(server: OmniServer) -> Image.Image:
                 stage_init_timeout=900,
             ),
             id="flux2_dev_modelopt_fp8_2gpu",
-            marks=hardware_marks(res={"cuda": "H100"}, num_cards=2),
+            marks=[
+                pytest.mark.gpu,
+                pytest.mark.cuda,
+                pytest.mark.H100,
+                pytest.mark.distributed_cuda(num_cards=2),
+            ],
         )
     ],
     indirect=True,
