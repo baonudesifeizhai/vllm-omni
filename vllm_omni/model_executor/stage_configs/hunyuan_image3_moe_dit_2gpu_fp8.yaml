@@ -11,7 +11,6 @@ stage_args:
       max_batch_size: 1
     engine_args:
       model_stage: dit
-      enforce_eager: true
       trust_remote_code: true
       distributed_executor_backend: "mp"
       quantization: "fp8"
