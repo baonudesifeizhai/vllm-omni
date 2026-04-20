@@ -250,3 +250,26 @@ class ModelOptFp8CheckpointAdapter:
 
         self._check_pending_weights(state)
         self._log_adaptation_summary(state)
+
+
+def maybe_patch_modelopt_fp8_runtime(quant_config: object | None) -> None:
+    if not ModelOptFp8CheckpointAdapter._is_checkpoint_quant_config(quant_config):
+        return
+
+    from vllm.model_executor.kernels.linear.scaled_mm.flashinfer import (
+        FlashInferFP8ScaledMMLinearKernel,
+    )
+
+    if getattr(FlashInferFP8ScaledMMLinearKernel, "_vllm_omni_output_shape_patch", False):
+        return
+
+    apply_scaled_mm = FlashInferFP8ScaledMMLinearKernel.apply_scaled_mm
+
+    def apply_scaled_mm_with_output_shape(self, **kwargs):
+        return apply_scaled_mm(self, **kwargs).view(*kwargs["output_shape"])
+
+    FlashInferFP8ScaledMMLinearKernel.apply_scaled_mm = apply_scaled_mm_with_output_shape
+    FlashInferFP8ScaledMMLinearKernel._vllm_omni_output_shape_patch = True
+    logger.info_once(
+        "Patched FlashInferFP8ScaledMMLinearKernel to restore diffusion ModelOpt FP8 linear output shapes."
+    )
