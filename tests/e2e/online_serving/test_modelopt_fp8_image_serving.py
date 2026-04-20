@@ -17,7 +17,7 @@ import requests
 from PIL import Image
 
 from tests.conftest import OmniServer, OmniServerParams, assert_image_valid
-from tests.utils import hardware_test
+from tests.utils import hardware_marks
 
 MODEL = "feizhai123/flux2-dev-modelopt-fp8"
 STAGE_CONFIG = str(Path(__file__).parent.parent / "stage_configs" / "flux2_dev_dit_2gpu_fp8.yaml")
@@ -30,8 +30,6 @@ HEIGHT = 512
 NUM_INFERENCE_STEPS = 4
 TRUE_CFG_SCALE = 4.0
 SEED = 42
-
-TEST_PARAMS = [OmniServerParams(model=MODEL, stage_config_path=STAGE_CONFIG)]
 
 
 def _post_image_request(server: OmniServer) -> Image.Image:
@@ -63,8 +61,22 @@ def _post_image_request(server: OmniServer) -> Image.Image:
 
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
-@pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
+@pytest.mark.parametrize(
+    "omni_server",
+    [
+        pytest.param(
+            OmniServerParams(
+                model=MODEL,
+                stage_config_path=STAGE_CONFIG,
+                init_timeout=900,
+                stage_init_timeout=900,
+            ),
+            id="flux2_dev_modelopt_fp8_2gpu",
+            marks=hardware_marks(res={"cuda": "H100"}, num_cards=2),
+        )
+    ],
+    indirect=True,
+)
 def test_modelopt_fp8_images_api_returns_valid_image(omni_server: OmniServer) -> None:
     image = _post_image_request(omni_server)
     assert_image_valid(image, width=WIDTH, height=HEIGHT)
