@@ -7,7 +7,7 @@ import re
 import time
 from collections.abc import Generator, Iterable
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import cast
 
 import torch
 from huggingface_hub import hf_hub_download
@@ -37,9 +37,6 @@ from vllm_omni.diffusion.model_loader.checkpoint_adapters import (
 from vllm_omni.diffusion.model_loader.gguf_adapters import get_gguf_adapter
 from vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter import DiffusersAdapterPipeline
 from vllm_omni.diffusion.registry import initialize_model
-
-if TYPE_CHECKING:
-    from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 logger = init_logger(__name__)
 
@@ -176,7 +173,11 @@ class DiffusersPipelineLoader:
 
         return hf_folder, hf_weights_files, use_safetensors
 
-    def _get_weights_iterator(self, source: "ComponentSource") -> Generator[tuple[str, torch.Tensor], None, None]:
+    def _get_weights_iterator(
+        self,
+        source: "ComponentSource",
+        model: nn.Module | None = None,
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
         _, hf_weights_files, use_safetensors = self._prepare_weights(
             source.model_or_path,
@@ -295,7 +296,7 @@ class DiffusersPipelineLoader:
         """Load a model with the given configurations."""
         if load_format is None:
             load_format = "default"
-
+        self.od_config = od_config
         # CPU offload + FP8: load weights on device for FP8 quantization
         if load_device == "cpu" and od_config.quantization_config is not None:
             load_device = device.type
@@ -317,13 +318,12 @@ class DiffusersPipelineLoader:
                         model_cls = resolve_obj_by_qualname(custom_pipeline_name)
                         model = model_cls(od_config=od_config)
                     else:
-                        # 'dummy' format should not call this function at all
                         raise ValueError(f"Unknown load_format: {load_format}")
                 logger.debug("Loading weights on %s ...", load_device)
                 if load_format == "diffusers":
                     # DiffusersAdapterPipeline.load_weights() calls
-                    # DiffusionPipeline.from_pretrained() internally — it does
-                    # NOT use our native (customized) pipeline classes.
+                    # DiffusionPipeline.from_pretrained() internally; it does
+                    # not use our native customized pipeline classes.
                     cast(DiffusersAdapterPipeline, model).load_weights()
                 elif self._is_gguf_quantization(od_config):
                     self._load_weights_with_gguf(model, od_config)
@@ -475,9 +475,7 @@ class DiffusersPipelineLoader:
     def _get_model_loadable_names(self, model: nn.Module) -> set[str]:
         # Avoid model.state_dict() here because GGUF uses UninitializedParameter
         # which raises during detach(). Collect names directly.
-        names = {name for name, _ in model.named_parameters()}
-        names.update(name for name, _ in model.named_buffers())
-        return names
+        return {name for name, _ in model.named_parameters()} | {name for name, _ in model.named_buffers()}
 
     def _resolve_gguf_model_path(self, gguf_model: str, revision: str | None) -> str:
         if os.path.isfile(gguf_model):
@@ -584,9 +582,15 @@ class DiffusersPipelineLoader:
         # mapping (QKV fusion, etc.).
         if load_format == "default":
             model = initialize_model(od_config)
+        elif load_format == "diffusers":
+            from vllm_omni.diffusion.distributed.utils import get_local_device
+
+            model = DiffusersAdapterPipeline(od_config=od_config, device=get_local_device())
         elif load_format == "custom_pipeline":
             model_cls = resolve_obj_by_qualname(custom_pipeline_name)
             model = model_cls(od_config=od_config)
+        else:
+            raise ValueError(f"Unknown load_format: {load_format}")
         self.load_weights(model)
 
         # Collect all transformers to shard (some models have transformer_2 for MoE)
