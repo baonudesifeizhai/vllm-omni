@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from diffusers.models.embeddings import (
@@ -27,6 +27,9 @@ from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+
 
 class Flux2SwiGLU(nn.Module):
     """SwiGLU activation used by Flux2."""
@@ -48,6 +51,7 @@ class Flux2FeedForward(nn.Module):
         mult: float = 3.0,
         inner_dim: int | None = None,
         bias: bool = False,
+        quant_config: "QuantizationConfig | None" = None,
     ):
         super().__init__()
         if inner_dim is None:
@@ -59,6 +63,7 @@ class Flux2FeedForward(nn.Module):
             [inner_dim, inner_dim],
             bias=bias,
             return_bias=False,
+            quant_config=quant_config,
         )
         self.act_fn = Flux2SwiGLU()
         self.linear_out = RowParallelLinear(
@@ -67,6 +72,7 @@ class Flux2FeedForward(nn.Module):
             bias=bias,
             input_is_parallel=True,
             return_bias=False,
+            quant_config=quant_config,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -89,6 +95,7 @@ class Flux2Attention(nn.Module):
         eps: float = 1e-5,
         out_dim: int = None,
         elementwise_affine: bool = True,
+        quant_config: "QuantizationConfig | None" = None,
     ):
         super().__init__()
         self.head_dim = dim_head
@@ -104,6 +111,7 @@ class Flux2Attention(nn.Module):
             head_size=self.head_dim,
             total_num_heads=self.heads,
             bias=bias,
+            quant_config=quant_config,
         )
         self.query_num_heads = self.to_qkv.num_heads
         self.kv_num_heads = self.to_qkv.num_kv_heads
@@ -119,6 +127,7 @@ class Flux2Attention(nn.Module):
                     bias=out_bias,
                     input_is_parallel=True,
                     return_bias=False,
+                    quant_config=quant_config,
                 ),
                 nn.Dropout(dropout),
             ]
@@ -132,6 +141,7 @@ class Flux2Attention(nn.Module):
                 head_size=self.head_dim,
                 total_num_heads=self.heads,
                 bias=added_proj_bias,
+                quant_config=quant_config,
             )
             self.add_query_num_heads = self.add_kv_proj.num_heads
             self.add_kv_num_heads = self.add_kv_proj.num_kv_heads
@@ -141,6 +151,7 @@ class Flux2Attention(nn.Module):
                 bias=out_bias,
                 input_is_parallel=True,
                 return_bias=False,
+                quant_config=quant_config,
             )
 
         self.rope = RotaryEmbedding(is_neox_style=False)
@@ -238,6 +249,7 @@ class Flux2ParallelSelfAttention(nn.Module):
         elementwise_affine: bool = True,
         mlp_ratio: float = 4.0,
         mlp_mult_factor: int = 2,
+        quant_config: "QuantizationConfig | None" = None,
     ):
         super().__init__()
         self.head_dim = dim_head
@@ -256,6 +268,7 @@ class Flux2ParallelSelfAttention(nn.Module):
             self.inner_dim * 3 + self.mlp_hidden_dim * self.mlp_mult_factor,
             bias=bias,
             gather_output=True,
+            quant_config=quant_config,
         )
         self.mlp_act_fn = Flux2SwiGLU()
 
@@ -267,6 +280,7 @@ class Flux2ParallelSelfAttention(nn.Module):
             self.out_dim,
             bias=out_bias,
             gather_output=True,
+            quant_config=quant_config,
         )
         self.rope = RotaryEmbedding(is_neox_style=False)
         self.attn = Attention(
@@ -329,6 +343,7 @@ class Flux2SingleTransformerBlock(nn.Module):
         mlp_ratio: float = 3.0,
         eps: float = 1e-6,
         bias: bool = False,
+        quant_config: "QuantizationConfig | None" = None,
     ):
         super().__init__()
         self.norm = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
@@ -342,6 +357,7 @@ class Flux2SingleTransformerBlock(nn.Module):
             eps=eps,
             mlp_ratio=mlp_ratio,
             mlp_mult_factor=2,
+            quant_config=quant_config,
         )
 
     def forward(
@@ -389,6 +405,7 @@ class Flux2TransformerBlock(nn.Module):
         mlp_ratio: float = 3.0,
         eps: float = 1e-6,
         bias: bool = False,
+        quant_config: "QuantizationConfig | None" = None,
     ):
         super().__init__()
         self.mlp_hidden_dim = int(dim * mlp_ratio)
@@ -406,13 +423,26 @@ class Flux2TransformerBlock(nn.Module):
             added_proj_bias=bias,
             out_bias=bias,
             eps=eps,
+            quant_config=quant_config,
         )
 
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
-        self.ff = Flux2FeedForward(dim=dim, dim_out=dim, mult=mlp_ratio, bias=bias)
+        self.ff = Flux2FeedForward(
+            dim=dim,
+            dim_out=dim,
+            mult=mlp_ratio,
+            bias=bias,
+            quant_config=quant_config,
+        )
 
         self.norm2_context = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
-        self.ff_context = Flux2FeedForward(dim=dim, dim_out=dim, mult=mlp_ratio, bias=bias)
+        self.ff_context = Flux2FeedForward(
+            dim=dim,
+            dim_out=dim,
+            mult=mlp_ratio,
+            bias=bias,
+            quant_config=quant_config,
+        )
 
     def forward(
         self,
@@ -576,6 +606,7 @@ class Flux2Transformer2DModel(nn.Module):
         rope_theta: int = 2000,
         eps: float = 1e-6,
         guidance_embeds: bool = True,
+        quant_config: "QuantizationConfig | None" = None,
     ):
         super().__init__()
         self.guidance_embeds = guidance_embeds
@@ -624,6 +655,7 @@ class Flux2Transformer2DModel(nn.Module):
                     mlp_ratio=mlp_ratio,
                     eps=eps,
                     bias=False,
+                    quant_config=quant_config,
                 )
                 for _ in range(num_layers)
             ]
@@ -638,6 +670,7 @@ class Flux2Transformer2DModel(nn.Module):
                     mlp_ratio=mlp_ratio,
                     eps=eps,
                     bias=False,
+                    quant_config=quant_config,
                 )
                 for _ in range(num_single_layers)
             ]
