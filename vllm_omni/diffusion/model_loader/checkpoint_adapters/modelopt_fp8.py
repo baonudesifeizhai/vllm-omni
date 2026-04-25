@@ -252,48 +252,24 @@ class ModelOptFp8CheckpointAdapter:
         self._log_adaptation_summary(state)
 
 
-def _force_modelopt_fp8_cutlass_linear_kernel() -> None:
+def maybe_patch_modelopt_fp8_runtime(quant_config: object | None) -> None:
+    if not ModelOptFp8CheckpointAdapter._is_checkpoint_quant_config(quant_config):
+        return
+
     import vllm.model_executor.layers.quantization.modelopt as modelopt
     from vllm.model_executor.kernels.linear.scaled_mm.cutlass import (
         CutlassFP8ScaledMMLinearKernel,
     )
 
-    if getattr(modelopt, "_vllm_omni_force_cutlass_fp8_linear", False):
-        return
+    if not getattr(modelopt, "_vllm_omni_force_cutlass_fp8_linear", False):
+        init_fp8_linear_kernel = modelopt.init_fp8_linear_kernel
 
-    init_fp8_linear_kernel = modelopt.init_fp8_linear_kernel
+        def init_fp8_linear_kernel_with_cutlass(*args, **kwargs):
+            # TODO: Remove this once vLLM's ModelOpt FP8 path is stable for
+            # diffusion workloads without forcing the backend.
+            kwargs["force_kernel"] = CutlassFP8ScaledMMLinearKernel
+            return init_fp8_linear_kernel(*args, **kwargs)
 
-    def init_fp8_linear_kernel_with_cutlass(*args, **kwargs):
-        # TODO: Remove this forced backend once vLLM's ModelOpt FP8 kernel
-        # selector is verified to be stable for diffusion workloads.
-        kwargs["force_kernel"] = CutlassFP8ScaledMMLinearKernel
-        return init_fp8_linear_kernel(*args, **kwargs)
-
-    modelopt.init_fp8_linear_kernel = init_fp8_linear_kernel_with_cutlass
-    modelopt._vllm_omni_force_cutlass_fp8_linear = True
-    logger.info_once("Forced vLLM ModelOpt FP8 linear kernel backend to CUTLASS.")
-
-
-def maybe_patch_modelopt_fp8_runtime(quant_config: object | None) -> None:
-    if not ModelOptFp8CheckpointAdapter._is_checkpoint_quant_config(quant_config):
-        return
-
-    _force_modelopt_fp8_cutlass_linear_kernel()
-
-    from vllm.model_executor.kernels.linear.scaled_mm.flashinfer import (
-        FlashInferFP8ScaledMMLinearKernel,
-    )
-
-    if getattr(FlashInferFP8ScaledMMLinearKernel, "_vllm_omni_output_shape_patch", False):
-        return
-
-    apply_scaled_mm = FlashInferFP8ScaledMMLinearKernel.apply_scaled_mm
-
-    def apply_scaled_mm_with_output_shape(self, **kwargs):
-        return apply_scaled_mm(self, **kwargs).view(*kwargs["output_shape"])
-
-    FlashInferFP8ScaledMMLinearKernel.apply_scaled_mm = apply_scaled_mm_with_output_shape
-    FlashInferFP8ScaledMMLinearKernel._vllm_omni_output_shape_patch = True
-    logger.info_once(
-        "Patched FlashInferFP8ScaledMMLinearKernel to restore diffusion ModelOpt FP8 linear output shapes."
-    )
+        modelopt.init_fp8_linear_kernel = init_fp8_linear_kernel_with_cutlass
+        modelopt._vllm_omni_force_cutlass_fp8_linear = True
+        logger.info_once("Forced vLLM ModelOpt FP8 linear kernel backend to CUTLASS.")
