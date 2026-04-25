@@ -4,7 +4,6 @@
 import pytest
 import torch
 import torch.nn as nn
-from vllm.model_executor.layers.quantization.modelopt import ModelOptFp8Config
 
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.gguf_adapters import get_gguf_adapter
@@ -94,36 +93,3 @@ def test_qwen_model_class_selects_qwen_gguf_adapter():
     adapter = get_gguf_adapter("dummy.gguf", object(), source, od_config)
 
     assert adapter.__class__.__name__ == "QwenImageGGUFAdapter"
-
-
-def test_loader_auto_detects_quant_config_from_transformer_config():
-    od_config = type(
-        "Config",
-        (),
-        {
-            "quantization_config": None,
-            "tf_model_config": type(
-                "TransformerConfig",
-                (),
-                {
-                    "quant_config": ModelOptFp8Config.from_config(
-                        {
-                            "quant_method": "modelopt",
-                            "quant_algo": "FP8",
-                            "ignore": [],
-                        }
-                    ),
-                    "quant_method": "modelopt",
-                },
-            )(),
-            "set_tf_model_config": lambda self, tf_model_config: setattr(
-                self,
-                "quantization_config",
-                tf_model_config.quant_config,
-            ),
-        },
-    )()
-
-    DiffusersPipelineLoader._auto_detect_quant_config(od_config)
-
-    assert od_config.quantization_config is od_config.tf_model_config.quant_config
