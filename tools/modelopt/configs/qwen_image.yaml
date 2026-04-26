@@ -1,0 +1,72 @@
+# Legacy qwen-image uses the older static FP8 ModelOpt profile and retains
+# pooled_projection_dim in transformer/config.json.
+# Point weights_src_dir at the quantized transformer directory produced by your
+# external ModelOpt run.
+name: qwen_image_modelopt_fp8
+
+vars:
+  model_dir: /root/zdj/models/qwen-image
+  output_dir: /tmp/qwen-image-modelopt-fp8
+  weights_src_dir: /path/to/modelopt-output/transformer
+
+steps:
+  - type: assemble
+    name: assemble_qwen_image_modelopt_fp8
+    skeleton_dir: "{model_dir}"
+    output_dir: "{output_dir}"
+    asset_mode: symlink
+    copy:
+      root_files:
+        - model_index.json
+      dirs:
+        - tokenizer
+        - text_encoder
+        - vae
+        - scheduler
+    components:
+      - target_subdir: transformer
+        config_src: "{model_dir}/transformer/config.json"
+        weights_src: "{weights_src_dir}"
+        config_updates:
+          _name_or_path: "{model_dir}/transformer"
+          _diffusers_version: "0.37.1"
+          pooled_projection_dim: 768
+          quantization_config:
+            config_groups:
+              group_0:
+                input_activations:
+                  dynamic: false
+                  num_bits: 8
+                  type: float
+                weights:
+                  dynamic: false
+                  num_bits: 8
+                  type: float
+                targets:
+                  - Linear
+            ignore:
+              - image_rope_prepare*
+              - img_in
+              - modulate_index_prepare*
+              - norm_out*
+              - pos_embed*
+              - proj_out
+              - time_text_embed*
+              - timestep_embedder*
+              - transformer_blocks.*.img_mod*
+              - transformer_blocks.*.txt_mod*
+              - txt_in
+              - txt_norm
+            producer:
+              name: modelopt
+            quant_algo: FP8
+            quant_method: modelopt
+
+  - type: verify
+    name: verify_qwen_image_modelopt_fp8
+    checks:
+      - exists: "{output_dir}/model_index.json"
+      - exists: "{output_dir}/transformer/config.json"
+      - any_exists:
+          - "{output_dir}/transformer/diffusion_pytorch_model.safetensors"
+          - "{output_dir}/transformer/diffusion_pytorch_model.safetensors.index.json"

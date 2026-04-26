@@ -1,0 +1,93 @@
+# Example config showing how to materialize a builtin NVIDIA ModelOpt recipe
+# before running your own quantization command.
+#
+# Typical flow:
+# 1. modelopt_recipe step writes a resolved recipe YAML to recipe_path
+# 2. your own "run" step consumes recipe_path and produces quantized weights
+# 3. assemble + verify build the final diffusers-style directory
+name: qwen_image_2512_modelopt_fp8_dynamic_with_recipe
+
+vars:
+  model_dir: /root/zdj/models/qwen-image-2512
+  output_dir: /tmp/qwen-image-2512-modelopt-fp8-dynamic-all
+  work_dir: /tmp/modelopt_qwen_image_2512
+  recipe_path: "{work_dir}/modelopt_recipe.yaml"
+  weights_src_dir: /path/to/modelopt-output/transformer
+
+steps:
+  - type: modelopt_recipe
+    name: write_builtin_fp8_recipe
+    recipe: general/ptq/fp8_default-fp8_kv.yml
+    output_path: "{recipe_path}"
+    overrides:
+      metadata:
+        description: Qwen-Image-2512 example recipe for vLLM-Omni conversion
+
+  # Add your own quantization command here when the exact ModelOpt entrypoint is
+  # decided. The command can reference {recipe_path} and should write the
+  # quantized transformer weights into {weights_src_dir}.
+  #
+  # - type: run
+  #   name: quantize_transformer
+  #   command:
+  #     - /root/zdj/vllm/.venv/bin/python
+  #     - /path/to/your_modelopt_quantize.py
+  #     - --recipe
+  #     - "{recipe_path}"
+  #     - --model
+  #     - "{model_dir}/transformer"
+  #     - --output-dir
+  #     - "{weights_src_dir}"
+
+  - type: assemble
+    name: assemble_qwen_image_2512_modelopt_fp8
+    skeleton_dir: "{model_dir}"
+    output_dir: "{output_dir}"
+    asset_mode: symlink
+    copy:
+      root_files:
+        - model_index.json
+      dirs:
+        - tokenizer
+        - text_encoder
+        - vae
+        - scheduler
+    components:
+      - target_subdir: transformer
+        config_src: "{model_dir}/transformer/config.json"
+        weights_src: "{weights_src_dir}"
+        config_updates:
+          _name_or_path: "{model_dir}/transformer"
+          _diffusers_version: "0.37.1"
+          quantization_config:
+            config_groups:
+              group_0:
+                input_activations:
+                  dynamic: true
+                  num_bits: 8
+                  strategy: token
+                  type: float
+                weights:
+                  dynamic: false
+                  num_bits: 8
+                  strategy: channel
+                  type: float
+                targets:
+                  - Linear
+            ignore: []
+            producer:
+              name: modelopt
+              version: manual-fp8-per-channel-per-token
+            quant_algo: FP8_PER_CHANNEL_PER_TOKEN
+            quant_method: modelopt
+            source_profile: all-linear
+
+  - type: verify
+    name: verify_qwen_image_2512_modelopt_fp8
+    checks:
+      - exists: "{output_dir}/model_index.json"
+      - exists: "{output_dir}/transformer/config.json"
+      - exists: "{recipe_path}"
+      - any_exists:
+          - "{output_dir}/transformer/diffusion_pytorch_model.safetensors"
+          - "{output_dir}/transformer/diffusion_pytorch_model.safetensors.index.json"
