@@ -10,7 +10,6 @@ through Omni, accepts an Images API request, and returns a decodable image.
 
 import base64
 from io import BytesIO
-from pathlib import Path
 
 import pytest
 import requests
@@ -19,7 +18,6 @@ from PIL import Image
 from tests.conftest import OmniServer, OmniServerParams, assert_image_valid
 
 MODEL = "feizhai123/flux2-dev-modelopt-fp8"
-STAGE_CONFIG = str(Path(__file__).parent.parent / "stage_configs" / "flux2_dev_dit_2gpu_fp8.yaml")
 PROMPT = (
     "An art deco locomotive crossing a high bridge above a misty canyon at sunrise, cinematic light, highly detailed."
 )
@@ -66,7 +64,13 @@ def _post_image_request(server: OmniServer) -> Image.Image:
         pytest.param(
             OmniServerParams(
                 model=MODEL,
-                stage_config_path=STAGE_CONFIG,
+                server_args=[
+                    "--model-class-name",
+                    "Flux2Pipeline",
+                    "--tensor-parallel-size",
+                    "2",
+                    "--trust-remote-code",
+                ],
                 init_timeout=900,
                 stage_init_timeout=900,
             ),

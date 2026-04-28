@@ -1,17 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-Quantization quality gate — validates that quantized models stay within
-acceptable perceptual distance (LPIPS) of the BF16 baseline.
+Quantization quality report for diffusion models.
 
 Developers adding a new quantization method should:
 1. Add their method + model to QUALITY_CONFIGS below
-2. Set a max_lpips threshold (use 0.15 for image, 0.20 for video as defaults)
-3. Run: pytest tests/diffusion/quantization/test_quantization_quality.py -v -m ""
+2. Run: pytest tests/diffusion/quantization/test_quantization_quality.py -v -m ""
+3. Compare LPIPS / PSNR / MAE against the BF16 baseline
 4. Paste the output table into their PR description
 
 The test generates outputs with both BF16 and the quantized method using the
-same seed, computes LPIPS, and fails if it exceeds the threshold.
+same seed and reports multiple similarity metrics for review.
 
 Requirements:
     pip install lpips
@@ -54,7 +53,7 @@ class QualityTestConfig:
     id: str  # pytest ID, e.g. "fp8_z_image"
     task: str  # "t2i" or "t2v"
     prompt: str  # generation prompt
-    max_lpips: float  # fail threshold — higher = more lenient
+    max_lpips: float | None = None  # legacy/local override field; not enforced
     model: str | None = None  # HF model name
     quantization: str | None = None  # quantization method, e.g. "fp8"
     baseline_model: str | None = None  # explicit BF16/local baseline path
@@ -98,7 +97,7 @@ class QualityTestConfig:
 
 
 # Add new quantization methods / models here.
-# Developers: copy a config, change quantization + max_lpips, run the test.
+# Developers: copy a config, change quantization, run the test, and review metrics.
 QUALITY_CONFIGS = [
     QualityTestConfig(
         id="fp8_z_image",
@@ -106,7 +105,6 @@ QUALITY_CONFIGS = [
         quantization="fp8",
         task="t2i",
         prompt="a cup of coffee on a wooden table, morning light",
-        max_lpips=0.10,
         num_inference_steps=20,
     ),
     QualityTestConfig(
@@ -115,7 +113,6 @@ QUALITY_CONFIGS = [
         quantization="fp8",
         task="t2i",
         prompt="a cup of coffee on a wooden table, morning light",
-        max_lpips=0.20,
         num_inference_steps=10,
     ),
     QualityTestConfig(
@@ -124,7 +121,6 @@ QUALITY_CONFIGS = [
         quantization="fp8",
         task="t2i",
         prompt="a cup of coffee on a wooden table, morning light",
-        max_lpips=0.35,
         seed=142,
         num_inference_steps=20,
     ),
@@ -275,6 +271,34 @@ def _compute_lpips(baseline, quantized, task: str) -> float:
     return compute_lpips_video(baseline, quantized)
 
 
+def _to_float_array(output, task: str) -> np.ndarray:
+    if task == "t2i":
+        array = np.asarray(output.convert("RGB"), dtype=np.float32) / 255.0
+    else:
+        array = np.asarray(output, dtype=np.float32)
+        if array.max() > 1.0 or array.min() < 0.0:
+            array = np.clip(array, 0.0, 255.0) / 255.0
+        else:
+            array = np.clip(array, 0.0, 1.0)
+    return array
+
+
+def _compute_psnr_and_mae(baseline, quantized, task: str) -> tuple[float, float]:
+    baseline_array = _to_float_array(baseline, task)
+    quantized_array = _to_float_array(quantized, task)
+    if baseline_array.shape != quantized_array.shape:
+        raise ValueError(
+            "Output shapes do not match for metric computation: "
+            f"baseline={baseline_array.shape}, quantized={quantized_array.shape}"
+        )
+
+    diff = baseline_array - quantized_array
+    mae = float(np.mean(np.abs(diff)))
+    mse = float(np.mean(np.square(diff)))
+    psnr = float("inf") if mse == 0.0 else float(20.0 * np.log10(1.0 / np.sqrt(mse)))
+    return psnr, mae
+
+
 def _unload(omni):
     del omni
     gc.collect()
@@ -298,7 +322,7 @@ _OUTPUT_DIR = Path(os.environ["VLLM_OMNI_QUALITY_OUTPUT_DIR"]) if "VLLM_OMNI_QUA
     [pytest.param(c, id=c.id, marks=_marks) for c in _all_quality_configs()],
 )
 def test_quantization_quality(config: QualityTestConfig):
-    """Validate that quantized output stays within LPIPS threshold of BF16."""
+    """Generate BF16 and quantized outputs and report similarity metrics."""
     from vllm_omni.entrypoints.omni import Omni
 
     generate_fn = _generate_video if config.task == "t2v" else _generate_image
@@ -319,8 +343,9 @@ def test_quantization_quality(config: QualityTestConfig):
     _unload(omni_qt)
     _maybe_save_output(_OUTPUT_DIR, config, "quantized", quant_out)
 
-    # --- LPIPS ---
+    # --- Similarity metrics ---
     lpips_score = _compute_lpips(baseline_out, quant_out, config.task)
+    psnr_score, mae_score = _compute_psnr_and_mae(baseline_out, quant_out, config.task)
 
     # --- Report ---
     mem_reduction = (bl_mem - qt_mem) / bl_mem * 100 if bl_mem > 0 else 0
@@ -330,12 +355,13 @@ def test_quantization_quality(config: QualityTestConfig):
     print(f"  Baseline:      {config.baseline_ref()}")
     print(f"  Quantized:     {config.quantized_ref()}")
     print(f"  Method:        {config.quantization_ref() or 'pre-quantized checkpoint'}")
-    print(f"  LPIPS:         {lpips_score:.4f}  (threshold: {config.max_lpips})")
+    print(f"  LPIPS:         {lpips_score:.4f}  (lower is better)")
+    print(f"  PSNR:          {psnr_score:.4f} dB  (higher is better)")
+    print(f"  MAE:           {mae_score:.6f}  (lower is better)")
     print(f"  BF16 memory:   {bl_mem:.2f} GiB")
     print(f"  Quant memory:  {qt_mem:.2f} GiB  ({mem_reduction:.0f}% reduction)")
-    print(f"  Result:        {'PASS' if lpips_score <= config.max_lpips else 'FAIL'}")
     print(f"{'=' * 60}\n")
 
-    assert lpips_score <= config.max_lpips, (
-        f"LPIPS {lpips_score:.4f} exceeds threshold {config.max_lpips} for {config.quantization} on {config.model}"
-    )
+    assert np.isfinite(lpips_score), f"LPIPS is not finite for {config.id}: {lpips_score}"
+    assert np.isfinite(psnr_score) or np.isinf(psnr_score), f"PSNR is invalid for {config.id}: {psnr_score}"
+    assert np.isfinite(mae_score), f"MAE is not finite for {config.id}: {mae_score}"

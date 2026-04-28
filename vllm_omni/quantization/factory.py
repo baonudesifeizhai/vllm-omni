@@ -68,14 +68,10 @@ SUPPORTED_QUANTIZATION_METHODS: list[str] = list(dict.fromkeys(QUANTIZATION_METH
 
 _MODEL_OPT_METHODS = {
     "modelopt",
-    "modelopt_fp4",
-    "modelopt_mxfp8",
-    "modelopt_mixed",
 }
 _MODEL_OPT_FP8_ALGOS = {
     "FP8",
     "FP8_PER_CHANNEL_PER_TOKEN",
-    "FP8_PB_WO",
 }
 
 
@@ -84,28 +80,31 @@ def _normalize_method_name(method: Any) -> str:
 
 
 def _detect_modelopt_method(config: Mapping[str, Any]) -> str | None:
+    quantization = config.get("quantization")
+    if isinstance(quantization, Mapping):
+        quant_algo = str(quantization.get("quant_algo", "")).upper()
+    else:
+        quant_algo = str(config.get("quant_algo", "")).upper()
+
     method = config.get("method", config.get("quant_method"))
-    if method is not None:
-        normalized_method = _normalize_method_name(method)
-        if normalized_method in _MODEL_OPT_METHODS:
-            return normalized_method
+    normalized_method = _normalize_method_name(method) if method is not None else None
 
     producer = config.get("producer")
-    if isinstance(producer, Mapping) and str(producer.get("name", "")).lower() == "modelopt":
-        quantization = config.get("quantization")
-        if isinstance(quantization, Mapping):
-            quant_algo = str(quantization.get("quant_algo", "")).upper()
-        else:
-            quant_algo = str(config.get("quant_algo", "")).upper()
+    is_modelopt_config = normalized_method in _MODEL_OPT_METHODS or (
+        isinstance(producer, Mapping) and str(producer.get("name", "")).lower() == "modelopt"
+    )
 
+    if not is_modelopt_config:
+        return None
+
+    if quant_algo:
         if quant_algo in _MODEL_OPT_FP8_ALGOS:
             return "modelopt"
-        if quant_algo == "NVFP4":
-            return "modelopt_fp4"
-        if quant_algo == "MXFP8":
-            return "modelopt_mxfp8"
-        if quant_algo == "MIXED_PRECISION":
-            return "modelopt_mixed"
+        return None
+
+    if method is not None:
+        if normalized_method in _MODEL_OPT_METHODS:
+            return normalized_method
 
     return None
 
