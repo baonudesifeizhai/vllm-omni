@@ -66,6 +66,15 @@ def apply_rotary_emb_mindiesd(
 
 
 def _ensure_batch_dim(x: torch.Tensor) -> tuple[torch.Tensor, bool]:
+    # Upstream fused rotary kernels are called through
+    # ``vllm.model_executor.layers.rotary_embedding.common.ApplyRotaryEmb``
+    # in upstream vLLM (see
+    # ``/root/zdj/vllm/vllm/model_executor/layers/rotary_embedding/common.py``),
+    # which documents ``x`` as ``[batch_size, seq_len, nheads, headdim]`` and
+    # forwards to ``vllm.vllm_flash_attn.layers.rotary.apply_rotary_emb`` in
+    # ``/root/zdj/vllm/vllm/vllm_flash_attn/layers/rotary.py``. Some omni
+    # diffusion call sites pass ``[seq_len, nheads, headdim]`` instead, so
+    # normalize to 4D here before entering the upstream fused path.
     if x.dim() == 3:
         return x.unsqueeze(0), True
     return x, False
