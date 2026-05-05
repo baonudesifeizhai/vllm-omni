@@ -14,6 +14,7 @@ stage_args:
       trust_remote_code: true
       distributed_executor_backend: "mp"
       quantization: "fp8"
+      force_cutlass_fp8: true
       parallel_config:
         tensor_parallel_size: 2
         enable_expert_parallel: true

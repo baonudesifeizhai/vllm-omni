@@ -511,6 +511,7 @@ class OmniDiffusionConfig:
     # str is resolved to {"method": <str>} internally.
     # Per-component: {"transformer": {"method": "fp8"}, "vae": None}
     quantization_config: str | QuantizationConfig | dict[str, Any] | None = None
+    force_cutlass_fp8: bool = False
 
     # Diffusion pipeline Profiling config
     enable_diffusion_pipeline_profiler: bool = False

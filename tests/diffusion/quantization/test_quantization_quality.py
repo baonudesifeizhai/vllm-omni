@@ -1,16 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-Quantization quality report for diffusion models.
+Quantization quality gate for diffusion models.
 
 Developers adding a new quantization method should:
 1. Add their method + model to QUALITY_CONFIGS below
-2. Run: pytest tests/diffusion/quantization/test_quantization_quality.py -v -m ""
-3. Compare LPIPS / PSNR / MAE against the BF16 baseline
+2. Set a max_lpips threshold (use 0.15 for image, 0.20 for video as defaults)
+3. Run: pytest tests/diffusion/quantization/test_quantization_quality.py -v -m ""
 4. Paste the output table into their PR description
 
 The test generates outputs with both BF16 and the quantized method using the
-same seed and reports multiple similarity metrics for review.
+same seed, computes similarity metrics, and fails if LPIPS exceeds the threshold.
 
 Requirements:
     pip install lpips
@@ -53,7 +53,7 @@ class QualityTestConfig:
     id: str  # pytest ID, e.g. "fp8_z_image"
     task: str  # "t2i" or "t2v"
     prompt: str  # generation prompt
-    max_lpips: float | None = None  # legacy/local override field; not enforced
+    max_lpips: float  # fail threshold — higher = more lenient
     model: str | None = None  # HF model name
     quantization: str | None = None  # quantization method, e.g. "fp8"
     baseline_model: str | None = None  # explicit BF16/local baseline path
@@ -97,7 +97,7 @@ class QualityTestConfig:
 
 
 # Add new quantization methods / models here.
-# Developers: copy a config, change quantization, run the test, and review metrics.
+# Developers: copy a config, change quantization + max_lpips, run the test.
 QUALITY_CONFIGS = [
     QualityTestConfig(
         id="fp8_z_image",
@@ -105,6 +105,7 @@ QUALITY_CONFIGS = [
         quantization="fp8",
         task="t2i",
         prompt="a cup of coffee on a wooden table, morning light",
+        max_lpips=0.10,
         num_inference_steps=20,
     ),
     QualityTestConfig(
@@ -113,6 +114,7 @@ QUALITY_CONFIGS = [
         quantization="fp8",
         task="t2i",
         prompt="a cup of coffee on a wooden table, morning light",
+        max_lpips=0.20,
         num_inference_steps=10,
     ),
     QualityTestConfig(
@@ -121,6 +123,7 @@ QUALITY_CONFIGS = [
         quantization="fp8",
         task="t2i",
         prompt="a cup of coffee on a wooden table, morning light",
+        max_lpips=0.35,
         seed=142,
         num_inference_steps=20,
     ),
@@ -322,7 +325,7 @@ _OUTPUT_DIR = Path(os.environ["VLLM_OMNI_QUALITY_OUTPUT_DIR"]) if "VLLM_OMNI_QUA
     [pytest.param(c, id=c.id, marks=_marks) for c in _all_quality_configs()],
 )
 def test_quantization_quality(config: QualityTestConfig):
-    """Generate BF16 and quantized outputs and report similarity metrics."""
+    """Validate that quantized output stays within LPIPS threshold of BF16."""
     from vllm_omni.entrypoints.omni import Omni
 
     generate_fn = _generate_video if config.task == "t2v" else _generate_image
@@ -355,13 +358,18 @@ def test_quantization_quality(config: QualityTestConfig):
     print(f"  Baseline:      {config.baseline_ref()}")
     print(f"  Quantized:     {config.quantized_ref()}")
     print(f"  Method:        {config.quantization_ref() or 'pre-quantized checkpoint'}")
-    print(f"  LPIPS:         {lpips_score:.4f}  (lower is better)")
+    print(f"  LPIPS:         {lpips_score:.4f}  (threshold: {config.max_lpips})")
     print(f"  PSNR:          {psnr_score:.4f} dB  (higher is better)")
     print(f"  MAE:           {mae_score:.6f}  (lower is better)")
     print(f"  BF16 memory:   {bl_mem:.2f} GiB")
     print(f"  Quant memory:  {qt_mem:.2f} GiB  ({mem_reduction:.0f}% reduction)")
+    print(f"  Result:        {'PASS' if lpips_score <= config.max_lpips else 'FAIL'}")
     print(f"{'=' * 60}\n")
 
     assert np.isfinite(lpips_score), f"LPIPS is not finite for {config.id}: {lpips_score}"
     assert np.isfinite(psnr_score) or np.isinf(psnr_score), f"PSNR is invalid for {config.id}: {psnr_score}"
     assert np.isfinite(mae_score), f"MAE is not finite for {config.id}: {mae_score}"
+    assert lpips_score <= config.max_lpips, (
+        f"LPIPS {lpips_score:.4f} exceeds threshold {config.max_lpips} "
+        f"for {config.quantization_ref() or 'pre-quantized checkpoint'} on {config.quantized_ref()}"
+    )

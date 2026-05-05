@@ -11,6 +11,7 @@ stage_args:
       model_stage: dit
       model_class_name: QwenImagePipeline
       max_num_seqs: 1
+      force_cutlass_fp8: true
       trust_remote_code: true
       distributed_executor_backend: "mp"
       parallel_config:

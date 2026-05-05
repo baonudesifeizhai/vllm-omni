@@ -41,9 +41,6 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.ipc import pack_diffusion_output_shm
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
-from vllm_omni.diffusion.model_loader.checkpoint_adapters.modelopt_fp8 import (
-    maybe_patch_modelopt_fp8_runtime,
-)
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
@@ -92,6 +89,63 @@ def _make_diffusion_vllm_model_config(od_config: OmniDiffusionConfig) -> _Diffus
     )
 
 
+def _apply_force_cutlass_fp8_config(quant_config: object | None) -> None:
+    from vllm.model_executor.kernels.linear import (
+        CutlassFP8ScaledMMLinearKernel,
+        init_fp8_linear_kernel,
+    )
+    from vllm.model_executor.layers.quantization import modelopt as vllm_modelopt
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kFp8DynamicTokenSym,
+        kFp8StaticTensorSym,
+        kFp8StaticTokenSym,
+    )
+
+    def make_linear_method_cls(base_cls: type, activation_quant_key: Any, weight_quant_key: Any) -> type:
+        class CutlassModelOptFp8LinearMethod(base_cls):  # type: ignore[valid-type, misc]
+            def create_weights(self, layer, *args: Any, **kwargs: Any) -> None:
+                super().create_weights(layer, *args, **kwargs)
+                self.fp8_linear = init_fp8_linear_kernel(
+                    activation_quant_key=activation_quant_key,
+                    weight_quant_key=weight_quant_key,
+                    weight_shape=layer.weight.shape,
+                    input_dtype=self.input_dtype,
+                    out_dtype=self.out_dtype,
+                    force_kernel=CutlassFP8ScaledMMLinearKernel,
+                    module_name=self.__class__.__name__,
+                )
+
+        CutlassModelOptFp8LinearMethod.__name__ = f"Cutlass{base_cls.__name__}"
+        return CutlassModelOptFp8LinearMethod
+
+    linear_method_cls = getattr(quant_config, "LinearMethodCls", None)
+    quant_keys_by_cls = {
+        vllm_modelopt.ModelOptFp8LinearMethod: (
+            kFp8StaticTensorSym,
+            kFp8StaticTensorSym,
+        ),
+        vllm_modelopt.ModelOptFp8PcPtLinearMethod: (
+            kFp8DynamicTokenSym,
+            kFp8StaticTokenSym,
+        ),
+    }
+    quant_keys = quant_keys_by_cls.get(linear_method_cls)
+    if quant_keys is None:
+        return
+
+    from vllm.platforms import current_platform
+
+    if not (current_platform.is_cuda() and current_platform.has_device_capability(89)):
+        return
+
+    quant_config.LinearMethodCls = make_linear_method_cls(
+        linear_method_cls,
+        quant_keys[0],
+        quant_keys[1],
+    )
+    logger.info("Using CUTLASS FP8 linear kernels for this ModelOpt FP8 diffusion stage.")
+
+
 class DiffusionWorker:
     """
     A worker that manages GPU infrastructure and delegates to the model runner.
@@ -120,9 +174,10 @@ class DiffusionWorker:
         self.model_runner: DiffusionModelRunner | None = None
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
         self.lora_manager: DiffusionLoRAManager | None = None
-        maybe_patch_modelopt_fp8_runtime(self.od_config.quantization_config)
         self.stage_id = getattr(od_config, "stage_id", 0)
         self.init_device()
+        if getattr(self.od_config, "force_cutlass_fp8", False):
+            _apply_force_cutlass_fp8_config(self.od_config.quantization_config)
         # Create model runner
         self.model_runner = DiffusionModelRunner(
             vllm_config=self.vllm_config,

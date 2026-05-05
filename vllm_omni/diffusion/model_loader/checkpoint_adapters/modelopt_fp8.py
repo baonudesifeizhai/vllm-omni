@@ -151,10 +151,9 @@ class ModelOptFp8CheckpointAdapter:
         if scale_name is None or scale_name not in state.scale_tensors:
             raise ValueError(f"Missing ModelOpt FP8 weight_scale for full-precision target weight {name!r}")
 
-        weight = loaded_weight.to(dtype=torch.float32)
-        scale = state.scale_tensors[scale_name].to(dtype=torch.float32, device=weight.device)
+        scale = state.scale_tensors[scale_name].to(dtype=target_dtype, device=loaded_weight.device)
         scale = self._reshape_weight_scale(scale, loaded_weight.shape)
-        return (weight * scale).to(dtype=target_dtype)
+        return loaded_weight.to(dtype=target_dtype) * scale
 
     def _flush_pending_weights(
         self,
@@ -250,26 +249,3 @@ class ModelOptFp8CheckpointAdapter:
 
         self._check_pending_weights(state)
         self._log_adaptation_summary(state)
-
-
-def maybe_patch_modelopt_fp8_runtime(quant_config: object | None) -> None:
-    if not ModelOptFp8CheckpointAdapter._is_checkpoint_quant_config(quant_config):
-        return
-
-    import vllm.model_executor.layers.quantization.modelopt as modelopt
-    from vllm.model_executor.kernels.linear.scaled_mm.cutlass import (
-        CutlassFP8ScaledMMLinearKernel,
-    )
-
-    if not getattr(modelopt, "_vllm_omni_force_cutlass_fp8_linear", False):
-        init_fp8_linear_kernel = modelopt.init_fp8_linear_kernel
-
-        def init_fp8_linear_kernel_with_cutlass(*args, **kwargs):
-            # TODO: Remove this once vLLM's ModelOpt FP8 path is stable for
-            # diffusion workloads without forcing the backend.
-            kwargs["force_kernel"] = CutlassFP8ScaledMMLinearKernel
-            return init_fp8_linear_kernel(*args, **kwargs)
-
-        modelopt.init_fp8_linear_kernel = init_fp8_linear_kernel_with_cutlass
-        modelopt._vllm_omni_force_cutlass_fp8_linear = True
-        logger.info_once("Forced vLLM ModelOpt FP8 linear kernel backend to CUTLASS.")
