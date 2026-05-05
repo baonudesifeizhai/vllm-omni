@@ -131,7 +131,7 @@ class HunyuanModel(HunYuanModel):
         if _is_moe(self.config):
             # Params for weights, fp8 weight scales, fp8 activation scales
             # (param_name, weight_name, expert_id, shard_id)
-            fused_moe_expert_mapping = FusedMoE.make_expert_params_mapping(
+            fused_moe_expert_mapping = fused_moe_make_expert_params_mapping(
                 model=self,
                 ckpt_gate_proj_name="gate_proj",
                 ckpt_down_proj_name="down_proj",
