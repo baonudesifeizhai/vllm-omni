@@ -11,8 +11,8 @@ to DiffusionModelRunner.
 import gc
 import multiprocessing as mp
 import os
-from collections.abc import Iterable
-from contextlib import AbstractContextManager, nullcontext
+from collections.abc import Iterable, Iterator
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -89,66 +89,35 @@ def _make_diffusion_vllm_model_config(od_config: OmniDiffusionConfig) -> _Diffus
     )
 
 
-def _apply_force_cutlass_fp8_config(quant_config: object | None) -> None:
-    from vllm.model_executor.kernels.linear import (
-        CutlassFP8ScaledMMLinearKernel,
-        init_fp8_linear_kernel,
-    )
+@contextmanager
+def _force_cutlass_fp8_linear_kernel(quant_config: object | None) -> Iterator[None]:
+    from vllm.model_executor.kernels.linear import CutlassFP8ScaledMMLinearKernel
     from vllm.model_executor.layers.quantization import modelopt as vllm_modelopt
-    from vllm.model_executor.layers.quantization.utils.quant_utils import (
-        kFp8DynamicTokenSym,
-        kFp8StaticTensorSym,
-        kFp8StaticTokenSym,
-    )
-
-    def make_linear_method_cls(base_cls: type, activation_quant_key: Any, weight_quant_key: Any) -> type:
-        def create_weights(self, layer, *args: Any, **kwargs: Any) -> None:
-            base_cls.create_weights(self, layer, *args, **kwargs)
-            self.fp8_linear = init_fp8_linear_kernel(
-                activation_quant_key=activation_quant_key,
-                weight_quant_key=weight_quant_key,
-                weight_shape=layer.weight.shape,
-                input_dtype=self.input_dtype,
-                out_dtype=self.out_dtype,
-                force_kernel=CutlassFP8ScaledMMLinearKernel,
-                module_name=self.__class__.__name__,
-            )
-
-        return type(
-            f"Cutlass{base_cls.__name__}",
-            (base_cls,),
-            {
-                "__module__": base_cls.__module__,
-                "create_weights": create_weights,
-            },
-        )
-
-    linear_method_cls = getattr(quant_config, "LinearMethodCls", None)
-    quant_keys_by_cls = {
-        vllm_modelopt.ModelOptFp8LinearMethod: (
-            kFp8StaticTensorSym,
-            kFp8StaticTensorSym,
-        ),
-        vllm_modelopt.ModelOptFp8PcPtLinearMethod: (
-            kFp8DynamicTokenSym,
-            kFp8StaticTokenSym,
-        ),
-    }
-    quant_keys = quant_keys_by_cls.get(linear_method_cls)
-    if quant_keys is None:
-        return
-
     from vllm.platforms import current_platform
 
-    if not (current_platform.is_cuda() and current_platform.has_device_capability(89)):
+    if getattr(quant_config, "LinearMethodCls", None) not in {
+        vllm_modelopt.ModelOptFp8LinearMethod,
+        vllm_modelopt.ModelOptFp8PcPtLinearMethod,
+    }:
+        yield
         return
 
-    quant_config.LinearMethodCls = make_linear_method_cls(
-        linear_method_cls,
-        quant_keys[0],
-        quant_keys[1],
-    )
+    if not (current_platform.is_cuda() and current_platform.has_device_capability(89)):
+        yield
+        return
+
+    original_init_fp8_linear_kernel = vllm_modelopt.init_fp8_linear_kernel
+
+    def init_fp8_linear_kernel_with_cutlass(*args: Any, **kwargs: Any) -> Any:
+        kwargs.setdefault("force_kernel", CutlassFP8ScaledMMLinearKernel)
+        return original_init_fp8_linear_kernel(*args, **kwargs)
+
+    vllm_modelopt.init_fp8_linear_kernel = init_fp8_linear_kernel_with_cutlass
     logger.info("Using CUTLASS FP8 linear kernels for this ModelOpt FP8 diffusion stage.")
+    try:
+        yield
+    finally:
+        vllm_modelopt.init_fp8_linear_kernel = original_init_fp8_linear_kernel
 
 
 class DiffusionWorker:
@@ -181,8 +150,6 @@ class DiffusionWorker:
         self.lora_manager: DiffusionLoRAManager | None = None
         self.stage_id = getattr(od_config, "stage_id", 0)
         self.init_device()
-        if getattr(self.od_config, "force_cutlass_fp8", False):
-            _apply_force_cutlass_fp8_config(self.od_config.quantization_config)
         # Create model runner
         self.model_runner = DiffusionModelRunner(
             vllm_config=self.vllm_config,
@@ -270,9 +237,15 @@ class DiffusionWorker:
         """Load the diffusion model using DiffusionModelRunner."""
         load_format = kwargs.get("load_format", load_format)
         custom_pipeline_name = kwargs.get("custom_pipeline_name", custom_pipeline_name)
+        cutlass_fp8_context = (
+            _force_cutlass_fp8_linear_kernel(self.od_config.quantization_config)
+            if getattr(self.od_config, "force_cutlass_fp8", False)
+            else nullcontext()
+        )
         with (
             set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config),
             set_current_vllm_config(self.vllm_config),
+            cutlass_fp8_context,
         ):
             self.model_runner.load_model(
                 memory_pool_context_fn=self._maybe_get_memory_pool_context,
