@@ -349,6 +349,10 @@ def test_quantization_quality(config: QualityTestConfig):
     # --- Similarity metrics ---
     lpips_score = _compute_lpips(baseline_out, quant_out, config.task)
     psnr_score, mae_score = _compute_psnr_and_mae(baseline_out, quant_out, config.task)
+    assert lpips_score <= config.max_lpips, (
+        f"LPIPS {lpips_score:.4f} exceeds threshold {config.max_lpips} "
+        f"for {config.quantization_ref() or 'pre-quantized checkpoint'} on {config.quantized_ref()}"
+    )
 
     # --- Report ---
     mem_reduction = (bl_mem - qt_mem) / bl_mem * 100 if bl_mem > 0 else 0
@@ -369,7 +373,3 @@ def test_quantization_quality(config: QualityTestConfig):
     assert np.isfinite(lpips_score), f"LPIPS is not finite for {config.id}: {lpips_score}"
     assert np.isfinite(psnr_score) or np.isinf(psnr_score), f"PSNR is invalid for {config.id}: {psnr_score}"
     assert np.isfinite(mae_score), f"MAE is not finite for {config.id}: {mae_score}"
-    assert lpips_score <= config.max_lpips, (
-        f"LPIPS {lpips_score:.4f} exceeds threshold {config.max_lpips} "
-        f"for {config.quantization_ref() or 'pre-quantized checkpoint'} on {config.quantized_ref()}"
-    )
