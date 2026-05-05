@@ -36,6 +36,7 @@ from vllm.v1.engine.input_processor import InputProcessor
 
 from vllm_omni.config.stage_config import strip_parent_engine_args
 from vllm_omni.diffusion.data import DiffusionParallelConfig
+from vllm_omni.diffusion.diffusion_engine import supports_audio_output
 from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
 from vllm_omni.diffusion.stage_diffusion_proc import (
     complete_diffusion_handshake,
@@ -1324,9 +1325,8 @@ class AsyncOmniEngine:
 
         num_devices = max(1, int(parallel_config.world_size))
         devices = ",".join(str(i) for i in range(num_devices))
-        enforce_eager = kwargs.get("enforce_eager")
-        if enforce_eager is None:
-            enforce_eager = False
+        model_class_name = kwargs.get("model_class_name", None)
+        final_output_type = "audio" if model_class_name and supports_audio_output(model_class_name) else "image"
 
         stage_engine_args = {
             "max_num_seqs": 1,
@@ -1340,7 +1340,7 @@ class AsyncOmniEngine:
             "enable_cache_dit_summary": kwargs.get("enable_cache_dit_summary", False),
             "enable_cpu_offload": kwargs.get("enable_cpu_offload", False),
             "enable_layerwise_offload": kwargs.get("enable_layerwise_offload", False),
-            "enforce_eager": enforce_eager,
+            "enforce_eager": False if kwargs.get("enforce_eager") is None else kwargs.get("enforce_eager"),
             "boundary_ratio": kwargs.get("boundary_ratio", None),
             "flow_shift": kwargs.get("flow_shift", None),
             "diffusion_load_format": kwargs.get("diffusion_load_format", "default"),
@@ -1383,7 +1383,7 @@ class AsyncOmniEngine:
                 "engine_args": stage_engine_args,
                 "default_sampling_params": stage_default_sampling_params,
                 "final_output": True,
-                "final_output_type": "image",
+                "final_output_type": final_output_type,
             }
         ]
         default_stage_cfg[0]["engine_args"]["model_stage"] = "diffusion"
