@@ -102,21 +102,26 @@ def _apply_force_cutlass_fp8_config(quant_config: object | None) -> None:
     )
 
     def make_linear_method_cls(base_cls: type, activation_quant_key: Any, weight_quant_key: Any) -> type:
-        class CutlassModelOptFp8LinearMethod(base_cls):  # type: ignore[valid-type, misc]
-            def create_weights(self, layer, *args: Any, **kwargs: Any) -> None:
-                super().create_weights(layer, *args, **kwargs)
-                self.fp8_linear = init_fp8_linear_kernel(
-                    activation_quant_key=activation_quant_key,
-                    weight_quant_key=weight_quant_key,
-                    weight_shape=layer.weight.shape,
-                    input_dtype=self.input_dtype,
-                    out_dtype=self.out_dtype,
-                    force_kernel=CutlassFP8ScaledMMLinearKernel,
-                    module_name=self.__class__.__name__,
-                )
+        def create_weights(self, layer, *args: Any, **kwargs: Any) -> None:
+            base_cls.create_weights(self, layer, *args, **kwargs)
+            self.fp8_linear = init_fp8_linear_kernel(
+                activation_quant_key=activation_quant_key,
+                weight_quant_key=weight_quant_key,
+                weight_shape=layer.weight.shape,
+                input_dtype=self.input_dtype,
+                out_dtype=self.out_dtype,
+                force_kernel=CutlassFP8ScaledMMLinearKernel,
+                module_name=self.__class__.__name__,
+            )
 
-        CutlassModelOptFp8LinearMethod.__name__ = f"Cutlass{base_cls.__name__}"
-        return CutlassModelOptFp8LinearMethod
+        return type(
+            f"Cutlass{base_cls.__name__}",
+            (base_cls,),
+            {
+                "__module__": base_cls.__module__,
+                "create_weights": create_weights,
+            },
+        )
 
     linear_method_cls = getattr(quant_config, "LinearMethodCls", None)
     quant_keys_by_cls = {
