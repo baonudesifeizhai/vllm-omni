@@ -582,15 +582,9 @@ class DiffusersPipelineLoader:
         # mapping (QKV fusion, etc.).
         if load_format == "default":
             model = initialize_model(od_config)
-        elif load_format == "diffusers":
-            from vllm_omni.diffusion.distributed.utils import get_local_device
-
-            model = DiffusersAdapterPipeline(od_config=od_config, device=get_local_device())
         elif load_format == "custom_pipeline":
             model_cls = resolve_obj_by_qualname(custom_pipeline_name)
             model = model_cls(od_config=od_config)
-        else:
-            raise ValueError(f"Unknown load_format: {load_format}")
         self.load_weights(model)
 
         # Collect all transformers to shard (some models have transformer_2 for MoE)
