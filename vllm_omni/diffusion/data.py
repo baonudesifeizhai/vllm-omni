@@ -680,6 +680,9 @@ class OmniDiffusionConfig:
     def _is_generic_fp8_quant_config(quant_config: object) -> bool:
         if isinstance(quant_config, str):
             return quant_config.lower() == "fp8"
+        if isinstance(quant_config, Mapping):
+            method = quant_config.get("method", quant_config.get("quant_method"))
+            return isinstance(method, str) and method.lower() == "fp8"
         if hasattr(quant_config, "get_name"):
             return quant_config.get_name() == "fp8"
         return False
