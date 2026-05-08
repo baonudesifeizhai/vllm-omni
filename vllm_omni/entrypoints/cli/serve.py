@@ -638,6 +638,7 @@ def run_headless(args: argparse.Namespace) -> None:
         stage_cfg,
         model,
         stage_connector_spec=stage_connector_spec,
+        cli_tokenizer=getattr(args, "tokenizer", None),
     )
 
     # Inject omni KV connector config so the engine runner can initialize the
