@@ -89,7 +89,16 @@ CLI:
 python text_to_image.py --model <your-model> --quantization fp8
 python text_to_image.py --model <your-model> --quantization fp8 --ignored-layers "img_mlp"
 vllm serve <your-model> --omni --quantization fp8
+vllm serve <modelopt-fp8-checkpoint> --omni --tensor-parallel-size <N> --force-cutlass-fp8
 ```
+
+!!! note
+    `--force-cutlass-fp8` is an explicit runtime override for diffusion
+    checkpoints that already carry a supported ModelOpt FP8 config. It does not
+    quantize BF16 checkpoints and it does not apply to online `--quantization
+    fp8`. The flag only takes effect for ModelOpt FP8 diffusion stages on CUDA
+    SM89+ devices; other platforms and non-ModelOpt FP8 paths fall back to the
+    normal vLLM kernel selection.
 
 ## Parameters
 

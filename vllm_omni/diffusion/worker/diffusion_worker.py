@@ -56,33 +56,33 @@ logger = init_logger(__name__)
 
 @contextmanager
 def _force_cutlass_fp8_linear_kernel(quant_config: object | None) -> Iterator[None]:
-    from vllm.model_executor.kernels.linear import CutlassFP8ScaledMMLinearKernel
     from vllm.model_executor.layers.quantization import modelopt as vllm_modelopt
-    from vllm.platforms import current_platform
 
-    if getattr(quant_config, "LinearMethodCls", None) not in {
+    linear_method_cls = getattr(quant_config, "LinearMethodCls", None)
+    if linear_method_cls in {
         vllm_modelopt.ModelOptFp8LinearMethod,
         vllm_modelopt.ModelOptFp8PcPtLinearMethod,
     }:
-        yield
-        return
+        from vllm.platforms import current_platform
 
-    if not (current_platform.is_cuda() and current_platform.has_device_capability(89)):
-        yield
-        return
+        if current_platform.is_cuda() and current_platform.has_device_capability(89):
+            from vllm.model_executor.kernels.linear import CutlassFP8ScaledMMLinearKernel
 
-    original_init_fp8_linear_kernel = vllm_modelopt.init_fp8_linear_kernel
+            original_init_fp8_linear_kernel = vllm_modelopt.init_fp8_linear_kernel
 
-    def init_fp8_linear_kernel_with_cutlass(*args: Any, **kwargs: Any) -> Any:
-        kwargs.setdefault("force_kernel", CutlassFP8ScaledMMLinearKernel)
-        return original_init_fp8_linear_kernel(*args, **kwargs)
+            def init_fp8_linear_kernel_with_cutlass(*args: Any, **kwargs: Any) -> Any:
+                kwargs.setdefault("force_kernel", CutlassFP8ScaledMMLinearKernel)
+                return original_init_fp8_linear_kernel(*args, **kwargs)
 
-    vllm_modelopt.init_fp8_linear_kernel = init_fp8_linear_kernel_with_cutlass
-    logger.info("Using CUTLASS FP8 linear kernels for this ModelOpt FP8 diffusion stage.")
-    try:
-        yield
-    finally:
-        vllm_modelopt.init_fp8_linear_kernel = original_init_fp8_linear_kernel
+            vllm_modelopt.init_fp8_linear_kernel = init_fp8_linear_kernel_with_cutlass
+            logger.info("Using CUTLASS FP8 linear kernels for this ModelOpt FP8 diffusion stage.")
+            try:
+                yield
+            finally:
+                vllm_modelopt.init_fp8_linear_kernel = original_init_fp8_linear_kernel
+            return
+
+    yield
 
 
 class DiffusionWorker:
