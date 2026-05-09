@@ -53,13 +53,14 @@ The optional CUTLASS FP8 runtime override requires CUDA SM89+.
 
 ### Diffusion Model
 
-| Model | Scope | Status |
-|-------|-------|--------|
-| Qwen-Image family | Diffusion transformer | Validated for ModelOpt FP8 checkpoints |
-| Z-Image | Diffusion transformer | Validated for ModelOpt FP8 checkpoints |
-| FLUX.2-dev / FLUX.2-klein | Diffusion transformer | Validated for ModelOpt FP8 checkpoints |
-| HunyuanImage-3.0 | MoE diffusion transformer | Validated for ModelOpt FP8 checkpoints |
-| Wan2.2 | Diffusion transformer | Not validated |
+| Model | HF checkpoint | Scope | Status |
+|-------|---------------|-------|--------|
+| Qwen-Image 2512 | `feizhai123/qwen-image-2512-modelopt-fp8-dynamic-all` | Diffusion transformer | Validated for ModelOpt FP8 checkpoints |
+| Z-Image | `feizhai123/z-image-modelopt-fp8-conservative` | Diffusion transformer | Validated for ModelOpt FP8 checkpoints |
+| FLUX.2-dev | `feizhai123/flux2-dev-modelopt-fp8` | Diffusion transformer | Validated for ModelOpt FP8 checkpoints |
+| FLUX.2-klein 4B | `feizhai123/flux2-klein-4b-modelopt-fp8` | Diffusion transformer | Validated for ModelOpt FP8 checkpoints |
+| HunyuanImage-3.0 | `feizhai123/hunyuan-image3-modelopt-fp8` | MoE diffusion transformer | Validated for ModelOpt FP8 checkpoints |
+| Wan2.2 | Not available | Diffusion transformer | Not validated |
 
 ### Multi-Stage Omni/TTS Model
 
