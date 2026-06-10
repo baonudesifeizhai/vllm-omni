@@ -531,11 +531,7 @@ class HunyuanVideo15TransformerBlock(nn.Module):
 
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.ff = FeedForward(
-            dim=hidden_size,
-            dim_out=hidden_size,
-            mult=mlp_ratio,
-            quant_config=quant_config,
-            prefix=f"{prefix}.ff",
+            dim=hidden_size, dim_out=hidden_size, mult=mlp_ratio, quant_config=quant_config, prefix=f"{prefix}.ff"
         )
 
         self.norm2_context = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)

@@ -38,7 +38,6 @@ from vllm_omni.diffusion.models.hunyuan_video.pipeline_hunyuan_video_1_5 import 
     extract_glyph_texts,
     format_text_input,
     get_hunyuan_video_15_post_process_func,
-    prepare_hunyuan_video_transformer_quant_config,
     retrieve_latents,
 )
 from vllm_omni.diffusion.models.interface import SupportImageInput
@@ -186,15 +185,9 @@ class HunyuanVideo15I2VPipeline(
         if od_config.flow_shift is not None:
             self.scheduler._shift = od_config.flow_shift
 
-        transformer_kwargs = get_transformer_config_kwargs(
-            od_config.tf_model_config,
-            HunyuanVideo15Transformer3DModel,
-        )
-        quant_config = prepare_hunyuan_video_transformer_quant_config(od_config)
+        transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, HunyuanVideo15Transformer3DModel)
         self.transformer = HunyuanVideo15Transformer3DModel(
-            od_config=od_config,
-            quant_config=quant_config,
-            **transformer_kwargs,
+            od_config=od_config, quant_config=od_config.quantization_config, **transformer_kwargs
         )
 
         self.use_meanflow = getattr(od_config.tf_model_config, "use_meanflow", False)
