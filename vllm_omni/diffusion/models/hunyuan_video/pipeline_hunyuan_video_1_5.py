@@ -16,6 +16,7 @@ from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 from torch import nn
 from transformers import AutoConfig, ByT5Tokenizer, Qwen2_5_VLTextModel, Qwen2Tokenizer
+from vllm.model_executor.model_loader.utils import configure_quant_config
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -33,6 +34,7 @@ from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPi
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.quantization.factory import resolve_quant_config_from_disk
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +53,17 @@ def retrieve_latents(
         return encoder_output.latents
     else:
         raise AttributeError("Could not access latents of provided encoder_output")
+
+
+def prepare_hunyuan_video_transformer_quant_config(od_config: OmniDiffusionConfig):
+    quant_config = od_config.quantization_config
+    tf_quant_config = getattr(od_config.tf_model_config, "quantization_config", None)
+    if tf_quant_config is not None:
+        quant_config = resolve_quant_config_from_disk(quant_config, tf_quant_config)
+        od_config.quantization_config = quant_config
+    if quant_config is not None:
+        configure_quant_config(quant_config, HunyuanVideo15Transformer3DModel)
+    return quant_config
 
 
 def format_text_input(prompt: list[str], system_message: str) -> list[list[dict[str, str]]]:
@@ -142,9 +155,15 @@ class HunyuanVideo15Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, Diff
         if od_config.flow_shift is not None:
             self.scheduler._shift = od_config.flow_shift
 
-        transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, HunyuanVideo15Transformer3DModel)
+        transformer_kwargs = get_transformer_config_kwargs(
+            od_config.tf_model_config,
+            HunyuanVideo15Transformer3DModel,
+        )
+        quant_config = prepare_hunyuan_video_transformer_quant_config(od_config)
         self.transformer = HunyuanVideo15Transformer3DModel(
-            od_config=od_config, quant_config=od_config.quantization_config, **transformer_kwargs
+            od_config=od_config,
+            quant_config=quant_config,
+            **transformer_kwargs,
         )
 
         # Check if model uses meanflow (distilled variants)

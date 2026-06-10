@@ -54,9 +54,15 @@ class ModelOptFp8CheckpointAdapter:
 
     @staticmethod
     def _is_transformer_source(source: object) -> bool:
-        if getattr(source, "subfolder", None) == "transformer":
-            return True
-        return str(getattr(source, "prefix", "")).startswith("transformer.")
+        subfolder = str(getattr(source, "subfolder", "") or "")
+        prefix = str(getattr(source, "prefix", "") or "").rstrip(".")
+        return any(ModelOptFp8CheckpointAdapter._is_transformer_name(name) for name in (subfolder, prefix))
+
+    @staticmethod
+    def _is_transformer_name(name: str) -> bool:
+        return name == "transformer" or (
+            name.startswith("transformer_") and name.removeprefix("transformer_").isdigit()
+        )
 
     @staticmethod
     def _is_checkpoint_quant_config(quant_config: object | None) -> bool:
@@ -105,10 +111,14 @@ class ModelOptFp8CheckpointAdapter:
             for shard_name in shard_names:
                 orig_to_new_substr[f".{shard_name}."] = f".{packed_name}."
                 orig_to_new_prefix[f"{shard_name}."] = f"{packed_name}."
-        return WeightsMapper(
+        packed_mapper = WeightsMapper(
             orig_to_new_substr=orig_to_new_substr,
             orig_to_new_prefix=orig_to_new_prefix,
         )
+        model_mapper = getattr(model, "hf_to_vllm_mapper", None)
+        if isinstance(model_mapper, WeightsMapper):
+            return model_mapper | packed_mapper
+        return packed_mapper
 
     def _resolve_target_name(self, name: str) -> str | None:
         if name in self._loadable_tensors:
