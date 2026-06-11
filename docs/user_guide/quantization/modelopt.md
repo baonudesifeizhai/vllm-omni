@@ -34,12 +34,12 @@ and the quantization algorithm must be one of the validated algorithms below.
 |------------------|-----------------|
 | `method` / `quant_method` | `modelopt`, `modelopt_fp4`, `modelopt_mixed` |
 | `producer.name` | `modelopt` |
-| `quant_algo` | `FP8`, `FP8_PER_CHANNEL_PER_TOKEN`, `NVFP4`, `MIXED_PRECISION` |
+| `quant_algo` | `FP8`, `FP8_PER_CHANNEL_PER_TOKEN`, `NVFP4`, `W4A16_NVFP4`, `MIXED_PRECISION` |
 
 | `quant_algo` | Runtime method | Typical use |
 |--------------|----------------|-------------|
 | `FP8`, `FP8_PER_CHANNEL_PER_TOKEN` | `modelopt` | FP8 diffusion transformer checkpoints |
-| `NVFP4` | `modelopt_fp4` | NVFP4 diffusion transformer checkpoints |
+| `NVFP4`, `W4A16_NVFP4` | `modelopt_fp4` | NVFP4 diffusion transformer checkpoints |
 | `MIXED_PRECISION` | `modelopt_mixed` | Mixed FP8/NVFP4 checkpoints with a ModelOpt per-layer policy |
 
 For multi-component diffusion or omni models, only the checkpoint component
@@ -77,12 +77,14 @@ backend and quality validation.
 | FLUX.2-klein 4B | `feizhai123/flux2-klein-4b-modelopt-fp8` | Diffusion transformer | Validated for ModelOpt FP8 checkpoints |
 | HunyuanImage-3.0 | `feizhai123/hunyuan-image3-modelopt-fp8` | MoE diffusion transformer | Validated for ModelOpt FP8 checkpoints |
 | HunyuanImage-3.0 | `feizhai123/hunyuan-image3-modelopt-mixed-experts-nvfp4-dense-fp8` | MoE diffusion transformer | Validated for ModelOpt mixed FP8/NVFP4 checkpoints |
-| Wan2.2 | Not available | Diffusion transformer | Not validated |
+| Wan2.2 T2V | `nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4` | Diffusion transformer | Validated for ModelOpt NVFP4 checkpoints |
 
 For full serving commands and benchmark context, see
 [`recipes/Qwen/Qwen-Image.md`](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Qwen/Qwen-Image.md)
 and
 [`recipes/Tencent/HunyuanImage-3.0-Instruct.md`](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Tencent/HunyuanImage-3.0-Instruct.md).
+Wan2.2 ModelOpt NVFP4 serving commands are documented in
+[`recipes/Wan-AI/Wan2.2-T2V.md`](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Wan-AI/Wan2.2-T2V.md).
 
 ### Multi-Stage Omni/TTS Model
 
