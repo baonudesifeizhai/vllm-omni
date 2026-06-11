@@ -249,19 +249,11 @@ class DiffusersPipelineLoader:
         model: nn.Module | None = None,
     ) -> object | None:
         if model is not None:
-            source_module_names = (
-                source.prefix.rstrip(".").split(".", 1)[0],
-                source.subfolder or "",
-            )
-            for module_name in dict.fromkeys(source_module_names):
-                if not module_name:
-                    continue
-                try:
-                    source_module = model.get_submodule(module_name)
-                except AttributeError:
-                    continue
-                if hasattr(source_module, "quant_config"):
-                    return source_module.quant_config
+            source_prefix = source.prefix.rstrip(".")
+            source_module_name = source.subfolder or source_prefix.split(".", 1)[0]
+            source_module = model.get_submodule(source_module_name)
+            if hasattr(source_module, "quant_config"):
+                return source_module.quant_config
 
         quant_config = self.quant_config
         if hasattr(quant_config, "resolve"):

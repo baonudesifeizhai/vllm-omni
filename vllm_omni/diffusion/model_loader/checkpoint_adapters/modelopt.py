@@ -116,28 +116,15 @@ class ModelOptFp8CheckpointAdapter:
             orig_to_new_substr=orig_to_new_substr,
             orig_to_new_prefix=orig_to_new_prefix,
         )
-        collected_mapper = WeightsMapper()
-        seen_mappers: set[int] = set()
-        source_module_names = (
-            str(getattr(source, "subfolder", "") or ""),
-            str(getattr(source, "prefix", "") or "").rstrip(".").split(".", 1)[0],
+        source_prefix = getattr(source, "prefix", "").rstrip(".")
+        source_module_name = getattr(source, "subfolder", None) or source_prefix.split(".", 1)[0]
+        source_module = model.get_submodule(source_module_name)
+        source_mapper = getattr(
+            source_module,
+            "hf_to_vllm_mapper",
+            WeightsMapper(),
         )
-        source_modules = [model]
-        for module_name in dict.fromkeys(source_module_names):
-            if not module_name:
-                continue
-            try:
-                source_modules.append(model.get_submodule(module_name))
-            except AttributeError:
-                continue
-
-        for module in source_modules:
-            mapper = getattr(module, "hf_to_vllm_mapper", None)
-            if not isinstance(mapper, WeightsMapper) or id(mapper) in seen_mappers:
-                continue
-            seen_mappers.add(id(mapper))
-            collected_mapper = collected_mapper | mapper
-        return collected_mapper | packed_mapper
+        return source_mapper | packed_mapper
 
     def _resolve_target_name(self, name: str) -> str | None:
         if name in self._loadable_tensors:
