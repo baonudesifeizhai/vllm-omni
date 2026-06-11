@@ -40,7 +40,7 @@ class _AdaptState:
 class ModelOptFp8CheckpointAdapter:
     def __init__(self, model: nn.Module, source: object):
         self._loadable_tensors = self._get_model_loadable_tensors(model)
-        self._weights_mapper = self._get_weights_mapper(model)
+        self._weights_mapper = self._get_weights_mapper(model, source)
         self._source_label = getattr(source, "prefix", "") or getattr(source, "subfolder", None) or "model"
 
     @classmethod
@@ -54,9 +54,16 @@ class ModelOptFp8CheckpointAdapter:
 
     @staticmethod
     def _is_transformer_source(source: object) -> bool:
-        if getattr(source, "subfolder", None) == "transformer":
-            return True
-        return str(getattr(source, "prefix", "")).startswith("transformer.")
+        subfolder = str(getattr(source, "subfolder", "") or "")
+        prefix = str(getattr(source, "prefix", "") or "").rstrip(".")
+        prefix_root = prefix.split(".", 1)[0]
+        return any(ModelOptFp8CheckpointAdapter._is_transformer_name(name) for name in (subfolder, prefix_root))
+
+    @staticmethod
+    def _is_transformer_name(name: str) -> bool:
+        return name == "transformer" or (
+            name.startswith("transformer_") and name.removeprefix("transformer_").isdigit()
+        )
 
     @staticmethod
     def _is_checkpoint_quant_config(quant_config: object | None) -> bool:
@@ -88,7 +95,7 @@ class ModelOptFp8CheckpointAdapter:
         return None
 
     @classmethod
-    def _get_weights_mapper(cls, model: nn.Module) -> WeightsMapper:
+    def _get_weights_mapper(cls, model: nn.Module, source: object) -> WeightsMapper:
         mapping = {
             packed_name: tuple(shard_names) for packed_name, shard_names in DEFAULT_PACKED_MODULES_MAPPING.items()
         }
@@ -105,10 +112,32 @@ class ModelOptFp8CheckpointAdapter:
             for shard_name in shard_names:
                 orig_to_new_substr[f".{shard_name}."] = f".{packed_name}."
                 orig_to_new_prefix[f"{shard_name}."] = f"{packed_name}."
-        return WeightsMapper(
+        packed_mapper = WeightsMapper(
             orig_to_new_substr=orig_to_new_substr,
             orig_to_new_prefix=orig_to_new_prefix,
         )
+        collected_mapper = WeightsMapper()
+        seen_mappers: set[int] = set()
+        source_module_names = (
+            str(getattr(source, "subfolder", "") or ""),
+            str(getattr(source, "prefix", "") or "").rstrip(".").split(".", 1)[0],
+        )
+        source_modules = [model]
+        for module_name in dict.fromkeys(source_module_names):
+            if not module_name:
+                continue
+            try:
+                source_modules.append(model.get_submodule(module_name))
+            except AttributeError:
+                continue
+
+        for module in source_modules:
+            mapper = getattr(module, "hf_to_vllm_mapper", None)
+            if not isinstance(mapper, WeightsMapper) or id(mapper) in seen_mappers:
+                continue
+            seen_mappers.add(id(mapper))
+            collected_mapper = collected_mapper | mapper
+        return collected_mapper | packed_mapper
 
     def _resolve_target_name(self, name: str) -> str | None:
         if name in self._loadable_tensors:

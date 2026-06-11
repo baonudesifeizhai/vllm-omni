@@ -243,7 +243,26 @@ class DiffusersPipelineLoader:
                 return checkpoint_adapter.adapt(prefixed_weights_iterator)
         return prefixed_weights_iterator
 
-    def _get_source_quant_config(self, source: "ComponentSource") -> object | None:
+    def _get_source_quant_config(
+        self,
+        source: "ComponentSource",
+        model: nn.Module | None = None,
+    ) -> object | None:
+        if model is not None:
+            source_module_names = (
+                source.prefix.rstrip(".").split(".", 1)[0],
+                source.subfolder or "",
+            )
+            for module_name in dict.fromkeys(source_module_names):
+                if not module_name:
+                    continue
+                try:
+                    source_module = model.get_submodule(module_name)
+                except AttributeError:
+                    continue
+                if hasattr(source_module, "quant_config"):
+                    return source_module.quant_config
+
         quant_config = self.quant_config
         if hasattr(quant_config, "resolve"):
             return quant_config.resolve(source.prefix.rstrip("."))
@@ -258,7 +277,7 @@ class DiffusersPipelineLoader:
         return get_checkpoint_adapter(
             model=model,
             source=source,
-            quant_config=self._get_source_quant_config(source),
+            quant_config=self._get_source_quant_config(source, model),
             use_safetensors=use_safetensors,
         )
 
@@ -404,11 +423,10 @@ class DiffusersPipelineLoader:
         if loaded_weights is not None:
             weights_not_loaded = weights_to_load - loaded_weights
             # NOTE: if the model is quantized, ignore not_loaded check for scale
-            # weights. ModelOpt FP8 carries a per-tensor `weight_scale` and a
-            # static activation `input_scale`, which the quant method may
-            # fold/track differently than plain parameters.
+            # weights. ModelOpt checkpoints carry scale tensors that the quant
+            # method may fold/track differently than plain parameters.
             weights_scale_not_loaded = {
-                name for name in weights_not_loaded if name.endswith(("weight_scale", "input_scale"))
+                name for name in weights_not_loaded if name.endswith(("weight_scale", "weight_scale_2", "input_scale"))
             }
             weights_not_loaded = weights_not_loaded - weights_scale_not_loaded
             if weights_not_loaded:
@@ -431,8 +449,9 @@ class DiffusersPipelineLoader:
         _QUANTIZED_WEIGHT_SUFFIXES = (
             # GPTQ / AWQ / AutoRound – g_idx is optional (not all checkpoints include it)
             ".g_idx",
-            # FP8
+            # ModelOpt / FP8
             ".weight_scale",
+            ".weight_scale_2",
             ".weight_scale_inv",
             ".input_scale",
             # GGUF
