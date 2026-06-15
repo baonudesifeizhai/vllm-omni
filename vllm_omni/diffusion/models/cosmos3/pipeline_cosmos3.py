@@ -795,6 +795,9 @@ class Cosmos3OmniDiffusersPipeline(
 
         return None
 
+    # Checkpoint adapters use this hook before model-specific weight loading.
+    remap_checkpoint_key = _remap_ckpt_key
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Stream-remap checkpoint weights and load via AutoWeightsLoader.
 

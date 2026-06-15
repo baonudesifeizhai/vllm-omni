@@ -11,7 +11,13 @@ from vllm.model_executor.utils import get_packed_modules_mapping
 
 logger = init_logger(__name__)
 
-MODEL_OPT_SCALE_SUFFIXES = (".input_scale", ".weight_scale", ".weight_scale_2", ".weight_scale_inv")
+MODEL_OPT_SCALE_SUFFIXES = (
+    ".input_scale",
+    ".pre_quant_scale",
+    ".weight_scale",
+    ".weight_scale_2",
+    ".weight_scale_inv",
+)
 DEFAULT_PACKED_MODULES_MAPPING = {
     "to_qkv": ("to_q", "to_k", "to_v"),
     "add_kv_proj": ("add_q_proj", "add_k_proj", "add_v_proj"),
@@ -41,6 +47,7 @@ class ModelOptFp8CheckpointAdapter:
     def __init__(self, model: nn.Module, source: object):
         self._loadable_tensors = self._get_model_loadable_tensors(model)
         self._weights_mapper = self._get_weights_mapper(model)
+        self._checkpoint_key_mapper = getattr(model, "remap_checkpoint_key", None)
         self._source_label = getattr(source, "prefix", "") or getattr(source, "subfolder", None) or "model"
 
     @classmethod
@@ -113,6 +120,11 @@ class ModelOptFp8CheckpointAdapter:
     def _resolve_target_name(self, name: str) -> str | None:
         if name in self._loadable_tensors:
             return name
+
+        if callable(self._checkpoint_key_mapper):
+            candidate = self._checkpoint_key_mapper(name)
+            if candidate in self._loadable_tensors:
+                return candidate
 
         for candidate in self._weights_mapper.apply_list([name]):
             if candidate != name and candidate in self._loadable_tensors:
@@ -269,4 +281,11 @@ class ModelOptMixedPrecisionCheckpointAdapter(ModelOptFp8CheckpointAdapter):
             quant_config is not None
             and hasattr(quant_config, "get_name")
             and quant_config.get_name() == "modelopt_mixed"
+            and bool(
+                getattr(
+                    quant_config,
+                    "is_checkpoint_mixed_precision_serialized",
+                    False,
+                )
+            )
         )
