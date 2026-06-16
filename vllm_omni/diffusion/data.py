@@ -838,9 +838,6 @@ class OmniDiffusionConfig:
 
     @classmethod
     def _quant_config_algo_name(cls, quant_config: object) -> str | None:
-        if isinstance(quant_config, str):
-            normalized = cls._normalize_quant_name(quant_config)
-            return normalized.upper() if normalized is not None else None
         if isinstance(quant_config, Mapping):
             quantization = quant_config.get("quantization")
             algo = None
@@ -848,25 +845,19 @@ class OmniDiffusionConfig:
                 algo = quantization.get("quant_algo")
             if algo is None:
                 algo = quant_config.get("quant_algo")
-            normalized = cls._normalize_quant_name(algo)
-            return normalized.upper() if normalized is not None else None
-        algo = getattr(quant_config, "quant_algo", None)
-        if algo is None:
-            algo = getattr(quant_config, "quant_method", None)
+        else:
+            algo = getattr(quant_config, "quant_algo", None)
         normalized = cls._normalize_quant_name(algo)
         return normalized.upper() if normalized is not None else None
 
     @classmethod
     def _requested_quant_family(cls, quant_config: object) -> str | None:
         algo = cls._quant_config_algo_name(quant_config)
-        if algo is not None:
-            family = MODEL_OPT_QUANT_ALGO_FAMILIES.get(algo)
-            if family is not None:
-                return family
+        family = MODEL_OPT_QUANT_ALGO_FAMILIES.get(algo)
+        if family is not None:
+            return family
 
         method = cls._quant_config_method_name(quant_config)
-        if method is None:
-            return None
         return MODEL_OPT_QUANT_METHOD_FAMILIES.get(method)
 
     def set_tf_model_config(self, tf_config: "TransformerConfig") -> None:
