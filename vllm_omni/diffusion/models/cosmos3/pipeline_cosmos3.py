@@ -812,6 +812,10 @@ class Cosmos3OmniDiffusersPipeline(
             total = kept = 0
             for name, tensor in weights:
                 total += 1
+                if name in allowed or name in tp_aware:
+                    kept += 1
+                    yield name, tensor
+                    continue
                 remapped = self._remap_ckpt_key(name)
                 if remapped is not None and (remapped in allowed or remapped in tp_aware):
                     kept += 1

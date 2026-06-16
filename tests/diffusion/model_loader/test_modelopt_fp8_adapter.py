@@ -154,14 +154,14 @@ def test_modelopt_adapter_uses_checkpoint_key_remap_for_target_dtype():
         adapter.adapt(
             iter(
                 [
-                    ("transformer.orig.proj.weight_scale", scale),
                     ("transformer.orig.proj.weight", fp8_weight),
+                    ("transformer.orig.proj.weight_scale", scale),
                 ]
             )
         )
     )
 
-    assert [name for name, _ in adapted] == ["transformer.orig.proj.weight"]
+    assert [name for name, _ in adapted] == ["runtime.proj.weight"]
     assert adapted[0][1].dtype == model.runtime.proj.weight.dtype
     assert torch.allclose(adapted[0][1], fp8_weight.to(torch.float32) * scale)
 
