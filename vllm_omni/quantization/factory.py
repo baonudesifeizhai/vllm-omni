@@ -215,6 +215,18 @@ _MODEL_OPT_NVFP4_ALGOS = {
 _MODEL_OPT_MIXED_ALGOS = {
     "MIXED_PRECISION",
 }
+MODEL_OPT_QUANT_ALGO_FAMILIES: dict[str, str] = {
+    **dict.fromkeys(_MODEL_OPT_FP8_ALGOS, "fp8"),
+    **dict.fromkeys(_MODEL_OPT_NVFP4_ALGOS, "nvfp4"),
+    **dict.fromkeys(_MODEL_OPT_MIXED_ALGOS, "modelopt_mixed"),
+}
+MODEL_OPT_QUANT_METHOD_FAMILIES: dict[str, str] = {
+    "fp8": "fp8",
+    "fp4": "nvfp4",
+    "nvfp4": "nvfp4",
+    "modelopt_fp4": "nvfp4",
+    "modelopt_mixed": "modelopt_mixed",
+}
 
 
 def _normalize_method_name(method: Any) -> str:
@@ -240,11 +252,12 @@ def _detect_modelopt_method(config: Mapping[str, Any]) -> str | None:
         return None
 
     if quant_algo:
-        if quant_algo in _MODEL_OPT_FP8_ALGOS:
+        quant_family = MODEL_OPT_QUANT_ALGO_FAMILIES.get(quant_algo)
+        if quant_family == "fp8":
             return "modelopt"
-        if quant_algo in _MODEL_OPT_NVFP4_ALGOS:
+        if quant_family == "nvfp4":
             return "modelopt_fp4"
-        if quant_algo in _MODEL_OPT_MIXED_ALGOS:
+        if quant_family == "modelopt_mixed":
             return "modelopt_mixed"
         return None
 
