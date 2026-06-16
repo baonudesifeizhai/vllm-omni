@@ -22,7 +22,11 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.diffusion.utils.network_utils import is_port_available
 from vllm_omni.errors import client_error_metadata
-from vllm_omni.quantization import build_quant_config
+from vllm_omni.quantization.factory import (
+    MODEL_OPT_QUANT_ALGO_FAMILIES,
+    MODEL_OPT_QUANT_METHOD_FAMILIES,
+    build_quant_config,
+)
 
 if TYPE_CHECKING:
     from vllm.config import ProfilerConfig
@@ -802,11 +806,12 @@ class OmniDiffusionConfig:
                 False,
             )
         )
+        requested_family = self._requested_quant_family(self.quantization_config)
         should_use_checkpoint_config = (
             self.quantization_config is None
-            or (is_checkpoint_fp8 and self._is_generic_fp8_quant_config(self.quantization_config))
-            or (is_checkpoint_nvfp4 and self._is_generic_nvfp4_quant_config(self.quantization_config))
-            or (is_checkpoint_mixed and self._is_generic_modelopt_mixed_quant_config(self.quantization_config))
+            or (is_checkpoint_fp8 and requested_family == "fp8")
+            or (is_checkpoint_nvfp4 and requested_family == "nvfp4")
+            or (is_checkpoint_mixed and requested_family == "modelopt_mixed")
         )
         if should_use_checkpoint_config:
             self.quantization_config = tf_config.quant_config
@@ -816,37 +821,53 @@ class OmniDiffusionConfig:
             )
 
     @staticmethod
-    def _is_generic_fp8_quant_config(quant_config: object) -> bool:
-        if isinstance(quant_config, str):
-            return quant_config.lower() == "fp8"
-        if isinstance(quant_config, Mapping):
-            method = quant_config.get("method", quant_config.get("quant_method"))
-            return isinstance(method, str) and method.lower() == "fp8"
-        if hasattr(quant_config, "get_name"):
-            return quant_config.get_name() == "fp8"
-        return False
+    def _normalize_quant_name(name: object) -> str | None:
+        return name.lower().replace("-", "_") if isinstance(name, str) else None
 
-    @staticmethod
-    def _is_generic_nvfp4_quant_config(quant_config: object) -> bool:
+    @classmethod
+    def _quant_config_method_name(cls, quant_config: object) -> str | None:
         if isinstance(quant_config, str):
-            return quant_config.lower() in {"fp4", "nvfp4", "modelopt_fp4"}
+            return cls._normalize_quant_name(quant_config)
         if isinstance(quant_config, Mapping):
             method = quant_config.get("method", quant_config.get("quant_method"))
-            return isinstance(method, str) and method.lower() in {"fp4", "nvfp4", "modelopt_fp4"}
-        if hasattr(quant_config, "get_name"):
-            return quant_config.get_name() == "modelopt_fp4"
-        return False
+            return cls._normalize_quant_name(method)
+        get_name = getattr(quant_config, "get_name", None)
+        if callable(get_name):
+            return cls._normalize_quant_name(get_name())
+        return None
 
-    @staticmethod
-    def _is_generic_modelopt_mixed_quant_config(quant_config: object) -> bool:
+    @classmethod
+    def _quant_config_algo_name(cls, quant_config: object) -> str | None:
         if isinstance(quant_config, str):
-            return quant_config.lower() == "modelopt_mixed"
+            normalized = cls._normalize_quant_name(quant_config)
+            return normalized.upper() if normalized is not None else None
         if isinstance(quant_config, Mapping):
-            method = quant_config.get("method", quant_config.get("quant_method"))
-            return isinstance(method, str) and method.lower() == "modelopt_mixed"
-        if hasattr(quant_config, "get_name"):
-            return quant_config.get_name() == "modelopt_mixed"
-        return False
+            quantization = quant_config.get("quantization")
+            algo = None
+            if isinstance(quantization, Mapping):
+                algo = quantization.get("quant_algo")
+            if algo is None:
+                algo = quant_config.get("quant_algo")
+            normalized = cls._normalize_quant_name(algo)
+            return normalized.upper() if normalized is not None else None
+        algo = getattr(quant_config, "quant_algo", None)
+        if algo is None:
+            algo = getattr(quant_config, "quant_method", None)
+        normalized = cls._normalize_quant_name(algo)
+        return normalized.upper() if normalized is not None else None
+
+    @classmethod
+    def _requested_quant_family(cls, quant_config: object) -> str | None:
+        algo = cls._quant_config_algo_name(quant_config)
+        if algo is not None:
+            family = MODEL_OPT_QUANT_ALGO_FAMILIES.get(algo)
+            if family is not None:
+                return family
+
+        method = cls._quant_config_method_name(quant_config)
+        if method is None:
+            return None
+        return MODEL_OPT_QUANT_METHOD_FAMILIES.get(method)
 
     def set_tf_model_config(self, tf_config: "TransformerConfig") -> None:
         """Assign `tf_model_config` and propagate quantization if detected.
