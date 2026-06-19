@@ -706,9 +706,28 @@ class Cosmos3OmniDiffusersPipeline(
         Returns the remapped name under ``transformer.``, or None to skip.
         """
         k = key
-        # Strip the weights_sources prefix
+        # Strip the weights_sources prefix unless the checkpoint is already in
+        # the vLLM module namespace.
         if k.startswith("transformer."):
-            k = k[len("transformer.") :]
+            inner = k[len("transformer.") :]
+            if inner.startswith("language_model.lm_head."):
+                return None
+            if inner.startswith(
+                (
+                    "language_model.",
+                    "gen_layers.",
+                    "proj_in.",
+                    "proj_out.",
+                    "time_embedder.",
+                    "audio_proj_in.",
+                    "audio_proj_out.",
+                    "action_proj_in.",
+                    "action_proj_out.",
+                    "norm_moe_gen.",
+                )
+            ) or inner in ("audio_modality_embed", "action_modality_embed"):
+                return k
+            k = inner
         if k.startswith("model."):
             k = k[len("model.") :]
 
@@ -804,23 +823,23 @@ class Cosmos3OmniDiffusersPipeline(
         Handles quantization, TP-aware weight_loader, and buffer loading.
         Returns the set of loaded parameter names for strict validation.
         """
-        state = self.state_dict()
-        allowed = set(state.keys())
-        tp_aware = {n for n, p in self.named_parameters() if hasattr(p, "weight_loader")}
 
         def _remapped_weights() -> Iterable[tuple[str, torch.Tensor]]:
-            total = kept = 0
+            total = kept = skipped = 0
             for name, tensor in weights:
                 total += 1
                 remapped = self._remap_ckpt_key(name)
-                if remapped is not None and (remapped in allowed or remapped in tp_aware):
-                    kept += 1
-                    yield remapped, tensor
+                if remapped is None:
+                    skipped += 1
+                    continue
+                kept += 1
+                yield remapped, tensor
             if _is_rank_zero():
                 logger.info(
-                    "Cosmos3 weight remap: kept %d/%d tensors",
+                    "Cosmos3 weight remap: kept %d/%d tensors, skipped %d",
                     kept,
                     total,
+                    skipped,
                 )
 
         loader = AutoWeightsLoader(self)

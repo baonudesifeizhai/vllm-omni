@@ -18,7 +18,6 @@ from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.model_loader.weight_utils import (
-    download_gguf,
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
     filter_duplicate_safetensors_files,
@@ -30,6 +29,11 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.transformers_utils.repo_utils import file_exists
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.torch_utils import set_default_torch_dtype
+
+try:
+    from vllm.model_executor.model_loader.weight_utils import download_gguf
+except ImportError:
+    download_gguf = None
 
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -478,23 +482,27 @@ class DiffusersPipelineLoader:
 
     def _is_gguf_quantization(self) -> bool:
         """Check whether or not this pipeline loader is pointing at a GGUF config."""
-        from vllm_omni.quantization.gguf_config import DiffusionGGUFConfig
-
         maybe_gguf_model = self._get_gguf_model_from_config()
-        is_gguf = (
-            isinstance(self.quant_config, DiffusionGGUFConfig)
-            or (isinstance(self.quant_config, dict) and self.quant_config.get("method") == "gguf")
-            or (hasattr(self.quant_config, "get_name") and self.quant_config.get_name() == "gguf")
-        )
-        if is_gguf:
+        if isinstance(self.quant_config, dict):
+            is_gguf = self.quant_config.get("method") == "gguf"
+        elif hasattr(self.quant_config, "get_name"):
+            is_gguf = self.quant_config.get_name() == "gguf"
+        else:
+            is_gguf = False
+
+        if is_gguf or maybe_gguf_model:
             if not maybe_gguf_model:
                 raise ValueError("GGUF quantization requires gguf_model")
             return True
 
-        if isinstance(self.quant_config, dict):
-            return False
+        try:
+            from vllm_omni.quantization.gguf_config import DiffusionGGUFConfig
+        except ModuleNotFoundError as err:
+            if err.name == "vllm.model_executor.layers.quantization.gguf":
+                return False
+            raise
 
-        return bool(maybe_gguf_model)
+        return isinstance(self.quant_config, DiffusionGGUFConfig)
 
     def _is_transformer_source(self, source: "ComponentSource") -> bool:
         if source.subfolder == "transformer":
@@ -520,6 +528,11 @@ class DiffusersPipelineLoader:
             )
         # repo_id:quant_type
         if "/" in gguf_model and ":" in gguf_model:
+            if download_gguf is None:
+                raise RuntimeError(
+                    "GGUF repo_id:quant_type references require "
+                    "vllm.model_executor.model_loader.weight_utils.download_gguf"
+                )
             repo_id, quant_type = gguf_model.rsplit(":", 1)
             return download_gguf(
                 repo_id,

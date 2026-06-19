@@ -65,9 +65,48 @@ from vllm.entrypoints.openai.engine.protocol import (
 )
 from vllm.entrypoints.openai.engine.serving import ChatLikeRequest, clamp_prompt_logprobs
 from vllm.entrypoints.openai.parser.harmony_utils import (
+    get_encoding,
     get_streamable_parser_for_assistant,
-    parse_chat_output,
 )
+
+try:
+    from vllm.entrypoints.openai.parser.harmony_utils import parse_chat_output
+except ImportError:
+    from openai_harmony import Role
+
+    def _flatten_harmony_content(content: object) -> str:
+        if isinstance(content, str):
+            return content
+        if not isinstance(content, list):
+            return ""
+
+        parts: list[str] = []
+        for item in content:
+            text = getattr(item, "text", None)
+            if text is not None:
+                parts.append(text)
+            elif isinstance(item, dict) and item.get("text") is not None:
+                parts.append(item["text"])
+        return "".join(parts)
+
+    def parse_chat_output(token_ids: list[int]) -> tuple[str | None, str, object]:
+        messages = get_encoding().parse_messages_from_completion_tokens(
+            token_ids,
+            Role.ASSISTANT,
+            strict=False,
+        )
+        reasoning_parts: list[str] = []
+        content_parts: list[str] = []
+        for message in messages:
+            text = _flatten_harmony_content(message.content)
+            if message.channel == "analysis":
+                reasoning_parts.append(text)
+            elif message.channel == "final":
+                content_parts.append(text)
+        reasoning = "".join(reasoning_parts) or None
+        return reasoning, "".join(content_parts), None
+
+
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.entrypoints.serve.utils.api_utils import should_include_usage
 from vllm.entrypoints.serve.utils.tool_calls_utils import maybe_filter_parallel_tool_calls
