@@ -2234,7 +2234,11 @@ class HunyuanImage3Model(nn.Module):
             # processed with quantization, LoRA, fine-tuning, etc.
             if self.config.tie_word_embeddings and "lm_head.weight" in name:
                 continue
-            if self.quant_config is not None and (scale_name := self.quant_config.get_cache_scale(name)):
+            if (
+                self.quant_config is not None
+                and (get_cache_scale := getattr(self.quant_config, "get_cache_scale", None))
+                and (scale_name := get_cache_scale(name))
+            ):
                 # Loading kv cache scales for compressed-tensors quantization
                 param = params_dict[scale_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
