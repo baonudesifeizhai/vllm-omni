@@ -662,6 +662,10 @@ class OmniDiffusionConfig:
 
     profiler_config: "ProfilerConfig | dict[str, Any] | None" = None
 
+    # vLLM quantized Linear backend override. Diffusion workers build a
+    # worker-local VllmConfig, so this must be carried explicitly.
+    linear_backend: str | None = None
+
     # Model-specific function for collecting CFG KV caches (set at runtime)
     cfg_kv_collect_func: Any | None = None
 
@@ -780,6 +784,9 @@ class OmniDiffusionConfig:
             self.additional_config = dict(self.additional_config)
         else:
             raise TypeError(f"additional_config must be a mapping or None, got {type(self.additional_config)!r}")
+
+        if isinstance(self.linear_backend, str):
+            self.linear_backend = self.linear_backend.lower().replace("-", "_")
 
         # Convert parallel_config dict/DictConfig to DiffusionParallelConfig
         # Use Mapping to handle both plain dicts and OmegaConf DictConfig
