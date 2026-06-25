@@ -82,7 +82,14 @@ def create_transformer_from_config(
     signature = inspect.signature(LTX2VideoTransformer3DModel.__init__)
     allowed_keys = set(signature.parameters.keys())
     kwargs = {k: v for k, v in config.items() if k in allowed_keys}
+    if "quantization_config" in config:
+        from vllm_omni.quantization.factory import resolve_quant_config_from_disk
+
+        quant_config = resolve_quant_config_from_disk(quant_config, config["quantization_config"])
     if quant_config is not None:
+        from vllm.model_executor.model_loader.utils import configure_quant_config
+
+        configure_quant_config(quant_config, LTX2VideoTransformer3DModel)
         kwargs["quant_config"] = quant_config
 
     return LTX2VideoTransformer3DModel(**kwargs)

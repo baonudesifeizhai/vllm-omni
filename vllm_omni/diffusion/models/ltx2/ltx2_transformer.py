@@ -691,9 +691,16 @@ class LTX2Attention(torch.nn.Module):
         )
 
         # LTX-2.3: per-head gated attention
-        # leave unquantized for this linear
         if apply_gated_attention:
-            self.to_gate_logits = nn.Linear(query_dim, self.query_num_heads, bias=True)
+            self.to_gate_logits = ColumnParallelLinear(
+                query_dim,
+                heads,
+                bias=True,
+                gather_output=False,
+                return_bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_gate_logits" if prefix else "to_gate_logits",
+            )
         else:
             self.to_gate_logits = None
 
@@ -2041,6 +2048,10 @@ class LTX2VideoTransformer3DModel(nn.Module):
             (".audio_attn1.to_qkv", ".audio_attn1.to_k", "k"),
             (".audio_attn1.to_qkv", ".audio_attn1.to_v", "v"),
         ]
+        parameter_aliases = {
+            "audio_prompt_adaln_single.": "audio_prompt_adaln.",
+            "prompt_adaln_single.": "prompt_adaln.",
+        }
 
         params_dict = dict(self.named_parameters())
         tp_size = get_tensor_model_parallel_world_size()
@@ -2063,13 +2074,27 @@ class LTX2VideoTransformer3DModel(nn.Module):
             return weight
 
         for name, loaded_weight in weights:
+            for checkpoint_prefix, model_prefix in parameter_aliases.items():
+                if name.startswith(checkpoint_prefix):
+                    name = model_prefix + name.removeprefix(checkpoint_prefix)
+                    break
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
                 param = params_dict[name]
                 weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
+                try:
+                    weight_loader(param, loaded_weight, shard_id)
+                except AssertionError as exc:
+                    raise RuntimeError(
+                        "Failed to load fused LTX QKV parameter "
+                        f"{name!r} from {weight_name!r} shard {shard_id!r}: "
+                        f"parameter type={type(param).__name__}, "
+                        f"parameter shape={tuple(param.shape)}, "
+                        f"checkpoint shape={tuple(loaded_weight.shape)}"
+                    ) from exc
                 break
             else:
                 if name not in params_dict:
