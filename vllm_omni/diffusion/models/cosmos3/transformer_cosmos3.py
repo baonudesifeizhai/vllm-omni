@@ -12,6 +12,7 @@ Ported from the TRT-LLM integration (tekit branch user/shreyasm/cosmos3).
 from __future__ import annotations
 
 import math
+from collections import OrderedDict
 from typing import Any
 
 import torch
@@ -39,6 +40,8 @@ from vllm_omni.diffusion.layers.norm import RMSNorm as _VllmRMSNorm
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
+
+_ROPE_FREQS_CACHE_MAX_SIZE = 8
 
 
 class RMSNorm(_VllmRMSNorm):
@@ -1146,6 +1149,7 @@ class Cosmos3VFMTransformer(nn.Module):
         # Cached state (populated on first forward, reused across denoising steps)
         self.cached_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None
         self.cached_freqs_gen: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._rope_freqs_cache: OrderedDict[tuple[Any, ...], Any] = OrderedDict()
 
     @property
     def device(self) -> torch.device:
@@ -1221,6 +1225,55 @@ class Cosmos3VFMTransformer(nn.Module):
 
     # -- RoPE computation ----------------------------------------------------
 
+    @staticmethod
+    def _rope_cache_float(value: float | None) -> float | None:
+        if value is None:
+            return None
+        return float(value)
+
+    def _rope_freqs_cache_key(
+        self,
+        *,
+        batch_size: int,
+        text_seq_len: int,
+        text_lengths: tuple[int, ...],
+        t: int,
+        hp: int,
+        wp: int,
+        fps: float | None,
+        device: torch.device,
+        dtype: torch.dtype,
+        t_action: int | None,
+        action_start_frame_offset: int,
+        action_fps: float | None,
+        t_sound: int | None,
+        num_vision_items: int,
+        share_vision_temporal_positions: bool,
+    ) -> tuple[Any, ...]:
+        return (
+            batch_size,
+            text_seq_len,
+            text_lengths,
+            t,
+            hp,
+            wp,
+            self._rope_cache_float(fps),
+            str(device),
+            str(dtype),
+            int(t_action or 0),
+            int(action_start_frame_offset),
+            self._rope_cache_float(action_fps),
+            int(t_sound or 0),
+            int(num_vision_items),
+            bool(share_vision_temporal_positions),
+            self._rope_cache_float(self.base_fps),
+            int(self.temporal_compression_factor),
+            bool(self.enable_fps_modulation),
+            int(self.temporal_modality_margin),
+            self._rope_cache_float(getattr(self, "sound_latent_fps", None)),
+            int(getattr(self, "temporal_compression_factor_sound", 1)),
+        )
+
     def _compute_rope_freqs(
         self,
         text_mask: torch.Tensor,
@@ -1236,13 +1289,38 @@ class Cosmos3VFMTransformer(nn.Module):
         t_sound: int | None = None,
         num_vision_items: int = 1,
         share_vision_temporal_positions: bool = False,
+        real_text_len: int | None = None,
     ) -> tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
         """Compute mRoPE cos/sin for UND text and GEN media pathways."""
         if num_vision_items <= 0:
             raise ValueError(f"Cosmos3 num_vision_items must be positive, got {num_vision_items}.")
         B = text_mask.shape[0]
         S_text = text_mask.shape[1]
-        text_lengths = text_mask.sum(dim=1).long()
+        if real_text_len is None:
+            text_lengths = text_mask.sum(dim=1).long()
+            real_text_lengths = tuple(int(text_lengths[b].item()) for b in range(B))
+        else:
+            real_text_lengths = (int(real_text_len),) * B
+        cache_key = self._rope_freqs_cache_key(
+            batch_size=B,
+            text_seq_len=S_text,
+            text_lengths=real_text_lengths,
+            t=t,
+            hp=hp,
+            wp=wp,
+            fps=fps,
+            device=device,
+            dtype=dtype,
+            t_action=t_action,
+            action_start_frame_offset=action_start_frame_offset,
+            action_fps=action_fps,
+            t_sound=t_sound,
+            num_vision_items=num_vision_items,
+            share_vision_temporal_positions=share_vision_temporal_positions,
+        )
+        if cache_key in self._rope_freqs_cache:
+            self._rope_freqs_cache.move_to_end(cache_key)
+            return self._rope_freqs_cache[cache_key]
         effective_fps = fps if fps is not None and t > 1 else None
         action_frames = int(t_action or 0)
         sound_frames = int(t_sound or 0)
@@ -1250,7 +1328,7 @@ class Cosmos3VFMTransformer(nn.Module):
         text_pos_list = []
         gen_pos_list = []
         for b in range(B):
-            real_len = int(text_lengths[b].item())
+            real_len = real_text_lengths[b]
             t_pos, t_offset = compute_mrope_position_ids_text(real_len, temporal_offset=0)
             media_temporal_offset = t_offset + self.temporal_modality_margin
             gen_positions = []
@@ -1323,7 +1401,12 @@ class Cosmos3VFMTransformer(nn.Module):
 
         freqs_und = (cos_und.unsqueeze(2), sin_und.unsqueeze(2))  # (B, S, 1, D)
         freqs_gen = (cos_gen.unsqueeze(2), sin_gen.unsqueeze(2))
-        return freqs_und, freqs_gen
+        result = (freqs_und, freqs_gen)
+        self._rope_freqs_cache[cache_key] = result
+        self._rope_freqs_cache.move_to_end(cache_key)
+        while len(self._rope_freqs_cache) > _ROPE_FREQS_CACHE_MAX_SIZE:
+            self._rope_freqs_cache.popitem(last=False)
+        return result
 
     # -- Cache management ----------------------------------------------------
 
@@ -1555,6 +1638,7 @@ class Cosmos3VFMTransformer(nn.Module):
                 t_sound=s_sound,
                 num_vision_items=len(control_latent_list) + 1,
                 share_vision_temporal_positions=transfer_share_vision_temporal_positions,
+                real_text_len=max_real_len,
             )
             cached_kv_full = self.language_model(text_ids, freqs_und)
             self.cached_freqs_gen = freqs_gen
