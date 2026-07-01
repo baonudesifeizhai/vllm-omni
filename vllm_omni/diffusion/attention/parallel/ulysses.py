@@ -11,7 +11,7 @@ import torch.nn.functional as F
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.parallel.base import ParallelAttentionContext
-from vllm_omni.diffusion.distributed.comm import SeqAllToAll4D
+from vllm_omni.diffusion.distributed.comm import SeqAllToAll4D, all_to_all_4D_qkv
 from vllm_omni.diffusion.distributed.group_coordinator import SequenceParallelGroupCoordinator
 from vllm_omni.diffusion.forward_context import get_ulysses_mode
 
@@ -329,9 +329,40 @@ class UlyssesParallelAttention:
                     )
 
             # (bs, seq_len/P, head_cnt, head_size) -> (bs, seq_len, head_cnt/P, head_size)
-            query = SeqAllToAll4D.apply(self._ulysses_pg, query, self._scatter_idx, self._gather_idx, self._use_sync)
-            key = SeqAllToAll4D.apply(self._ulysses_pg, key, self._scatter_idx, self._gather_idx, self._use_sync)
-            value = SeqAllToAll4D.apply(self._ulysses_pg, value, self._scatter_idx, self._gather_idx, self._use_sync)
+            with torch.profiler.record_function("ulysses_packed_qkv_all2all"):
+                packed_qkv = all_to_all_4D_qkv(
+                    query,
+                    key,
+                    value,
+                    self._scatter_idx,
+                    self._gather_idx,
+                    group=self._ulysses_pg,
+                    use_sync=self._use_sync,
+                )
+            if packed_qkv is None:
+                query = SeqAllToAll4D.apply(
+                    self._ulysses_pg,
+                    query,
+                    self._scatter_idx,
+                    self._gather_idx,
+                    self._use_sync,
+                )
+                key = SeqAllToAll4D.apply(
+                    self._ulysses_pg,
+                    key,
+                    self._scatter_idx,
+                    self._gather_idx,
+                    self._use_sync,
+                )
+                value = SeqAllToAll4D.apply(
+                    self._ulysses_pg,
+                    value,
+                    self._scatter_idx,
+                    self._gather_idx,
+                    self._use_sync,
+                )
+            else:
+                query, key, value = packed_qkv
             seq_lens = []
             local_seq_len = 0
             orig_head_cnt = 0
