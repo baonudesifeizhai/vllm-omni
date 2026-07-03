@@ -7,9 +7,12 @@
 # https://github.com/feifeibear/long-context-attention/blob/main/yunchang/attention/layer.py
 
 
+import os
+from collections.abc import Callable
 from dataclasses import replace
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import extract_layer_index
@@ -21,11 +24,33 @@ from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
 from vllm_omni.diffusion.attention.parallel.ring import RingParallelAttention
 from vllm_omni.diffusion.attention.selector import get_attn_backend_for_role
 from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
+from vllm_omni.diffusion.distributed.comm import SeqAllToAll4D
 from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
+
+_TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
+_USE_SYMM_MEM_ALL2ALL_ENV = "VLLM_OMNI_USE_SYMM_MEM_ALL2ALL"
+_USE_SYMM_MEM_ATTN_OVERLAP_ENV = "VLLM_OMNI_USE_SYMM_MEM_ATTENTION_OVERLAP"
+_SYMM_MEM_ATTN_OVERLAP_CHUNKS_ENV = "VLLM_OMNI_SYMM_MEM_ATTENTION_CHUNKS"
+
+
+def _env_flag(name: str) -> bool:
+    value = os.environ.get(name, "")
+    return value.strip().lower() in _TRUE_ENV_VALUES
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        logger.warning_once("Ignoring invalid integer env %s=%r", name, value)
+        return default
 
 
 def _try_extract_layer_index(prefix: str) -> int | None:
@@ -168,6 +193,11 @@ class Attention(nn.Module):
                 return self._no_parallel_strategy
         return self.parallel_strategy
 
+    @property
+    def async_ulysses_enabled(self) -> bool:
+        strategy = self._get_active_parallel_strategy()
+        return bool(getattr(strategy, "async_ulysses_enabled", False))
+
     def _init_kv_cache_quantization(self, config) -> None:
         if config is None:
             return
@@ -242,6 +272,35 @@ class Attention(nn.Module):
 
         return self._forward_impl(query, key, value, attn_metadata)
 
+    def forward_async(
+        self,
+        compute_query: Callable[[], torch.Tensor],
+        compute_key: Callable[[], torch.Tensor],
+        compute_value: Callable[[], torch.Tensor],
+        attn_metadata: AttentionMetadata | None = None,
+    ) -> torch.Tensor:
+        """Run V/Q/K projection and strict-Ulysses input A2A as a pipeline."""
+        strategy = self._get_active_parallel_strategy()
+        pre_attention_async = getattr(strategy, "pre_attention_async", None)
+        if not getattr(strategy, "async_ulysses_enabled", False) or pre_attention_async is None:
+            raise RuntimeError("Attention.forward_async requires the symmetric-memory strict-Ulysses fast path")
+
+        query, key, value, attn_metadata, ctx = pre_attention_async(
+            compute_query,
+            compute_key,
+            compute_value,
+            attn_metadata,
+        )
+        return self._forward_after_pre_attention(
+            query,
+            key,
+            value,
+            attn_metadata,
+            strategy,
+            ctx,
+            allow_post_overlap=False,
+        )
+
     @torch.compiler.disable
     def _forward_hsdp_compile_boundary(
         self,
@@ -267,7 +326,39 @@ class Attention(nn.Module):
         # For Ring: Concat joint_q
         query, key, value, attn_metadata, ctx = strategy.pre_attention(query, key, value, attn_metadata)
 
+        return self._forward_after_pre_attention(
+            query,
+            key,
+            value,
+            attn_metadata,
+            strategy,
+            ctx,
+        )
+
+    def _forward_after_pre_attention(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None,
+        strategy,
+        ctx,
+        *,
+        allow_post_overlap: bool = True,
+    ) -> torch.Tensor:
         attn_metadata = self._with_kv_cache_dtype(attn_metadata)
+
+        if allow_post_overlap:
+            out = self._try_forward_ulysses_post_attention_overlap(
+                query,
+                key,
+                value,
+                attn_metadata,
+                strategy,
+                ctx,
+            )
+            if out is not None:
+                return out
 
         # 2. Kernel Execution (Computation)
         if self.use_ring and strategy is not self._no_parallel_strategy:
@@ -280,6 +371,146 @@ class Attention(nn.Module):
         out = strategy.post_attention(out, ctx)
 
         return out
+
+    def _can_use_ulysses_post_attention_overlap(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None,
+        strategy,
+        ctx,
+    ) -> bool:
+        if not (_env_flag(_USE_SYMM_MEM_ALL2ALL_ENV) and _env_flag(_USE_SYMM_MEM_ATTN_OVERLAP_ENV)):
+            return False
+        if torch.compiler.is_compiling():
+            return False
+        if self.use_ring or strategy is self._no_parallel_strategy:
+            return False
+        if getattr(strategy, "name", None) != "ulysses":
+            return False
+        if not (query.is_cuda and key.is_cuda and value.is_cuda):
+            return False
+        if not current_omni_platform.is_cuda():
+            return False
+        if getattr(ctx, "use_uaa", False):
+            return False
+        if getattr(ctx, "joint_len", 0) != 0:
+            return False
+        if getattr(ctx, "scatter_idx", None) != 2 or getattr(ctx, "gather_idx", None) != 1:
+            return False
+        if query.dim() != 4 or key.dim() != 4 or value.dim() != 4:
+            return False
+        if query.shape[0] != key.shape[0] or query.shape[0] != value.shape[0]:
+            return False
+        if key.shape[1] != value.shape[1]:
+            return False
+        if query.shape[3] != key.shape[3] or query.shape[3] != value.shape[3]:
+            return False
+        q_heads = int(query.shape[2])
+        k_heads = int(key.shape[2])
+        v_heads = int(value.shape[2])
+        if k_heads <= 0 or q_heads <= 0 or k_heads != v_heads:
+            return False
+        if q_heads % k_heads != 0:
+            return False
+        world_size = dist.get_world_size(ctx.ulysses_pg)
+        if world_size <= 1:
+            return False
+        return query.shape[1] % world_size == 0 and q_heads > 1
+
+    @torch.compiler.disable
+    def _try_forward_ulysses_post_attention_overlap(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None,
+        strategy,
+        ctx,
+    ) -> torch.Tensor | None:
+        if not self._can_use_ulysses_post_attention_overlap(
+            query,
+            key,
+            value,
+            attn_metadata,
+            strategy,
+            ctx,
+        ):
+            return None
+
+        world_size = dist.get_world_size(ctx.ulysses_pg)
+        batch, seq_len, local_q_heads, head_dim = query.shape
+        local_kv_heads = int(key.shape[2])
+        q_per_kv = local_q_heads // local_kv_heads
+        local_seq_len = seq_len // world_size
+        chunk_count = min(
+            _env_int(_SYMM_MEM_ATTN_OVERLAP_CHUNKS_ENV, 2),
+            local_kv_heads,
+        )
+        if chunk_count <= 1:
+            return None
+
+        output = query.new_empty((batch, local_seq_len, local_q_heads * world_size, head_dim))
+
+        compute_stream = torch.cuda.current_stream(query.device)
+        comm_stream = torch.cuda.Stream(device=query.device)
+        done_events: list[torch.cuda.Event] = []
+        live_tensors: list[torch.Tensor] = [output]
+
+        for chunk_idx in range(chunk_count):
+            kv_start = chunk_idx * local_kv_heads // chunk_count
+            kv_end = (chunk_idx + 1) * local_kv_heads // chunk_count
+            if kv_start == kv_end:
+                continue
+            head_start = kv_start * q_per_kv
+            head_end = kv_end * q_per_kv
+            chunk_heads = head_end - head_start
+
+            q_chunk = query[:, :, head_start:head_end, :].contiguous()
+            k_chunk = key[:, :, kv_start:kv_end, :].contiguous()
+            v_chunk = value[:, :, kv_start:kv_end, :].contiguous()
+            with torch.profiler.record_function("ulysses_overlap_attention_chunk"):
+                attn_chunk = self._run_local_attention(
+                    q_chunk,
+                    k_chunk,
+                    v_chunk,
+                    attn_metadata,
+                )
+
+            ready = torch.cuda.Event()
+            compute_stream.record_event(ready)
+
+            with torch.cuda.stream(comm_stream):
+                comm_stream.wait_event(ready)
+                with torch.profiler.record_function("ulysses_overlap_reverse_all2all_chunk"):
+                    comm_chunk = SeqAllToAll4D.apply(
+                        ctx.ulysses_pg,
+                        attn_chunk,
+                        ctx.gather_idx,
+                        ctx.scatter_idx,
+                        ctx.use_sync,
+                    )
+                    for rank in range(world_size):
+                        src_start = rank * chunk_heads
+                        src_end = src_start + chunk_heads
+                        dst_start = rank * local_q_heads + head_start
+                        dst_end = dst_start + chunk_heads
+                        output[:, :, dst_start:dst_end, :].copy_(comm_chunk[:, :, src_start:src_end, :])
+                done = torch.cuda.Event()
+                comm_stream.record_event(done)
+
+            for tensor in (q_chunk, k_chunk, v_chunk, attn_chunk, comm_chunk):
+                tensor.record_stream(comm_stream)
+                live_tensors.append(tensor)
+            output.record_stream(comm_stream)
+            done_events.append(done)
+
+        for event in done_events:
+            compute_stream.wait_event(event)
+        # Keep tensors alive until the waits above are enqueued.
+        live_tensors.clear()
+        return output
 
     def _run_local_attention(self, query, key, value, attn_metadata):
         if query.dtype == torch.float32:

@@ -149,7 +149,7 @@ where = ["."]
 include = ["vllm_omni*"]
 
 [tool.setuptools.package-data]
-"vllm_omni" = ["_version.py", "py.typed"]
+"vllm_omni" = ["_version.py", "py.typed", "csrc/*.cpp", "csrc/*.cu"]
 "vllm_omni.model_executor.stage_configs" = ["*.yaml"]
 
 [tool.setuptools_scm]

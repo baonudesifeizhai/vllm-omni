@@ -361,6 +361,10 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat((-x2, x1), dim=-1)
 
 
+def _apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    return (x * cos) + (_rotate_half(x) * sin)
+
+
 def _apply_rotary_pos_emb(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -375,9 +379,7 @@ def _apply_rotary_pos_emb(
         cos: [1, S, 1, D] or broadcastable
         sin: [1, S, 1, D] or broadcastable
     """
-    q_embed = (q * cos) + (_rotate_half(q) * sin)
-    k_embed = (k * cos) + (_rotate_half(k) * sin)
-    return q_embed, k_embed
+    return _apply_rotary(q, cos, sin), _apply_rotary(k, cos, sin)
 
 
 # ---------------------------------------------------------------------------
@@ -666,6 +668,26 @@ class Cosmos3CrossAttention(nn.Module):
 
     # -- SP path: framework Attention with joint_key/value -------------------
 
+    def _sp_metadata(
+        self,
+        reference: torch.Tensor,
+        k_und: torch.Tensor,
+        v_und: torch.Tensor,
+    ) -> AttentionMetadata:
+        batch = reference.shape[0]
+        joint_q = reference.new_empty(
+            batch,
+            0,
+            self.num_heads_local,
+            self.head_dim,
+        )
+        return AttentionMetadata(
+            joint_query=joint_q,
+            joint_key=k_und,
+            joint_value=v_und,
+            joint_strategy="front",
+        )
+
     def _forward_sp(
         self,
         q: torch.Tensor,
@@ -680,14 +702,7 @@ class Cosmos3CrossAttention(nn.Module):
         # (joint_query, joint_key, joint_value must all be present) without
         # adding text tokens to Q.  joint_len=0 keeps post_attention on the
         # standard reverse-all-to-all path (no joint-output splitting).
-        joint_q = q.new_empty(B, 0, self.num_heads_local, self.head_dim)
-
-        attn_metadata = AttentionMetadata(
-            joint_query=joint_q,
-            joint_key=k_und,
-            joint_value=v_und,
-            joint_strategy="front",
-        )
+        attn_metadata = self._sp_metadata(q, k_und, v_und)
         out = self.attn(q, k, v, attn_metadata)
         return out.reshape(B, S_gen, -1)
 
@@ -710,6 +725,63 @@ class Cosmos3CrossAttention(nn.Module):
             freqs_sin: [B, S_gen_local, 1, D]
         """
         B, S_gen, _ = hidden_states.shape
+
+        if _is_sp_active() and self.attn.async_ulysses_enabled:
+
+            def compute_value() -> torch.Tensor:
+                return self.to_v(hidden_states).view(
+                    B,
+                    S_gen,
+                    self.num_kv_heads_local,
+                    self.head_dim,
+                )
+
+            def compute_query() -> torch.Tensor:
+                query = self.to_q(hidden_states).view(
+                    B,
+                    S_gen,
+                    self.num_heads_local,
+                    self.head_dim,
+                )
+                query = F.rms_norm(
+                    query,
+                    (self.head_dim,),
+                    self.norm_q.weight,
+                    eps=self.norm_q.variance_epsilon,
+                )
+                return _apply_rotary(
+                    query,
+                    freqs_cos,
+                    freqs_sin,
+                )
+
+            def compute_key() -> torch.Tensor:
+                key = self.to_k(hidden_states).view(
+                    B,
+                    S_gen,
+                    self.num_kv_heads_local,
+                    self.head_dim,
+                )
+                key = F.rms_norm(
+                    key,
+                    (self.head_dim,),
+                    self.norm_k.weight,
+                    eps=self.norm_k.variance_epsilon,
+                )
+                return _apply_rotary(
+                    key,
+                    freqs_cos,
+                    freqs_sin,
+                )
+
+            attn_metadata = self._sp_metadata(hidden_states, k_und, v_und)
+            out = self.attn.forward_async(
+                compute_query,
+                compute_key,
+                compute_value,
+                attn_metadata,
+            )
+            return self.to_out(out.reshape(B, S_gen, -1))
 
         q = self.to_q(hidden_states).view(B, S_gen, self.num_heads_local, self.head_dim)
         k = self.to_k(hidden_states).view(B, S_gen, self.num_kv_heads_local, self.head_dim)
