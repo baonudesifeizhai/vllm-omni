@@ -9,6 +9,9 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
+from vllm_omni.diffusion.distributed.symm_mem_ulysses_ops import (
+    load_symm_mem_ulysses_ops,
+)
 from vllm_omni.platforms import current_omni_platform
 
 __all__ = [
@@ -58,6 +61,52 @@ def _can_use_symm_mem_all2all(
         and hasattr(torch_symm_mem, "_pipelined_produce_and_all2all")
         and _get_group_name(group) is not None
     )
+
+
+@torch.compiler.disable
+def _symm_mem_opaque_all_to_all_4d_qkv(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    scatter_idx: int,
+    gather_idx: int,
+    group: dist.ProcessGroup | None,
+    use_sync: bool,
+    seq_world_size: int,
+) -> tuple[Tensor, Tensor, Tensor] | None:
+    if (
+        not _use_symm_mem_packed_qkv_all2all()
+        or not _can_use_symm_mem_all2all(query, group, seq_world_size)
+        or group is None
+        or not (key.is_cuda and value.is_cuda)
+        or not (query.device == key.device == value.device)
+        or not (query.dtype == key.dtype == value.dtype)
+        or scatter_idx != 2
+        or gather_idx != 1
+        or query.dim() != 4
+        or key.dim() != 4
+        or value.dim() != 4
+    ):
+        return None
+
+    bs, shard_seqlen, q_heads, head_size = query.shape
+    if key.shape[:2] != (bs, shard_seqlen) or value.shape[:2] != (bs, shard_seqlen):
+        return None
+    if key.shape[3] != head_size or value.shape[3] != head_size:
+        return None
+    if q_heads % seq_world_size != 0 or key.shape[2] % seq_world_size != 0 or value.shape[2] % seq_world_size != 0:
+        return None
+
+    load_symm_mem_ulysses_ops()
+    output = torch.ops.vllm_omni.symm_mem_ulysses_exchange_qkv(
+        query.contiguous(),
+        key.contiguous(),
+        value.contiguous(),
+        group.boxed(),
+    )
+    if use_sync:
+        current_omni_platform.synchronize()
+    return output
 
 
 @torch.compiler.disable
@@ -225,6 +274,19 @@ def all_to_all_4D_qkv(
     so callers can fall back to the regular per-tensor all-to-all path.
     """
     seq_world_size = dist.get_world_size(group)
+    opaque_qkv = _symm_mem_opaque_all_to_all_4d_qkv(
+        query,
+        key,
+        value,
+        scatter_idx,
+        gather_idx,
+        group,
+        use_sync,
+        seq_world_size,
+    )
+    if opaque_qkv is not None:
+        return opaque_qkv
+
     return _symm_mem_all_to_all_4d_qkv(
         query,
         key,

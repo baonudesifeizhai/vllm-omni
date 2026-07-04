@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -14,10 +13,6 @@ from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.parallel.base import ParallelAttentionContext
 from vllm_omni.diffusion.distributed.comm import SeqAllToAll4D, all_to_all_4D_qkv
 from vllm_omni.diffusion.distributed.group_coordinator import SequenceParallelGroupCoordinator
-from vllm_omni.diffusion.distributed.symm_mem_ulysses import (
-    SymmMemUlyssesTransport,
-    get_symm_mem_ulysses_transport,
-)
 from vllm_omni.diffusion.forward_context import get_ulysses_mode
 
 
@@ -192,8 +187,6 @@ class UlyssesParallelAttention:
         self._scatter_idx = scatter_idx
         self._gather_idx = gather_idx
         self._use_sync = use_sync
-        if SymmMemUlyssesTransport.is_available(self._ulysses_pg):
-            SymmMemUlyssesTransport.load_ops()
 
     @property
     def enabled(self) -> bool:
@@ -202,58 +195,6 @@ class UlyssesParallelAttention:
     @property
     def name(self) -> str:
         return "ulysses"
-
-    @property
-    def async_ulysses_enabled(self) -> bool:
-        return (
-            self._sp_group.ring_world_size == 1
-            and self._scatter_idx == 2
-            and self._gather_idx == 1
-            and get_ulysses_mode(default="strict") == "strict"
-            and SymmMemUlyssesTransport.is_available(self._ulysses_pg)
-        )
-
-    def pre_attention_async(
-        self,
-        compute_query: Callable[[], torch.Tensor],
-        compute_key: Callable[[], torch.Tensor],
-        compute_value: Callable[[], torch.Tensor],
-        attn_metadata: AttentionMetadata | None,
-    ):
-        if not self.async_ulysses_enabled:
-            raise RuntimeError(
-                "Async Ulysses requires strict pure-Ulysses mode, CUDA, "
-                "scatter_idx=2/gather_idx=1, and symmetric memory enabled"
-            )
-
-        with torch.profiler.record_function("ulysses_async_compute_value"):
-            value = compute_value()
-        transport = get_symm_mem_ulysses_transport(
-            self._ulysses_pg,
-            value.device,
-        )
-        value_work = transport.prepare(value, name="value")
-        transport.push(value_work)
-
-        with torch.profiler.record_function("ulysses_async_compute_query"):
-            query = compute_query()
-        query_work = transport.prepare(query, name="query")
-        transport.push(query_work)
-
-        with torch.profiler.record_function("ulysses_async_compute_key"):
-            key = compute_key()
-        key_work = transport.prepare(key, name="key")
-        transport.push(key_work)
-
-        value, query, key = transport.join()
-        query, key, value = transport.post_unscatter_qkv(query, key, value)
-        return self.pre_attention(
-            query,
-            key,
-            value,
-            attn_metadata,
-            _preexchanged=True,
-        )
 
     def pre_attention(
         self,

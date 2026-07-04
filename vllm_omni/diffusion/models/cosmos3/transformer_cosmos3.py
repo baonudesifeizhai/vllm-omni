@@ -726,63 +726,6 @@ class Cosmos3CrossAttention(nn.Module):
         """
         B, S_gen, _ = hidden_states.shape
 
-        if _is_sp_active() and self.attn.async_ulysses_enabled:
-
-            def compute_value() -> torch.Tensor:
-                return self.to_v(hidden_states).view(
-                    B,
-                    S_gen,
-                    self.num_kv_heads_local,
-                    self.head_dim,
-                )
-
-            def compute_query() -> torch.Tensor:
-                query = self.to_q(hidden_states).view(
-                    B,
-                    S_gen,
-                    self.num_heads_local,
-                    self.head_dim,
-                )
-                query = F.rms_norm(
-                    query,
-                    (self.head_dim,),
-                    self.norm_q.weight,
-                    eps=self.norm_q.variance_epsilon,
-                )
-                return _apply_rotary(
-                    query,
-                    freqs_cos,
-                    freqs_sin,
-                )
-
-            def compute_key() -> torch.Tensor:
-                key = self.to_k(hidden_states).view(
-                    B,
-                    S_gen,
-                    self.num_kv_heads_local,
-                    self.head_dim,
-                )
-                key = F.rms_norm(
-                    key,
-                    (self.head_dim,),
-                    self.norm_k.weight,
-                    eps=self.norm_k.variance_epsilon,
-                )
-                return _apply_rotary(
-                    key,
-                    freqs_cos,
-                    freqs_sin,
-                )
-
-            attn_metadata = self._sp_metadata(hidden_states, k_und, v_und)
-            out = self.attn.forward_async(
-                compute_query,
-                compute_key,
-                compute_value,
-                attn_metadata,
-            )
-            return self.to_out(out.reshape(B, S_gen, -1))
-
         q = self.to_q(hidden_states).view(B, S_gen, self.num_heads_local, self.head_dim)
         k = self.to_k(hidden_states).view(B, S_gen, self.num_kv_heads_local, self.head_dim)
         v = self.to_v(hidden_states).view(B, S_gen, self.num_kv_heads_local, self.head_dim)

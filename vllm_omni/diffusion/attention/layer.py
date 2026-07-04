@@ -8,7 +8,6 @@
 
 
 import os
-from collections.abc import Callable
 from dataclasses import replace
 
 import torch
@@ -193,11 +192,6 @@ class Attention(nn.Module):
                 return self._no_parallel_strategy
         return self.parallel_strategy
 
-    @property
-    def async_ulysses_enabled(self) -> bool:
-        strategy = self._get_active_parallel_strategy()
-        return bool(getattr(strategy, "async_ulysses_enabled", False))
-
     def _init_kv_cache_quantization(self, config) -> None:
         if config is None:
             return
@@ -271,35 +265,6 @@ class Attention(nn.Module):
                 return self._forward_hsdp_compile_boundary(query, key, value, attn_metadata)
 
         return self._forward_impl(query, key, value, attn_metadata)
-
-    def forward_async(
-        self,
-        compute_query: Callable[[], torch.Tensor],
-        compute_key: Callable[[], torch.Tensor],
-        compute_value: Callable[[], torch.Tensor],
-        attn_metadata: AttentionMetadata | None = None,
-    ) -> torch.Tensor:
-        """Run V/Q/K projection and strict-Ulysses input A2A as a pipeline."""
-        strategy = self._get_active_parallel_strategy()
-        pre_attention_async = getattr(strategy, "pre_attention_async", None)
-        if not getattr(strategy, "async_ulysses_enabled", False) or pre_attention_async is None:
-            raise RuntimeError("Attention.forward_async requires the symmetric-memory strict-Ulysses fast path")
-
-        query, key, value, attn_metadata, ctx = pre_attention_async(
-            compute_query,
-            compute_key,
-            compute_value,
-            attn_metadata,
-        )
-        return self._forward_after_pre_attention(
-            query,
-            key,
-            value,
-            attn_metadata,
-            strategy,
-            ctx,
-            allow_post_overlap=False,
-        )
 
     @torch.compiler.disable
     def _forward_hsdp_compile_boundary(

@@ -20,7 +20,8 @@ def load_symm_mem_ulysses_ops() -> None:
             str(source_root / "symm_mem_ulysses.cu"),
         ],
         extra_cflags=["-O3"],
-        extra_cuda_cflags=["-O3", "--use_fast_math"],
+        extra_cuda_cflags=["-O3"],
+        with_cuda=True,
         is_python_module=False,
         verbose=os.environ.get("VLLM_OMNI_EXT_VERBOSE", "0") == "1",
     )
