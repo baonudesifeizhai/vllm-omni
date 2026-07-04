@@ -17,10 +17,8 @@ def load_symm_mem_ulysses_ops() -> None:
         name="vllm_omni_symm_mem_ulysses",
         sources=[
             str(source_root / "symm_mem_ulysses.cpp"),
-            str(source_root / "symm_mem_ulysses.cu"),
         ],
         extra_cflags=["-O3"],
-        extra_cuda_cflags=["-O3"],
         with_cuda=True,
         is_python_module=False,
         verbose=os.environ.get("VLLM_OMNI_EXT_VERBOSE", "0") == "1",

@@ -24,36 +24,6 @@ inline void cuda_check(cudaError_t error) {
   TORCH_CHECK(error == cudaSuccess, cudaGetErrorString(error));
 }
 
-cudaError_t launch_pack_qkv(
-    const void* query,
-    const void* key,
-    const void* value,
-    void* send,
-    void* recv,
-    int rank,
-    int batch,
-    int shard_seq_len,
-    int query_heads,
-    int key_heads,
-    int value_heads,
-    int head_dim,
-    int world_size,
-    cudaStream_t stream);
-
-cudaError_t launch_unpack_qkv(
-    const void* recv,
-    void* query_out,
-    void* key_out,
-    void* value_out,
-    int batch,
-    int shard_seq_len,
-    int query_shard_heads,
-    int key_shard_heads,
-    int value_shard_heads,
-    int head_dim,
-    int world_size,
-    cudaStream_t stream);
-
 namespace {
 
 class AsyncUlyssesOp {
@@ -98,56 +68,55 @@ class AsyncUlyssesOp {
     const int64_t value_shard_heads = value_heads / world_size;
     const int64_t packed_shard_heads =
         query_shard_heads + key_shard_heads + value_shard_heads;
-    TORCH_CHECK(query.element_size() == 2);
-    TORCH_CHECK(head_dim % 8 == 0);
     const int64_t chunk_bytes =
         shard_seq_len * batch * packed_shard_heads * head_dim *
         query.element_size();
     const int64_t total_bytes = chunk_bytes * world_size;
 
     Slot& slot = get_slot(total_bytes);
-    auto stream = at::cuda::getCurrentCUDAStream().stream();
-    cuda_check(launch_pack_qkv(
-        query.data_ptr(),
-        key.data_ptr(),
-        value.data_ptr(),
-        slot.send,
-        slot.recv,
-        rank,
-        static_cast<int>(batch),
-        static_cast<int>(shard_seq_len),
-        static_cast<int>(query_heads),
-        static_cast<int>(key_heads),
-        static_cast<int>(value_heads),
-        static_cast<int>(head_dim),
-        world_size,
-        stream));
+    auto options = query.options();
+    const std::vector<int64_t> packed_shape = {
+        world_size, shard_seq_len, batch, packed_shard_heads, head_dim};
+    auto send = torch::from_blob(slot.send, packed_shape, [](void*) {}, options);
+    auto recv = torch::from_blob(slot.recv, packed_shape, [](void*) {}, options);
 
-    copy_to_peers(slot, static_cast<size_t>(chunk_bytes));
+    for (int peer = 0; peer < world_size; ++peer) {
+      auto dst = (peer == rank ? recv : send).select(0, peer);
+
+      int64_t offset = 0;
+      auto q_dst = dst.narrow(2, offset, query_shard_heads);
+      auto q_src =
+          query.narrow(2, peer * query_shard_heads, query_shard_heads)
+              .transpose(0, 1);
+      q_dst.copy_(q_src);
+
+      offset += query_shard_heads;
+      auto k_dst = dst.narrow(2, offset, key_shard_heads);
+      auto k_src = key.narrow(2, peer * key_shard_heads, key_shard_heads)
+                       .transpose(0, 1);
+      k_dst.copy_(k_src);
+
+      offset += key_shard_heads;
+      auto v_dst = dst.narrow(2, offset, value_shard_heads);
+      auto v_src =
+          value.narrow(2, peer * value_shard_heads, value_shard_heads)
+              .transpose(0, 1);
+      v_dst.copy_(v_src);
+    }
+
+    copy_to_peers(send, slot, static_cast<size_t>(chunk_bytes));
     barrier();
 
-    auto query_out = torch::empty(
-        {batch, world_size * shard_seq_len, query_shard_heads, head_dim},
-        query.options());
-    auto key_out = torch::empty(
-        {batch, world_size * shard_seq_len, key_shard_heads, head_dim},
-        query.options());
-    auto value_out = torch::empty(
-        {batch, world_size * shard_seq_len, value_shard_heads, head_dim},
-        query.options());
-    cuda_check(launch_unpack_qkv(
-        slot.recv,
-        query_out.data_ptr(),
-        key_out.data_ptr(),
-        value_out.data_ptr(),
-        static_cast<int>(batch),
-        static_cast<int>(shard_seq_len),
-        static_cast<int>(query_shard_heads),
-        static_cast<int>(key_shard_heads),
-        static_cast<int>(value_shard_heads),
-        static_cast<int>(head_dim),
-        world_size,
-        stream));
+    auto packed =
+        recv.reshape({world_size * shard_seq_len, batch, packed_shard_heads,
+                      head_dim})
+            .transpose(0, 1);
+    int64_t offset = 0;
+    auto query_out = packed.narrow(2, offset, query_shard_heads).contiguous();
+    offset += query_shard_heads;
+    auto key_out = packed.narrow(2, offset, key_shard_heads).contiguous();
+    offset += key_shard_heads;
+    auto value_out = packed.narrow(2, offset, value_shard_heads).contiguous();
     return {std::move(query_out), std::move(key_out), std::move(value_out)};
   }
 
@@ -165,7 +134,10 @@ class AsyncUlyssesOp {
     std::vector<void*> peer_ptrs;
   };
 
-  void copy_to_peers(const Slot& slot, size_t chunk_bytes) {
+  void copy_to_peers(
+      const torch::Tensor& send,
+      const Slot& slot,
+      size_t chunk_bytes) {
     const int world_size = group_->getSize();
     const int rank = group_->getRank();
     const int peers = world_size - 1;
@@ -176,7 +148,7 @@ class AsyncUlyssesOp {
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     cudaStreamCaptureStatus capture_status;
     cuda_check(cudaStreamIsCapturing(stream, &capture_status));
-    const auto* send_ptr = static_cast<const char*>(slot.send);
+    const auto* send_ptr = static_cast<const char*>(send.data_ptr());
 
     for (int peer = 0; peer < world_size; ++peer) {
       if (peer == rank) {
