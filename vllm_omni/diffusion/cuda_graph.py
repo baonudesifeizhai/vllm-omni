@@ -37,7 +37,6 @@ class DiffusionCUDAGraphConfig:
     use_global_graph_pool: bool = True
     include_non_tensor_inputs: bool = True
     include_tensor_strides: bool = True
-    disable_on_capture_error: bool = True
     clear_cuda_cache_on_capture: bool = False
     name: str = "diffusion"
 
@@ -232,10 +231,7 @@ class DiffusionCUDAGraphRunner:
 
     def clear(self) -> None:
         for entry in self._cache.values():
-            try:
-                entry.graph.reset()
-            except Exception:
-                logger.debug("Failed to reset CUDA graph for %s", self.config.name, exc_info=True)
+            entry.graph.reset()
         self._cache.clear()
         self.last_call_info = {"mode": "clear", "cache_size": 0}
 
@@ -259,21 +255,18 @@ class DiffusionCUDAGraphRunner:
             return self._eager(fn, "disabled", args, kwargs)
         if not graph_can_capture:
             return self._eager(fn, graph_fallback_reason or "adapter_rejected", args, kwargs)
-        if self._is_stream_capturing():
-            return self._eager(fn, "stream_capturing", args, kwargs)
-
         first_tensor = self.key_builder.first_tensor(args, kwargs)
         if first_tensor is None:
             return self._eager(fn, "no_tensor_inputs", args, kwargs)
         if first_tensor.device.type != "cuda":
             return self._eager(fn, "non_cuda_inputs", args, kwargs)
+        if torch.cuda.is_current_stream_capturing():
+            return self._eager(fn, "stream_capturing", args, kwargs)
 
         key = self.key_builder.build(args, kwargs, extra_key=graph_extra_key)
         entry = self._cache.get(key)
         if entry is None:
             entry = self._capture(key, fn, args, kwargs)
-            if entry is None:
-                return self._eager(fn, "capture_failed", args, kwargs)
             self._cache[key] = entry
             self._evict_if_needed()
             entry.graph.replay()
@@ -337,39 +330,28 @@ class DiffusionCUDAGraphRunner:
         fn: Callable[..., Any],
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
-    ) -> GraphEntry | None:
+    ) -> GraphEntry:
         static_args = [self._clone_static(value) for value in args]
         static_kwargs = {name: self._clone_static(value) for name, value in kwargs.items()}
         device_tensor = self.key_builder.first_tensor(static_args, static_kwargs)
-        if device_tensor is None:
-            return None
+        assert device_tensor is not None
 
-        try:
-            with torch.no_grad():
-                for _ in range(max(0, int(self.config.warmup_steps))):
-                    _ = fn(*static_args, **static_kwargs)
-                    torch.accelerator.synchronize(device_tensor.device)
-                    if self.config.clear_cuda_cache_on_capture:
-                        torch.accelerator.empty_cache()
+        with torch.no_grad():
+            for _ in range(self.config.warmup_steps):
+                fn(*static_args, **static_kwargs)
+                torch.accelerator.synchronize(device_tensor.device)
+                if self.config.clear_cuda_cache_on_capture:
+                    torch.accelerator.empty_cache()
 
-            graph = torch.cuda.CUDAGraph()
-            pool = self._graph_pool()
-            with torch.no_grad():
-                if pool is None:
-                    with torch.cuda.graph(graph):
-                        static_output = fn(*static_args, **static_kwargs)
-                else:
-                    with torch.cuda.graph(graph, pool=pool):
-                        static_output = fn(*static_args, **static_kwargs)
-        except Exception:
-            logger.warning(
-                "Disabling %s CUDA graphs after capture failure.",
-                self.config.name,
-                exc_info=True,
-            )
-            if self.config.disable_on_capture_error:
-                self.config.enabled = False
-            return None
+        graph = torch.cuda.CUDAGraph()
+        pool = self._graph_pool()
+        with torch.no_grad():
+            if pool is None:
+                with torch.cuda.graph(graph):
+                    static_output = fn(*static_args, **static_kwargs)
+            else:
+                with torch.cuda.graph(graph, pool=pool):
+                    static_output = fn(*static_args, **static_kwargs)
 
         logger.debug("Captured %s CUDA graph with key_size=%d", self.config.name, len(key))
         return GraphEntry(
@@ -395,22 +377,14 @@ class DiffusionCUDAGraphRunner:
         return fn(*args, **kwargs)
 
     def _evict_if_needed(self) -> None:
-        max_graphs = max(1, int(self.config.max_graphs))
-        while len(self._cache) > max_graphs:
+        while len(self._cache) > self.config.max_graphs:
             _, entry = self._cache.popitem(last=False)
-            try:
-                entry.graph.reset()
-            except Exception:
-                logger.debug("Failed to reset evicted CUDA graph for %s", self.config.name, exc_info=True)
+            entry.graph.reset()
 
     def _graph_pool(self) -> Any:
         if not self.config.use_global_graph_pool:
             return None
-        try:
-            return current_platform.get_global_graph_pool()
-        except Exception:
-            logger.debug("Could not obtain global CUDA graph pool; using a private pool.", exc_info=True)
-            return None
+        return current_platform.get_global_graph_pool()
 
     def _return_output(self, output: Any) -> Any:
         if not self.config.clone_outputs:
@@ -441,36 +415,19 @@ class DiffusionCUDAGraphRunner:
 
     def _copy_inputs(self, static_value: Any, dynamic_value: Any) -> None:
         if isinstance(static_value, torch.Tensor):
-            if not isinstance(dynamic_value, torch.Tensor):
-                raise TypeError("CUDA graph replay expected a tensor input.")
             static_value.copy_(dynamic_value)
             return
         if isinstance(static_value, list):
-            if not isinstance(dynamic_value, Sequence) or len(static_value) != len(dynamic_value):
-                raise ValueError("CUDA graph replay input list structure changed.")
             for static_item, dynamic_item in zip(static_value, dynamic_value):
                 self._copy_inputs(static_item, dynamic_item)
             return
         if isinstance(static_value, tuple):
-            if not isinstance(dynamic_value, tuple) or len(static_value) != len(dynamic_value):
-                raise ValueError("CUDA graph replay input tuple structure changed.")
             for static_item, dynamic_item in zip(static_value, dynamic_value):
                 self._copy_inputs(static_item, dynamic_item)
             return
         if isinstance(static_value, dict):
-            if not isinstance(dynamic_value, Mapping) or set(static_value) != set(dynamic_value):
-                raise ValueError("CUDA graph replay input dict structure changed.")
             for key in static_value:
                 self._copy_inputs(static_value[key], dynamic_value[key])
-
-    @staticmethod
-    def _is_stream_capturing() -> bool:
-        if not torch.cuda.is_available():
-            return False
-        try:
-            return bool(torch.cuda.is_current_stream_capturing())
-        except Exception:
-            return False
 
 
 __all__ = [

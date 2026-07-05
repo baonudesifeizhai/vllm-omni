@@ -163,35 +163,17 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             )
 
     def _setup_cuda_graphs(self) -> None:
-        """Let graph-capable diffusion pipelines install model-specific runners."""
+        """Install the pipeline-specific CUDA graph runner when enabled."""
         graph_config = DiffusionCUDAGraphConfig.from_value(
-            getattr(self.od_config, "cuda_graph_config", None),
-            enabled=getattr(self.od_config, "enable_cuda_graph", False),
+            self.od_config.cuda_graph_config,
+            enabled=self.od_config.enable_cuda_graph,
         )
         self.od_config.cuda_graph_config = graph_config
         self.od_config.enable_cuda_graph = bool(graph_config.enabled)
         if not graph_config.enabled:
             return
 
-        setup_cuda_graphs = getattr(self.pipeline, "setup_cuda_graphs", None)
-        if not callable(setup_cuda_graphs):
-            logger.warning(
-                "CUDA graphs were enabled, but %s does not implement setup_cuda_graphs(); running eager.",
-                self.pipeline.__class__.__name__,
-            )
-            graph_config.enabled = False
-            self.od_config.enable_cuda_graph = False
-            return
-
-        try:
-            setup_cuda_graphs()
-        except Exception as exc:
-            logger.warning(
-                "Model runner: setup_cuda_graphs() failed (%s); running without diffusion CUDA graphs.",
-                exc,
-            )
-            graph_config.enabled = False
-            self.od_config.enable_cuda_graph = False
+        self.pipeline.setup_cuda_graphs()
 
     def load_model(
         self,
