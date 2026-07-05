@@ -453,6 +453,24 @@ def _to_compile_value(framework: str, serve_args_dict: dict[str, Any]) -> str:
     return "disabled"
 
 
+def _to_cuda_graph_value(framework: str, serve_args_dict: dict[str, Any]) -> str:
+    if framework == "vllm-omni":
+        if serve_args_dict.get("enable-cuda-graph"):
+            return "enabled"
+        cuda_graph_config = serve_args_dict.get("cuda-graph-config")
+        if isinstance(cuda_graph_config, dict) and cuda_graph_config.get("enabled"):
+            return "enabled"
+    return "disabled"
+
+
+def _to_attention_backend_value(framework: str, serve_args_dict: dict[str, Any]) -> str:
+    if framework == "vllm-omni":
+        backend = serve_args_dict.get("diffusion-attention-backend")
+        if backend:
+            return str(backend)
+    return os.environ.get("DIFFUSION_ATTENTION_BACKEND", "")
+
+
 def _to_quantization_value(framework: str, serve_args_dict: dict[str, Any]) -> str:
     if framework == "vllm-omni":
         quant = serve_args_dict.get("quantization")
@@ -707,7 +725,8 @@ def run_benchmark(
         "Quantization": _to_quantization_value(server_type, serve_args_dict),
         "offload": _to_offload_string(server_type, serve_args_dict),
         "compile": _to_compile_value(server_type, serve_args_dict),
-        "Attn_backend": os.environ.get("DIFFUSION_ATTENTION_BACKEND", ""),
+        "CUDA Graph": _to_cuda_graph_value(server_type, serve_args_dict),
+        "Attn_backend": _to_attention_backend_value(server_type, serve_args_dict),
         "num_inference_steps": params.get("num-inference-steps", ""),
         "completed": completed,
         "failed": failed,

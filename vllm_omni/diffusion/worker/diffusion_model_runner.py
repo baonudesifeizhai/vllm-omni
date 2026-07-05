@@ -29,6 +29,7 @@ from vllm_omni.diffusion.cache.prompt_embed_cache import (
 )
 from vllm_omni.diffusion.cache.selector import get_cache_backend
 from vllm_omni.diffusion.compile import regionally_compile
+from vllm_omni.diffusion.cuda_graph import DiffusionCUDAGraphConfig
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
@@ -159,6 +160,37 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 e,
             )
 
+    def _setup_cuda_graphs(self) -> None:
+        """Let graph-capable diffusion pipelines install model-specific runners."""
+        graph_config = DiffusionCUDAGraphConfig.from_value(
+            getattr(self.od_config, "cuda_graph_config", None),
+            enabled=getattr(self.od_config, "enable_cuda_graph", False),
+        )
+        self.od_config.cuda_graph_config = graph_config
+        self.od_config.enable_cuda_graph = bool(graph_config.enabled)
+        if not graph_config.enabled:
+            return
+
+        setup_cuda_graphs = getattr(self.pipeline, "setup_cuda_graphs", None)
+        if not callable(setup_cuda_graphs):
+            logger.warning(
+                "CUDA graphs were enabled, but %s does not implement setup_cuda_graphs(); running eager.",
+                self.pipeline.__class__.__name__,
+            )
+            graph_config.enabled = False
+            self.od_config.enable_cuda_graph = False
+            return
+
+        try:
+            setup_cuda_graphs()
+        except Exception as exc:
+            logger.warning(
+                "Model runner: setup_cuda_graphs() failed (%s); running without diffusion CUDA graphs.",
+                exc,
+            )
+            graph_config.enabled = False
+            self.od_config.enable_cuda_graph = False
+
     def load_model(
         self,
         memory_pool_context_fn: callable | None = None,
@@ -254,6 +286,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     "Model runner: Platform %s does not support torch inductor, skipping torch.compile.",
                     current_omni_platform.get_torch_device(),
                 )
+
+        self._setup_cuda_graphs()
 
         # Setup cache backend
         self.cache_backend = get_cache_backend(self.od_config.cache_backend, self.od_config.cache_config)
