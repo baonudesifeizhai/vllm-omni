@@ -34,7 +34,7 @@ import math
 import os
 import time
 from collections.abc import Iterable, Mapping
-from dataclasses import fields
+from dataclasses import fields, replace
 from typing import Any, ClassVar
 
 import numpy as np
@@ -47,6 +47,7 @@ from transformers import AutoTokenizer
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
+from vllm_omni.diffusion.cuda_graph import DiffusionCUDAGraphConfig, DiffusionCUDAGraphRunner
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
@@ -978,6 +979,7 @@ class Cosmos3OmniDiffusersPipeline(
         self._guidance_scale = None
         self._num_timesteps = None
         self._cosmos3_branch_caches: dict[str, tuple[Any, Any]] | None = None
+        self._cuda_graph_runner: DiffusionCUDAGraphRunner | None = None
         self._robolab_transform = None
 
         # Set True by ``enable_cache_for_cosmos3`` when cache-dit is enabled on
@@ -1015,6 +1017,80 @@ class Cosmos3OmniDiffusersPipeline(
 
     def disable_omni_model_cpu_offload(self) -> None:
         self.transformer.disable_model_cpu_offload()
+
+    def setup_cuda_graphs(self) -> None:
+        graph_config = DiffusionCUDAGraphConfig.from_value(
+            getattr(self.od_config, "cuda_graph_config", None),
+            enabled=getattr(self.od_config, "enable_cuda_graph", False),
+        )
+        if not graph_config.enabled:
+            self._cuda_graph_runner = None
+            return
+        if not torch.cuda.is_available():
+            logger.warning("Cosmos3 CUDA graphs requested, but CUDA is not available; running eager.")
+            graph_config.enabled = False
+            self.od_config.enable_cuda_graph = False
+            self.od_config.cuda_graph_config = graph_config
+            self._cuda_graph_runner = None
+            return
+
+        graph_config = replace(graph_config, name="cosmos3.cached_gen")
+        self.od_config.cuda_graph_config = graph_config
+        self.od_config.enable_cuda_graph = True
+        self._cuda_graph_runner = DiffusionCUDAGraphRunner(graph_config)
+        logger.info("Cosmos3 CUDA graphs enabled for cached GEN transformer forward.")
+
+    def _cuda_graph_capture_decision(self, transformer_kwargs: Mapping[str, Any]) -> tuple[bool, str | None]:
+        if self.transformer.cached_kv is None or self.transformer.cached_freqs_gen is None:
+            return False, "cosmos3_cache_not_ready"
+        if getattr(self.transformer, "_model_cpu_offload_enabled", False):
+            return False, "model_cpu_offload"
+        parallel_config = getattr(self.od_config, "parallel_config", None)
+        if int(getattr(parallel_config, "tensor_parallel_size", 1) or 1) > 1:
+            return False, "tensor_parallel"
+        if int(getattr(parallel_config, "sequence_parallel_size", 1) or 1) > 1:
+            return False, "sequence_parallel"
+        if int(getattr(parallel_config, "ulysses_degree", 1) or 1) > 1:
+            return False, "ulysses_sequence_parallel"
+        if int(getattr(parallel_config, "ring_degree", 1) or 1) > 1:
+            return False, "ring_sequence_parallel"
+        cache_backend = getattr(self.od_config, "cache_backend", None)
+        if cache_backend not in (None, "", "none"):
+            return False, f"cache_backend_{cache_backend}"
+        if transformer_kwargs.get("action_latents") is not None and transformer_kwargs.get("action_domain_ids") is None:
+            return False, "action_domain_ids_not_static"
+        return True, None
+
+    def _transformer_forward_with_cuda_graph(
+        self,
+        graph_branch: str,
+        **transformer_kwargs: Any,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        runner = getattr(self, "_cuda_graph_runner", None)
+        if runner is None:
+            return self.transformer(**transformer_kwargs)
+        if self.transformer.cached_kv is None or self.transformer.cached_freqs_gen is None:
+            return self.transformer(**transformer_kwargs)
+
+        gen_kwargs = dict(transformer_kwargs)
+        gen_kwargs.pop("text_ids", None)
+        gen_kwargs.pop("text_mask", None)
+        gen_kwargs["cached_kv"] = self.transformer.cached_kv
+        gen_kwargs["cached_freqs_gen"] = self.transformer.cached_freqs_gen
+        can_capture, reason = self._cuda_graph_capture_decision(transformer_kwargs)
+        extra_key = {
+            "branch": graph_branch,
+            "transformer_id": id(self.transformer),
+        }
+        output = runner.run(
+            self.transformer.forward_cached_gen,
+            graph_extra_key=extra_key,
+            graph_can_capture=can_capture,
+            graph_fallback_reason=reason,
+            **gen_kwargs,
+        )
+        logger.debug("Cosmos3 CUDA graph branch=%s info=%s", graph_branch, runner.last_call_info)
+        return output
 
     # -- Weight loading --------------------------------------------------------
 
@@ -2651,7 +2727,8 @@ class Cosmos3OmniDiffusersPipeline(
                 cfg_active = _cfg_active_at(t)
 
                 self.transformer.cached_kv, self.transformer.cached_freqs_gen = cond_cache
-                noise_cond = self.transformer(
+                noise_cond = self._transformer_forward_with_cuda_graph(
+                    "cond",
                     hidden_states=latents,
                     timestep=timestep,
                     text_ids=cond_ids,
@@ -2665,7 +2742,8 @@ class Cosmos3OmniDiffusersPipeline(
 
                 if cfg_active or keep_uncond_for_cache:
                     self.transformer.cached_kv, self.transformer.cached_freqs_gen = uncond_cache
-                    noise_uncond = self.transformer(
+                    noise_uncond = self._transformer_forward_with_cuda_graph(
+                        "uncond",
                         hidden_states=latents,
                         timestep=timestep,
                         text_ids=uncond_ids,
@@ -2689,7 +2767,8 @@ class Cosmos3OmniDiffusersPipeline(
         else:
             for t in self.progress_bar(timesteps):
                 timestep = t.unsqueeze(0)
-                noise_pred = self.transformer(
+                noise_pred = self._transformer_forward_with_cuda_graph(
+                    "single",
                     hidden_states=latents,
                     timestep=timestep,
                     text_ids=cond_ids,
