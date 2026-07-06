@@ -115,6 +115,38 @@ shift at the same seed). The pipeline
 auto-resolves from `model_index.json`; pass
 `--model-class-name Cosmos3OmniDiffusersPipeline` to force it explicitly.
 
+#### CUDA Graph
+
+CUDA Graph is optional for Cosmos3. Enable it when serving latency-sensitive,
+fixed-shape requests, especially small text-to-image or short/low-resolution
+video requests on a single GPU. It captures the cached GEN transformer forward;
+prompt processing, scheduler steps, and VAE encode/decode still run outside the
+graph.
+
+It is not recommended as the first optimization for long/high-resolution video
+generation, where transformer compute and VAE work dominate launch overhead. The
+benefit is expected to be smaller there, so benchmark your target shape before
+turning it on by default.
+
+Example:
+
+```bash
+vllm serve nvidia/Cosmos3-Nano \
+  --omni \
+  --host 0.0.0.0 --port 8000 \
+  --no-guardrails \
+  --diffusion-attention-backend TORCH_SDPA \
+  --enable-cuda-graph \
+  --cuda-graph-config '{"enabled":true,"warmup_steps":1,"max_graphs":8}'
+```
+
+In a single-B300 512x512 T2I benchmark with 20 steps, no CFG
+(`guidance_scale=1.0`), `TORCH_SDPA`, and `torch.compile` enabled, adding CUDA
+Graph improved `stage_0_gen_ms` from 220.61 ms to 203.16 ms (+7.9%) and mean
+latency from 293.75 ms to 277.80 ms (+5.4%). With the same prompt and seed, T2I
+and 33-frame T2V smoke outputs matched the `torch.compile` baseline exactly
+(SSIM 1.0).
+
 #### Verification
 
 Best quality uses the JSON-upsampled prompts from `assets/` (download with
