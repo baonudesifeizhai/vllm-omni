@@ -17,6 +17,8 @@ All benchmark results for a session are consolidated into a single JSON file und
 BENCHMARK_RESULT_DIR (override via the DIFFUSION_BENCHMARK_DIR environment variable).
 Each entry in the file contains the test metadata (test_name, endpoint, benchmark_params,
 timestamp) together with the raw metrics returned by the benchmark script.
+Optional top-level ``metadata`` in a benchmark config is copied into each result
+record for report-only fields such as ``CUDA Graph`` and ``Attn_backend``.
 """
 
 import json
@@ -453,24 +455,6 @@ def _to_compile_value(framework: str, serve_args_dict: dict[str, Any]) -> str:
     return "disabled"
 
 
-def _to_cuda_graph_value(framework: str, serve_args_dict: dict[str, Any]) -> str:
-    if framework == "vllm-omni":
-        if serve_args_dict.get("enable-cuda-graph"):
-            return "enabled"
-        cuda_graph_config = serve_args_dict.get("cuda-graph-config")
-        if isinstance(cuda_graph_config, dict) and cuda_graph_config.get("enabled"):
-            return "enabled"
-    return "disabled"
-
-
-def _to_attention_backend_value(framework: str, serve_args_dict: dict[str, Any]) -> str:
-    if framework == "vllm-omni":
-        backend = serve_args_dict.get("diffusion-attention-backend")
-        if backend:
-            return str(backend)
-    return os.environ.get("DIFFUSION_ATTENTION_BACKEND", "")
-
-
 def _to_quantization_value(framework: str, serve_args_dict: dict[str, Any]) -> str:
     if framework == "vllm-omni":
         quant = serve_args_dict.get("quantization")
@@ -500,6 +484,7 @@ def _unique_server_params(configs: list[dict[str, Any]]) -> list[dict[str, Any]]
                 "serve_args": _build_serve_args(serve_args_dict),
                 "benchmark_endpoint": cfg.get("benchmark_endpoint", cfg.get("benchmark_backend")),
                 "server_params": cfg["server_params"],
+                "metadata": cfg.get("metadata", {}),
             }
         )
     return result
@@ -699,6 +684,9 @@ def run_benchmark(
     serve_args_dict = server_cfg.get("serve_args_dict", {})
     if not isinstance(serve_args_dict, dict):
         serve_args_dict = {}
+    metadata = server_cfg.get("metadata", {})
+    if not isinstance(metadata, dict):
+        metadata = {}
 
     completed = metrics.get("completed_requests", metrics.get("completed", 0))
     failed = metrics.get("failed_requests", metrics.get("failed", 0))
@@ -725,8 +713,6 @@ def run_benchmark(
         "Quantization": _to_quantization_value(server_type, serve_args_dict),
         "offload": _to_offload_string(server_type, serve_args_dict),
         "compile": _to_compile_value(server_type, serve_args_dict),
-        "CUDA Graph": _to_cuda_graph_value(server_type, serve_args_dict),
-        "Attn_backend": _to_attention_backend_value(server_type, serve_args_dict),
         "num_inference_steps": params.get("num-inference-steps", ""),
         "completed": completed,
         "failed": failed,
@@ -747,6 +733,7 @@ def run_benchmark(
         "build_url": os.environ.get("BUILDKITE_BUILD_URL", ""),
         "source_file": source_file,
     }
+    record.update(metadata)
     _append_to_aggregated_file(record)
     print(f"\n  Result appended to: {AGGREGATED_RESULT_FILE}")
     print(f"  Log saved to:       {log_file}")
