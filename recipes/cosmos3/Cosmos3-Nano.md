@@ -119,7 +119,7 @@ auto-resolves from `model_index.json`; pass
 
 CUDA Graph is optional for Cosmos3. Enable it when serving latency-sensitive,
 fixed-shape requests, especially small text-to-image or short/low-resolution
-video requests on a single GPU. It captures the cached GEN transformer forward;
+video requests. It captures the cached GEN transformer forward;
 prompt processing, scheduler steps, and VAE encode/decode still run outside the
 graph.
 
@@ -146,6 +146,10 @@ Graph improved `stage_0_gen_ms` from 220.61 ms to 203.16 ms (+7.9%) and mean
 latency from 293.75 ms to 277.80 ms (+5.4%). With the same prompt and seed, T2I
 and 33-frame T2V smoke outputs matched the `torch.compile` baseline exactly
 (SSIM 1.0).
+
+On the same 512x512 T2I shape with Ulysses-2 sequence parallelism, adding CUDA
+Graph improved `stage_0_gen_ms` from 371.16 ms to 238.01 ms (+35.9%) and mean
+latency from 446.77 ms to 314.15 ms (+29.7%) in a 16-request sanity benchmark.
 
 #### Verification
 
