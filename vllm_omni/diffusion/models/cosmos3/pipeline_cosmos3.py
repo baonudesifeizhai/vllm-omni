@@ -1045,15 +1045,6 @@ class Cosmos3OmniDiffusersPipeline(
             return False, "cosmos3_cache_not_ready"
         if getattr(self.transformer, "_model_cpu_offload_enabled", False):
             return False, "model_cpu_offload"
-        parallel_config = getattr(self.od_config, "parallel_config", None)
-        if int(getattr(parallel_config, "tensor_parallel_size", 1) or 1) > 1:
-            return False, "tensor_parallel"
-        if int(getattr(parallel_config, "sequence_parallel_size", 1) or 1) > 1:
-            return False, "sequence_parallel"
-        if int(getattr(parallel_config, "ulysses_degree", 1) or 1) > 1:
-            return False, "ulysses_sequence_parallel"
-        if int(getattr(parallel_config, "ring_degree", 1) or 1) > 1:
-            return False, "ring_sequence_parallel"
         cache_backend = getattr(self.od_config, "cache_backend", None)
         if cache_backend not in (None, "", "none"):
             return False, f"cache_backend_{cache_backend}"
