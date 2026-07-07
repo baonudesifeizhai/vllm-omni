@@ -147,10 +147,6 @@ latency from 293.75 ms to 277.80 ms (+5.4%). With the same prompt and seed, T2I
 and 33-frame T2V smoke outputs matched the `torch.compile` baseline exactly
 (SSIM 1.0).
 
-On the same 512x512 T2I shape with Ulysses-2 sequence parallelism, adding CUDA
-Graph improved `stage_0_gen_ms` from 371.16 ms to 238.01 ms (+35.9%) and mean
-latency from 446.77 ms to 314.15 ms (+29.7%) in a 16-request sanity benchmark.
-
 #### Verification
 
 Best quality uses the JSON-upsampled prompts from `assets/` (download with
