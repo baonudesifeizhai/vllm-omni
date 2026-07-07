@@ -33,8 +33,8 @@ import json
 import math
 import os
 import time
-from collections.abc import Iterable, Mapping
-from dataclasses import fields, replace
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import fields
 from typing import Any, ClassVar
 
 import numpy as np
@@ -47,7 +47,7 @@ from transformers import AutoTokenizer
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
-from vllm_omni.diffusion.cuda_graph import DiffusionCUDAGraphConfig, DiffusionCUDAGraphRunner
+from vllm_omni.diffusion.cuda_graph import DiffusionCUDAGraphManager
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
@@ -979,7 +979,7 @@ class Cosmos3OmniDiffusersPipeline(
         self._guidance_scale = None
         self._num_timesteps = None
         self._cosmos3_branch_caches: dict[str, tuple[Any, Any]] | None = None
-        self._cuda_graph_runner: DiffusionCUDAGraphRunner | None = None
+        self._cuda_graph_manager: DiffusionCUDAGraphManager | None = None
         self._robolab_transform = None
 
         # Set True by ``enable_cache_for_cosmos3`` when cache-dit is enabled on
@@ -1018,26 +1018,13 @@ class Cosmos3OmniDiffusersPipeline(
     def disable_omni_model_cpu_offload(self) -> None:
         self.transformer.disable_model_cpu_offload()
 
-    def setup_cuda_graphs(self) -> None:
-        graph_config = DiffusionCUDAGraphConfig.from_value(
-            getattr(self.od_config, "cuda_graph_config", None),
-            enabled=getattr(self.od_config, "enable_cuda_graph", False),
-        )
-        if not graph_config.enabled:
-            self._cuda_graph_runner = None
-            return
-        if not torch.cuda.is_available():
-            logger.warning("Cosmos3 CUDA graphs requested, but CUDA is not available; running eager.")
-            graph_config.enabled = False
-            self.od_config.enable_cuda_graph = False
-            self.od_config.cuda_graph_config = graph_config
-            self._cuda_graph_runner = None
-            return
+    def get_cuda_graph_routines(self) -> dict[str, Callable[..., Any]]:
+        return {"cosmos3.cached_gen": self.transformer.forward_cached_gen}
 
-        graph_config = replace(graph_config, name="cosmos3.cached_gen")
-        self.od_config.cuda_graph_config = graph_config
-        self.od_config.enable_cuda_graph = True
-        self._cuda_graph_runner = DiffusionCUDAGraphRunner(graph_config)
+    def bind_cuda_graph_manager(self, manager: DiffusionCUDAGraphManager | None) -> None:
+        self._cuda_graph_manager = manager
+        if manager is None or not manager.enabled:
+            return
         logger.info("Cosmos3 CUDA graphs enabled for cached GEN transformer forward.")
 
     def _cuda_graph_capture_decision(self, transformer_kwargs: Mapping[str, Any]) -> tuple[bool, str | None]:
@@ -1057,8 +1044,8 @@ class Cosmos3OmniDiffusersPipeline(
         graph_branch: str,
         **transformer_kwargs: Any,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
-        runner = getattr(self, "_cuda_graph_runner", None)
-        if runner is None:
+        manager = getattr(self, "_cuda_graph_manager", None)
+        if manager is None:
             return self.transformer(**transformer_kwargs)
         if self.transformer.cached_kv is None or self.transformer.cached_freqs_gen is None:
             return self.transformer(**transformer_kwargs)
@@ -1073,14 +1060,18 @@ class Cosmos3OmniDiffusersPipeline(
             "branch": graph_branch,
             "transformer_id": id(self.transformer),
         }
-        output = runner.run(
-            self.transformer.forward_cached_gen,
+        output = manager.run(
+            "cosmos3.cached_gen",
             graph_extra_key=extra_key,
             graph_can_capture=can_capture,
             graph_fallback_reason=reason,
             **gen_kwargs,
         )
-        logger.debug("Cosmos3 CUDA graph branch=%s info=%s", graph_branch, runner.last_call_info)
+        logger.debug(
+            "Cosmos3 CUDA graph branch=%s info=%s",
+            graph_branch,
+            manager.last_call_info("cosmos3.cached_gen"),
+        )
         return output
 
     # -- Weight loading --------------------------------------------------------

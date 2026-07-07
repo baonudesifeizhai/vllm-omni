@@ -430,8 +430,47 @@ class DiffusionCUDAGraphRunner:
                 self._copy_inputs(static_value[key], dynamic_value[key])
 
 
+class DiffusionCUDAGraphManager:
+    """Own CUDA graph runners for the routines declared by one pipeline."""
+
+    def __init__(self, config: DiffusionCUDAGraphConfig | None = None) -> None:
+        self.config = config or DiffusionCUDAGraphConfig()
+        self._fns: dict[str, Callable[..., Any]] = {}
+        self._runners: dict[str, DiffusionCUDAGraphRunner] = {}
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.config.enabled)
+
+    def register(self, name: str, fn: Callable[..., Any]) -> None:
+        self._fns[name] = fn
+        self._runners[name] = DiffusionCUDAGraphRunner(replace(self.config, name=name))
+
+    def last_call_info(self, name: str) -> dict[str, Any]:
+        return self._runners[name].last_call_info
+
+    def run(
+        self,
+        name: str,
+        *args: Any,
+        graph_extra_key: Hashable | Mapping[str, Hashable] | Sequence[Hashable] | None = None,
+        graph_can_capture: bool = True,
+        graph_fallback_reason: str | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        return self._runners[name].run(
+            self._fns[name],
+            *args,
+            graph_extra_key=graph_extra_key,
+            graph_can_capture=graph_can_capture,
+            graph_fallback_reason=graph_fallback_reason,
+            **kwargs,
+        )
+
+
 __all__ = [
     "DiffusionCUDAGraphConfig",
+    "DiffusionCUDAGraphManager",
     "DiffusionCUDAGraphRunner",
     "GraphEntry",
     "GraphKey",
