@@ -980,6 +980,7 @@ class Cosmos3OmniDiffusersPipeline(
         self._num_timesteps = None
         self._cosmos3_branch_caches: dict[str, tuple[Any, Any]] | None = None
         self._cuda_graph_manager: DiffusionCUDAGraphManager | None = None
+        self._cuda_graph_cache_generation = 0
         self._robolab_transform = None
 
         # Set True by ``enable_cache_for_cosmos3`` when cache-dit is enabled on
@@ -1048,7 +1049,10 @@ class Cosmos3OmniDiffusersPipeline(
         if manager is None:
             return self.transformer(**transformer_kwargs)
         if self.transformer.cached_kv is None or self.transformer.cached_freqs_gen is None:
-            return self.transformer(**transformer_kwargs)
+            output = self.transformer(**transformer_kwargs)
+            if self.transformer.cached_kv is not None and self.transformer.cached_freqs_gen is not None:
+                self._cuda_graph_cache_generation += 1
+            return output
 
         gen_kwargs = dict(transformer_kwargs)
         gen_kwargs.pop("text_ids", None)
@@ -1065,6 +1069,8 @@ class Cosmos3OmniDiffusersPipeline(
             graph_extra_key=extra_key,
             graph_can_capture=can_capture,
             graph_fallback_reason=reason,
+            graph_static_input_names=("cached_kv", "cached_freqs_gen"),
+            graph_static_input_token=self._cuda_graph_cache_generation,
             **gen_kwargs,
         )
         logger.debug(
