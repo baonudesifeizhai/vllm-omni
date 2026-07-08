@@ -210,8 +210,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             return
 
         manager = DiffusionCUDAGraphManager(graph_config)
-        for name, routine in routines.items():
-            manager.register(name, routine)
+        for name, fn in routines.items():
+            manager.register(name, fn)
         self._bind_cuda_graph_manager(manager)
         logger.info(
             "Diffusion CUDA graphs enabled for %s routines: %s.",
