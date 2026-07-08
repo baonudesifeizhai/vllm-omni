@@ -2,20 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CUDA graph helpers for diffusion transformer forwards.
 
-The runner is intentionally model-agnostic: it captures a callable for a
-specific graph key, owns static input buffers for that key, and replays the
-captured graph when later calls have compatible inputs. Model-specific code is
-expected to decide whether a call is graph-safe and to pass any extra key parts
-that are not visible from the input structure.
+The manager owns graph capture, replay, caching, and lifecycle. Model routines
+own graph-safe input preparation and static-buffer updates.
 """
 
 from __future__ import annotations
 
-import functools
 from collections import OrderedDict
-from collections.abc import Callable, Hashable, Mapping, Sequence
-from dataclasses import dataclass, fields, replace
-from typing import Any, TypeAlias
+from collections.abc import Hashable, Mapping, Sequence
+from dataclasses import dataclass, field, fields, replace
+from typing import Any, Protocol, TypeAlias
 
 import torch
 from vllm.logger import init_logger
@@ -40,6 +36,12 @@ class DiffusionCUDAGraphConfig:
     clear_cuda_cache_on_capture: bool = False
     name: str = "diffusion"
 
+    def __post_init__(self) -> None:
+        if self.max_graphs < 1:
+            raise ValueError("max_graphs must be at least 1")
+        if self.warmup_steps < 0:
+            raise ValueError("warmup_steps must be non-negative")
+
     @classmethod
     def from_value(
         cls,
@@ -53,7 +55,10 @@ class DiffusionCUDAGraphConfig:
             config = value
         elif isinstance(value, Mapping):
             valid_fields = {field.name for field in fields(cls)}
-            config = cls(**{key: item for key, item in value.items() if key in valid_fields})
+            unknown_fields = set(value) - valid_fields
+            if unknown_fields:
+                raise ValueError(f"Unknown CUDA graph config fields: {sorted(unknown_fields)}")
+            config = cls(**value)
         else:
             raise TypeError(
                 f"cuda_graph_config must be a DiffusionCUDAGraphConfig, mapping, or None, got {type(value)!r}"
@@ -64,15 +69,79 @@ class DiffusionCUDAGraphConfig:
 
 
 @dataclass
+class DiffusionCUDAGraphCall:
+    """A model routine's normalized inputs and graph-safety decision."""
+
+    args: tuple[Any, ...] = ()
+    kwargs: dict[str, Any] = field(default_factory=dict)
+    extra_key: Hashable | Mapping[str, Hashable] | Sequence[Hashable] | None = None
+    can_capture: bool = True
+    fallback_reason: str | None = None
+
+
+@dataclass
+class DiffusionCUDAGraphStaticInputs:
+    """Static graph inputs owned and updated by a model routine."""
+
+    args: list[Any]
+    kwargs: dict[str, Any]
+    state: dict[str, Any] = field(default_factory=dict)
+
+
+class DiffusionCUDAGraphRoutine(Protocol):
+    """Model-owned CUDA graph input and forward contract."""
+
+    def prepare(self, *args: Any, **kwargs: Any) -> DiffusionCUDAGraphCall: ...
+
+    def eager(self, *args: Any, **kwargs: Any) -> Any: ...
+
+    def forward(self, *args: Any, **kwargs: Any) -> Any: ...
+
+    def create_static_inputs(self, call: DiffusionCUDAGraphCall) -> DiffusionCUDAGraphStaticInputs: ...
+
+    def copy_inputs(
+        self,
+        static_inputs: DiffusionCUDAGraphStaticInputs,
+        call: DiffusionCUDAGraphCall,
+    ) -> None: ...
+
+
+@dataclass
 class GraphEntry:
-    """Captured graph and its static input/output buffers."""
+    """Captured graph and the model-owned buffers used to replay it."""
 
     key: GraphKey
     graph: torch.cuda.CUDAGraph
-    static_args: list[Any]
-    static_kwargs: dict[str, Any]
+    static_inputs: DiffusionCUDAGraphStaticInputs
     static_output: Any
     hits: int = 0
+
+
+def clone_graph_value(value: Any) -> Any:
+    """Clone tensor leaves while preserving a nested input structure."""
+    if isinstance(value, torch.Tensor):
+        return value.clone()
+    if isinstance(value, tuple):
+        return tuple(clone_graph_value(item) for item in value)
+    if isinstance(value, list):
+        return [clone_graph_value(item) for item in value]
+    if isinstance(value, Mapping):
+        return {key: clone_graph_value(item) for key, item in value.items()}
+    return value
+
+
+def copy_graph_value(static_value: Any, dynamic_value: Any) -> None:
+    """Copy tensor leaves into an already-compatible static structure."""
+    if isinstance(static_value, torch.Tensor):
+        static_value.copy_(dynamic_value)
+        return
+    if isinstance(static_value, (list, tuple)):
+        for static_item, dynamic_item in zip(static_value, dynamic_value, strict=True):
+            copy_graph_value(static_item, dynamic_item)
+        return
+    if isinstance(static_value, dict):
+        for key in static_value:
+            copy_graph_value(static_value[key], dynamic_value[key])
 
 
 class GraphKeyBuilder:
@@ -213,10 +282,12 @@ class DiffusionCUDAGraphRunner:
 
     def __init__(
         self,
+        routine: DiffusionCUDAGraphRoutine,
         config: DiffusionCUDAGraphConfig | None = None,
         *,
         key_builder: GraphKeyBuilder | None = None,
     ) -> None:
+        self.routine = routine
         self.config = config or DiffusionCUDAGraphConfig()
         self.key_builder = key_builder or GraphKeyBuilder(
             include_non_tensor_inputs=self.config.include_non_tensor_inputs,
@@ -237,36 +308,29 @@ class DiffusionCUDAGraphRunner:
 
     def run(
         self,
-        fn: Callable[..., Any],
         *args: Any,
-        graph_extra_key: Hashable | Mapping[str, Hashable] | Sequence[Hashable] | None = None,
-        graph_can_capture: bool = True,
-        graph_fallback_reason: str | None = None,
         **kwargs: Any,
     ) -> Any:
-        """Run ``fn`` eagerly or through a captured CUDA graph.
-
-        ``graph_extra_key`` is for model-visible state that is not represented by
-        input tensor metadata. ``graph_can_capture`` lets model adapters reject a
-        call before the generic runner attempts capture.
-        """
+        """Run the model routine eagerly or through a captured CUDA graph."""
 
         if not self.config.enabled:
-            return self._eager(fn, "disabled", args, kwargs)
-        if not graph_can_capture:
-            return self._eager(fn, graph_fallback_reason or "adapter_rejected", args, kwargs)
-        first_tensor = self.key_builder.first_tensor(args, kwargs)
-        if first_tensor is None:
-            return self._eager(fn, "no_tensor_inputs", args, kwargs)
-        if first_tensor.device.type != "cuda":
-            return self._eager(fn, "non_cuda_inputs", args, kwargs)
-        if torch.cuda.is_current_stream_capturing():
-            return self._eager(fn, "stream_capturing", args, kwargs)
+            return self._eager("disabled", args, kwargs)
 
-        key = self.key_builder.build(args, kwargs, extra_key=graph_extra_key)
+        call = self.routine.prepare(*args, **kwargs)
+        if not call.can_capture:
+            return self._eager(call.fallback_reason or "routine_rejected", args, kwargs)
+        first_tensor = self.key_builder.first_tensor(call.args, call.kwargs)
+        if first_tensor is None:
+            return self._eager("no_tensor_inputs", args, kwargs)
+        if first_tensor.device.type != "cuda":
+            return self._eager("non_cuda_inputs", args, kwargs)
+        if torch.cuda.is_current_stream_capturing():
+            return self._eager("stream_capturing", args, kwargs)
+
+        key = self.key_builder.build(call.args, call.kwargs, extra_key=call.extra_key)
         entry = self._cache.get(key)
         if entry is None:
-            entry = self._capture(key, fn, args, kwargs)
+            entry = self._capture(key, call)
             self._cache[key] = entry
             self._evict_if_needed()
             entry.graph.replay()
@@ -280,8 +344,7 @@ class DiffusionCUDAGraphRunner:
             return self._return_output(entry.static_output)
 
         self._cache.move_to_end(key)
-        self._copy_inputs(entry.static_args, list(args))
-        self._copy_inputs(entry.static_kwargs, kwargs)
+        self.routine.copy_inputs(entry.static_inputs, call)
         entry.graph.replay()
         entry.hits += 1
         self.last_call_info = {
@@ -293,52 +356,18 @@ class DiffusionCUDAGraphRunner:
         }
         return self._return_output(entry.static_output)
 
-    def wrap(
-        self,
-        fn: Callable[..., Any],
-        *,
-        extra_key_fn: Callable[..., Hashable | Mapping[str, Hashable] | Sequence[Hashable] | None] | None = None,
-        can_capture_fn: Callable[..., tuple[bool, str | None] | bool] | None = None,
-    ) -> Callable[..., Any]:
-        """Return a drop-in wrapper around ``fn``."""
-
-        @functools.wraps(fn)
-        def wrapper(*args: Any, **kwargs: Any) -> Any:
-            extra_key = extra_key_fn(*args, **kwargs) if extra_key_fn is not None else None
-            can_capture = True
-            reason = None
-            if can_capture_fn is not None:
-                decision = can_capture_fn(*args, **kwargs)
-                if isinstance(decision, tuple):
-                    can_capture, reason = decision
-                else:
-                    can_capture = bool(decision)
-            return self.run(
-                fn,
-                *args,
-                graph_extra_key=extra_key,
-                graph_can_capture=can_capture,
-                graph_fallback_reason=reason,
-                **kwargs,
-            )
-
-        return wrapper
-
     def _capture(
         self,
         key: GraphKey,
-        fn: Callable[..., Any],
-        args: tuple[Any, ...],
-        kwargs: dict[str, Any],
+        call: DiffusionCUDAGraphCall,
     ) -> GraphEntry:
-        static_args = [self._clone_static(value) for value in args]
-        static_kwargs = {name: self._clone_static(value) for name, value in kwargs.items()}
-        device_tensor = self.key_builder.first_tensor(static_args, static_kwargs)
+        static_inputs = self.routine.create_static_inputs(call)
+        device_tensor = self.key_builder.first_tensor(static_inputs.args, static_inputs.kwargs)
         assert device_tensor is not None
 
         with torch.no_grad():
             for _ in range(self.config.warmup_steps):
-                fn(*static_args, **static_kwargs)
+                self.routine.forward(*static_inputs.args, **static_inputs.kwargs)
                 torch.accelerator.synchronize(device_tensor.device)
                 if self.config.clear_cuda_cache_on_capture:
                     torch.accelerator.empty_cache()
@@ -348,23 +377,21 @@ class DiffusionCUDAGraphRunner:
         with torch.no_grad():
             if pool is None:
                 with torch.cuda.graph(graph):
-                    static_output = fn(*static_args, **static_kwargs)
+                    static_output = self.routine.forward(*static_inputs.args, **static_inputs.kwargs)
             else:
                 with torch.cuda.graph(graph, pool=pool):
-                    static_output = fn(*static_args, **static_kwargs)
+                    static_output = self.routine.forward(*static_inputs.args, **static_inputs.kwargs)
 
         logger.debug("Captured %s CUDA graph with key_size=%d", self.config.name, len(key))
         return GraphEntry(
             key=key,
             graph=graph,
-            static_args=static_args,
-            static_kwargs=static_kwargs,
+            static_inputs=static_inputs,
             static_output=static_output,
         )
 
     def _eager(
         self,
-        fn: Callable[..., Any],
         reason: str,
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
@@ -374,7 +401,7 @@ class DiffusionCUDAGraphRunner:
             "reason": reason,
             "cache_size": len(self._cache),
         }
-        return fn(*args, **kwargs)
+        return self.routine.eager(*args, **kwargs)
 
     def _evict_if_needed(self) -> None:
         while len(self._cache) > self.config.max_graphs:
@@ -389,45 +416,7 @@ class DiffusionCUDAGraphRunner:
     def _return_output(self, output: Any) -> Any:
         if not self.config.clone_outputs:
             return output
-        return self._clone_output(output)
-
-    def _clone_static(self, value: Any) -> Any:
-        if isinstance(value, torch.Tensor):
-            return value.clone()
-        if isinstance(value, tuple):
-            return tuple(self._clone_static(item) for item in value)
-        if isinstance(value, list):
-            return [self._clone_static(item) for item in value]
-        if isinstance(value, Mapping):
-            return {key: self._clone_static(item) for key, item in value.items()}
-        return value
-
-    def _clone_output(self, value: Any) -> Any:
-        if isinstance(value, torch.Tensor):
-            return value.clone()
-        if isinstance(value, tuple):
-            return tuple(self._clone_output(item) for item in value)
-        if isinstance(value, list):
-            return [self._clone_output(item) for item in value]
-        if isinstance(value, Mapping):
-            return {key: self._clone_output(item) for key, item in value.items()}
-        return value
-
-    def _copy_inputs(self, static_value: Any, dynamic_value: Any) -> None:
-        if isinstance(static_value, torch.Tensor):
-            static_value.copy_(dynamic_value)
-            return
-        if isinstance(static_value, list):
-            for static_item, dynamic_item in zip(static_value, dynamic_value):
-                self._copy_inputs(static_item, dynamic_item)
-            return
-        if isinstance(static_value, tuple):
-            for static_item, dynamic_item in zip(static_value, dynamic_value):
-                self._copy_inputs(static_item, dynamic_item)
-            return
-        if isinstance(static_value, dict):
-            for key in static_value:
-                self._copy_inputs(static_value[key], dynamic_value[key])
+        return clone_graph_value(output)
 
 
 class DiffusionCUDAGraphManager:
@@ -435,16 +424,23 @@ class DiffusionCUDAGraphManager:
 
     def __init__(self, config: DiffusionCUDAGraphConfig | None = None) -> None:
         self.config = config or DiffusionCUDAGraphConfig()
-        self._fns: dict[str, Callable[..., Any]] = {}
+        self._routines: dict[str, DiffusionCUDAGraphRoutine] = {}
         self._runners: dict[str, DiffusionCUDAGraphRunner] = {}
 
     @property
     def enabled(self) -> bool:
         return bool(self.config.enabled)
 
-    def register(self, name: str, fn: Callable[..., Any]) -> None:
-        self._fns[name] = fn
-        self._runners[name] = DiffusionCUDAGraphRunner(replace(self.config, name=name))
+    def register(self, name: str, routine: DiffusionCUDAGraphRoutine) -> None:
+        old_runner = self._runners.get(name)
+        if old_runner is not None:
+            old_runner.clear()
+        self._routines[name] = routine
+        self._runners[name] = DiffusionCUDAGraphRunner(routine, replace(self.config, name=name))
+
+    def clear(self) -> None:
+        for runner in self._runners.values():
+            runner.clear()
 
     def last_call_info(self, name: str) -> dict[str, Any]:
         return self._runners[name].last_call_info
@@ -453,26 +449,21 @@ class DiffusionCUDAGraphManager:
         self,
         name: str,
         *args: Any,
-        graph_extra_key: Hashable | Mapping[str, Hashable] | Sequence[Hashable] | None = None,
-        graph_can_capture: bool = True,
-        graph_fallback_reason: str | None = None,
         **kwargs: Any,
     ) -> Any:
-        return self._runners[name].run(
-            self._fns[name],
-            *args,
-            graph_extra_key=graph_extra_key,
-            graph_can_capture=graph_can_capture,
-            graph_fallback_reason=graph_fallback_reason,
-            **kwargs,
-        )
+        return self._runners[name].run(*args, **kwargs)
 
 
 __all__ = [
     "DiffusionCUDAGraphConfig",
+    "DiffusionCUDAGraphCall",
     "DiffusionCUDAGraphManager",
+    "DiffusionCUDAGraphRoutine",
     "DiffusionCUDAGraphRunner",
+    "DiffusionCUDAGraphStaticInputs",
     "GraphEntry",
     "GraphKey",
     "GraphKeyBuilder",
+    "clone_graph_value",
+    "copy_graph_value",
 ]

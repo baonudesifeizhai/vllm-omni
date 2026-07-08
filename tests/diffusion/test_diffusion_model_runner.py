@@ -546,6 +546,7 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
     runner.pipeline = None
     runner.cache_backend = None
     runner.offload_backend = None
+    runner.cuda_graph_manager = None
     runner.od_config = SimpleNamespace(
         enable_cpu_offload=False,
         enable_layerwise_offload=False,
@@ -553,6 +554,8 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
         cache_config={},
         model_class_name="NextStep11Pipeline",
         enforce_eager=True,
+        enable_cuda_graph=False,
+        cuda_graph_config=None,
         streaming_output=False,
     )
 
