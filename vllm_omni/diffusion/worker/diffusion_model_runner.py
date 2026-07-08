@@ -164,10 +164,20 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             )
 
     def _bind_cuda_graph_manager(self, manager: DiffusionCUDAGraphManager | None) -> None:
+        old_manager = self.cuda_graph_manager
+        if old_manager is not None and old_manager is not manager:
+            old_manager.clear()
         self.cuda_graph_manager = manager
         bind = getattr(self.pipeline, "bind_cuda_graph_manager", None)
         if bind is not None:
             bind(manager)
+
+    def clear_cuda_graphs(self, *, unbind: bool = False) -> None:
+        manager = self.cuda_graph_manager
+        if unbind:
+            self._bind_cuda_graph_manager(None)
+        elif manager is not None:
+            manager.clear()
 
     def _disable_cuda_graphs(self, graph_config: DiffusionCUDAGraphConfig) -> None:
         graph_config.enabled = False

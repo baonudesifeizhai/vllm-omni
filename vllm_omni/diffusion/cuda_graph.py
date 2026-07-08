@@ -72,6 +72,7 @@ class GraphEntry:
     static_args: list[Any]
     static_kwargs: dict[str, Any]
     static_output: Any
+    static_input_token: Hashable | None = None
     hits: int = 0
 
 
@@ -242,6 +243,8 @@ class DiffusionCUDAGraphRunner:
         graph_extra_key: Hashable | Mapping[str, Hashable] | Sequence[Hashable] | None = None,
         graph_can_capture: bool = True,
         graph_fallback_reason: str | None = None,
+        graph_static_input_names: Sequence[str] = (),
+        graph_static_input_token: Hashable | None = None,
         **kwargs: Any,
     ) -> Any:
         """Run ``fn`` eagerly or through a captured CUDA graph.
@@ -266,7 +269,7 @@ class DiffusionCUDAGraphRunner:
         key = self.key_builder.build(args, kwargs, extra_key=graph_extra_key)
         entry = self._cache.get(key)
         if entry is None:
-            entry = self._capture(key, fn, args, kwargs)
+            entry = self._capture(key, fn, args, kwargs, graph_static_input_token)
             self._cache[key] = entry
             self._evict_if_needed()
             entry.graph.replay()
@@ -281,7 +284,14 @@ class DiffusionCUDAGraphRunner:
 
         self._cache.move_to_end(key)
         self._copy_inputs(entry.static_args, list(args))
-        self._copy_inputs(entry.static_kwargs, kwargs)
+        static_input_names = frozenset(graph_static_input_names)
+        for name, value in kwargs.items():
+            if name not in static_input_names:
+                self._copy_inputs(entry.static_kwargs[name], value)
+        if entry.static_input_token != graph_static_input_token:
+            for name in static_input_names:
+                self._copy_inputs(entry.static_kwargs[name], kwargs[name])
+            entry.static_input_token = graph_static_input_token
         entry.graph.replay()
         entry.hits += 1
         self.last_call_info = {
@@ -319,6 +329,8 @@ class DiffusionCUDAGraphRunner:
                 graph_extra_key=extra_key,
                 graph_can_capture=can_capture,
                 graph_fallback_reason=reason,
+                graph_static_input_names=(),
+                graph_static_input_token=None,
                 **kwargs,
             )
 
@@ -330,6 +342,7 @@ class DiffusionCUDAGraphRunner:
         fn: Callable[..., Any],
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
+        static_input_token: Hashable | None,
     ) -> GraphEntry:
         static_args = [self._clone_static(value) for value in args]
         static_kwargs = {name: self._clone_static(value) for name, value in kwargs.items()}
@@ -360,6 +373,7 @@ class DiffusionCUDAGraphRunner:
             static_args=static_args,
             static_kwargs=static_kwargs,
             static_output=static_output,
+            static_input_token=static_input_token,
         )
 
     def _eager(
@@ -449,6 +463,10 @@ class DiffusionCUDAGraphManager:
     def last_call_info(self, name: str) -> dict[str, Any]:
         return self._runners[name].last_call_info
 
+    def clear(self) -> None:
+        for runner in self._runners.values():
+            runner.clear()
+
     def run(
         self,
         name: str,
@@ -456,6 +474,8 @@ class DiffusionCUDAGraphManager:
         graph_extra_key: Hashable | Mapping[str, Hashable] | Sequence[Hashable] | None = None,
         graph_can_capture: bool = True,
         graph_fallback_reason: str | None = None,
+        graph_static_input_names: Sequence[str] = (),
+        graph_static_input_token: Hashable | None = None,
         **kwargs: Any,
     ) -> Any:
         return self._runners[name].run(
@@ -464,6 +484,8 @@ class DiffusionCUDAGraphManager:
             graph_extra_key=graph_extra_key,
             graph_can_capture=graph_can_capture,
             graph_fallback_reason=graph_fallback_reason,
+            graph_static_input_names=graph_static_input_names,
+            graph_static_input_token=graph_static_input_token,
             **kwargs,
         )
 
