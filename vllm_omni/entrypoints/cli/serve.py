@@ -464,6 +464,16 @@ class OmniServeCommand(CLISubcommand):
             "Equivalent to setting DiffusionParallelConfig.ring_degree.",
         )
         omni_config_group.add_argument(
+            "--cosmos3-sparse-window-attention",
+            type=json.loads,
+            default=None,
+            help=(
+                "Experimental Cosmos3 long-video sparse/window attention config. "
+                "Pass JSON true or an object such as "
+                '\'{"enabled": true, "temporal_radius": 4, "spatial_radius": 4, "query_block_size": 256}\'.'
+            ),
+        )
+        omni_config_group.add_argument(
             "--diffusion-quantization-config",
             type=json.loads,
             default=None,

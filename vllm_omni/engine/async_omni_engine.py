@@ -1009,11 +1009,17 @@ class AsyncOmniEngine:
                 attention_backend=kwargs.get("diffusion_attention_backend"),
             )
 
+        model_config = kwargs.get("model_config", None)
+        sparse_window_attention = kwargs.get("cosmos3_sparse_window_attention", None)
+        if sparse_window_attention is not None:
+            model_config = dict(model_config or {})
+            model_config["cosmos3_sparse_window_attention"] = sparse_window_attention
+
         stage_engine_args = {
             "max_num_seqs": kwargs.get("max_num_seqs") or 1,
             "parallel_config": parallel_config,
             "model_class_name": kwargs.get("model_class_name", None),
-            "model_config": kwargs.get("model_config", None),
+            "model_config": model_config,
             "additional_config": kwargs.get("additional_config", None),
             "step_execution": kwargs.get("step_execution", False),
             "request_batch_max_wait_ms": kwargs.get("request_batch_max_wait_ms", 0.0),

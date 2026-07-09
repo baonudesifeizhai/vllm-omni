@@ -200,6 +200,7 @@ class OmniEngineArgs(EngineArgs):
     log_stats: bool = False
     custom_pipeline_args: dict[str, Any] | None = None
     has_sampling_extra_args: bool = False
+    cosmos3_sparse_window_attention: dict[str, Any] | bool | None = None
 
     def __post_init__(self) -> None:
         if self.worker_cls is None:

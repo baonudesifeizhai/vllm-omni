@@ -36,6 +36,12 @@ from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.layers.norm import RMSNorm as _VllmRMSNorm
+from vllm_omni.diffusion.models.cosmos3.sparse_window import (
+    Cosmos3SparseWindowConfig,
+    Cosmos3SparseWindowMetadata,
+    build_sparse_window_metadata,
+    sparse_window_attention,
+)
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -656,8 +662,21 @@ class Cosmos3CrossAttention(nn.Module):
         v: torch.Tensor,
         k_und: torch.Tensor,
         v_und: torch.Tensor,
+        sparse_window_metadata: Cosmos3SparseWindowMetadata | None = None,
     ) -> torch.Tensor:
         B, S_gen = q.shape[:2]
+        if sparse_window_metadata is not None:
+            out = sparse_window_attention(
+                q,
+                k,
+                v,
+                k_und,
+                v_und,
+                sparse_window_metadata,
+                softmax_scale=1.0 / (self.head_dim**0.5),
+            )
+            return out.reshape(B, S_gen, -1)
+
         k_all = torch.cat([k_und, k], dim=1)
         v_all = torch.cat([v_und, v], dim=1)
 
@@ -673,8 +692,20 @@ class Cosmos3CrossAttention(nn.Module):
         v: torch.Tensor,
         k_und: torch.Tensor,
         v_und: torch.Tensor,
+        sparse_window_metadata: Cosmos3SparseWindowMetadata | None = None,
     ) -> torch.Tensor:
         B, S_gen = q.shape[:2]
+        if sparse_window_metadata is not None:
+            out = sparse_window_attention(
+                q,
+                k,
+                v,
+                k_und,
+                v_und,
+                sparse_window_metadata,
+                softmax_scale=1.0 / (self.head_dim**0.5),
+            )
+            return out.reshape(B, S_gen, -1)
 
         # Zero-length joint_query satisfies the Ulysses contract
         # (joint_query, joint_key, joint_value must all be present) without
@@ -700,6 +731,7 @@ class Cosmos3CrossAttention(nn.Module):
         v_und: torch.Tensor,
         freqs_cos: torch.Tensor,
         freqs_sin: torch.Tensor,
+        sparse_window_metadata: Cosmos3SparseWindowMetadata | None = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -723,9 +755,9 @@ class Cosmos3CrossAttention(nn.Module):
         q, k = _apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
 
         if _is_sp_active():
-            out = self._forward_sp(q, k, v, k_und, v_und)
+            out = self._forward_sp(q, k, v, k_und, v_und, sparse_window_metadata)
         else:
-            out = self._forward_local(q, k, v, k_und, v_und)
+            out = self._forward_local(q, k, v, k_und, v_und, sparse_window_metadata)
 
         return self.to_out(out)
 
@@ -833,6 +865,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
         freqs_sin: torch.Tensor | None = None,
         cached_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
         freqs_gen: tuple[torch.Tensor, torch.Tensor] | None = None,
+        sparse_window_metadata: Cosmos3SparseWindowMetadata | None = None,
     ) -> torch.Tensor:
         if cached_kv is not None:
             if self.layer_idx is None:
@@ -847,7 +880,12 @@ class Cosmos3GenDecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
 
         hidden_states = self.cross_attention(
-            hidden_states, k_und=k_und, v_und=v_und, freqs_cos=freqs_cos, freqs_sin=freqs_sin
+            hidden_states,
+            k_und=k_und,
+            v_und=v_und,
+            freqs_cos=freqs_cos,
+            freqs_sin=freqs_sin,
+            sparse_window_metadata=sparse_window_metadata,
         )
         hidden_states = residual + hidden_states
 
@@ -1147,6 +1185,12 @@ class Cosmos3VFMTransformer(nn.Module):
         # Cached state (populated on first forward, reused across denoising steps)
         self.cached_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None
         self.cached_freqs_gen: tuple[torch.Tensor, torch.Tensor] | None = None
+        sparse_window_value = _od_config_get(od_config, "cosmos3_sparse_window_attention", None)
+        if sparse_window_value is None:
+            sparse_window_value = _od_config_get(od_config, "sparse_window_attention", None)
+        self.sparse_window_config = Cosmos3SparseWindowConfig.from_value(sparse_window_value)
+        if self.sparse_window_config.enabled:
+            logger.info("Cosmos3 sparse/window GEN attention enabled: %s", self.sparse_window_config)
 
     @property
     def device(self) -> torch.device:
@@ -1481,7 +1525,7 @@ class Cosmos3VFMTransformer(nn.Module):
             )
 
         # Query Ulysses state at runtime
-        ulysses_size, _, _ = _get_ulysses_state()
+        ulysses_size, ulysses_rank, ulysses_pg = _get_ulysses_state()
 
         # Patchify latents and project to hidden space
         hidden_video = self.proj_in(self.patchify(hidden_states, t, h, w))
@@ -1609,6 +1653,30 @@ class Cosmos3VFMTransformer(nn.Module):
         freqs_cos, freqs_sin = self.cached_freqs_gen
         hidden_gen, freqs_cos, freqs_sin = self.gen_sp_prepare(hidden_gen, freqs_cos, freqs_sin)
         freqs_gen = (freqs_cos, freqs_sin)
+        sparse_window_metadata = None
+        ring_size = 1
+        if is_forward_context_available():
+            parallel_config = getattr(get_forward_context().omni_diffusion_config, "parallel_config", None)
+            ring_size = int(getattr(parallel_config, "ring_degree", 1))
+        if (
+            self.sparse_window_config.enabled
+            and ring_size == 1
+            and not has_control
+            and not has_action
+            and not has_sound
+        ):
+            local_token_start = ulysses_rank * hidden_gen.shape[1] if ulysses_size > 1 else 0
+            sparse_window_metadata = build_sparse_window_metadata(
+                config=self.sparse_window_config,
+                video_shape=video_shape,
+                patch_grid=(hp, wp),
+                local_token_start=local_token_start,
+                local_token_count=hidden_gen.shape[1],
+                rank=ulysses_rank,
+                world_size=ulysses_size,
+                process_group=ulysses_pg,
+                device=hidden_gen.device,
+            )
 
         if len(self.gen_layers) == len(self.cached_kv):
             for layer, (k_und, v_und) in zip(self.gen_layers, self.cached_kv, strict=True):
@@ -1618,6 +1686,7 @@ class Cosmos3VFMTransformer(nn.Module):
                     v_und=v_und,
                     freqs_cos=freqs_cos,
                     freqs_sin=freqs_sin,
+                    sparse_window_metadata=sparse_window_metadata,
                 )
                 # Cache-dit's block wrapper may return a tuple; unwrap it.
                 if isinstance(hidden_gen, tuple):
@@ -1629,6 +1698,7 @@ class Cosmos3VFMTransformer(nn.Module):
                     hidden_gen,
                     cached_kv=self.cached_kv,
                     freqs_gen=freqs_gen,
+                    sparse_window_metadata=sparse_window_metadata,
                 )
                 if isinstance(hidden_gen, tuple):
                     hidden_gen = hidden_gen[0]
