@@ -29,6 +29,7 @@ from vllm_omni.diffusion.cache.prompt_embed_cache import (
 )
 from vllm_omni.diffusion.cache.selector import get_cache_backend
 from vllm_omni.diffusion.compile import regionally_compile
+from vllm_omni.diffusion.cuda_graph import DiffusionCUDAGraphConfig, DiffusionCUDAGraphManager
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
@@ -122,6 +123,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         self.cache_backend = None
         self.offload_backend = None
         self.prompt_embed_cache = None
+        self.cuda_graph_manager: DiffusionCUDAGraphManager | None = None
 
         # Cache for per-request stepwise state.
         self.state_cache: dict[str, DiffusionRequestState] = {}
@@ -158,6 +160,64 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 attr_name,
                 e,
             )
+
+    def _bind_cuda_graph_manager(self, manager: DiffusionCUDAGraphManager | None) -> None:
+        old_manager = self.cuda_graph_manager
+        if old_manager is not None and old_manager is not manager:
+            old_manager.clear()
+        self.cuda_graph_manager = manager
+        bind = getattr(self.pipeline, "bind_cuda_graph_manager", None)
+        if bind is not None:
+            bind(manager)
+
+    def clear_cuda_graphs(self, *, unbind: bool = False) -> None:
+        manager = self.cuda_graph_manager
+        if unbind:
+            self._bind_cuda_graph_manager(None)
+        elif manager is not None:
+            manager.clear()
+
+    def _disable_cuda_graphs(self, graph_config: DiffusionCUDAGraphConfig) -> None:
+        graph_config.enabled = False
+        self.od_config.cuda_graph_config = graph_config
+        self.od_config.enable_cuda_graph = False
+        self._bind_cuda_graph_manager(None)
+
+    def _setup_cuda_graphs(self) -> None:
+        """Build and bind the diffusion CUDA graph manager when enabled."""
+        graph_config = DiffusionCUDAGraphConfig.from_value(
+            self.od_config.cuda_graph_config,
+            enabled=self.od_config.enable_cuda_graph,
+        )
+        self.od_config.cuda_graph_config = graph_config
+        self.od_config.enable_cuda_graph = bool(graph_config.enabled)
+        if not graph_config.enabled:
+            self._bind_cuda_graph_manager(None)
+            return
+        if not torch.cuda.is_available():
+            logger.warning("Diffusion CUDA graphs requested, but CUDA is not available; running eager.")
+            self._disable_cuda_graphs(graph_config)
+            return
+
+        get_routines = getattr(self.pipeline, "get_cuda_graph_routines", None)
+        routines = dict(get_routines()) if get_routines is not None else {}
+        if not routines:
+            logger.warning(
+                "Diffusion CUDA graphs requested, but %s does not declare CUDA graph routines; running eager.",
+                type(self.pipeline).__name__,
+            )
+            self._disable_cuda_graphs(graph_config)
+            return
+
+        manager = DiffusionCUDAGraphManager(graph_config)
+        for name, fn in routines.items():
+            manager.register(name, fn)
+        self._bind_cuda_graph_manager(manager)
+        logger.info(
+            "Diffusion CUDA graphs enabled for %s routines: %s.",
+            type(self.pipeline).__name__,
+            ", ".join(routines),
+        )
 
     def load_model(
         self,
@@ -254,6 +314,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     "Model runner: Platform %s does not support torch inductor, skipping torch.compile.",
                     current_omni_platform.get_torch_device(),
                 )
+
+        self._setup_cuda_graphs()
 
         # Setup cache backend
         self.cache_backend = get_cache_backend(self.od_config.cache_backend, self.od_config.cache_config)

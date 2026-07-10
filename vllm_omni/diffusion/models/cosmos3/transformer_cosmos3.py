@@ -1189,6 +1189,7 @@ class Cosmos3VFMTransformer(nn.Module):
         if sparse_window_value is None:
             sparse_window_value = _od_config_get(od_config, "sparse_window_attention", None)
         self.sparse_window_config = Cosmos3SparseWindowConfig.from_value(sparse_window_value)
+        self._sparse_window_metadata_cache: dict[tuple[Any, ...], Cosmos3SparseWindowMetadata | None] = {}
         if self.sparse_window_config.enabled:
             logger.info("Cosmos3 sparse/window GEN attention enabled: %s", self.sparse_window_config)
 
@@ -1441,15 +1442,13 @@ class Cosmos3VFMTransformer(nn.Module):
         pad = (-(base + sound_frames)) % ulysses_size
         return sound_frames + pad
 
-    # -- Forward -------------------------------------------------------------
-
-    def forward(
+    def _prepare_gen_inputs(
         self,
+        *,
         hidden_states: torch.Tensor,
         timestep: torch.Tensor,
-        text_ids: torch.Tensor,
-        text_mask: torch.Tensor,
         video_shape: tuple[int, int, int],
+        text_mask: torch.Tensor | None = None,
         fps: float | None = None,
         action_latents: torch.Tensor | None = None,
         action_domain_ids: torch.Tensor | None = None,
@@ -1460,46 +1459,19 @@ class Cosmos3VFMTransformer(nn.Module):
         noisy_frame_mask: torch.Tensor | None = None,
         control_latents: list[torch.Tensor] | tuple[torch.Tensor, ...] | torch.Tensor | None = None,
         transfer_share_vision_temporal_positions: bool = True,
-        **kwargs,
-    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
-        """
-        Args:
-            hidden_states: [B, C, t, h, w] noisy latents
-            timestep: [B] diffusion timestep
-            text_ids: [B, S_text] tokenized text
-            text_mask: [B, S_text] attention mask (1=real, 0=pad)
-            video_shape: (t, h, w) in latent space
-            fps: video frame rate for temporal mRoPE modulation
-            action_latents: Optional [B, T_action, D_action] noisy action latents.
-            action_domain_ids: Optional [B] embodiment domain IDs for action projections.
-            action_noisy_mask: Optional [B, T_action, 1] mask where 1=noisy
-                action token and 0=clean conditioned token.
-            sound_latents: Optional [B, C_sound, T_sound] noisy sound latents.
-            noisy_frame_mask: Optional [B, 1, t, 1, 1] mask where 1=noisy (add
-                timestep embedding, predict velocity) and 0=conditioned (clean
-                context, skip timestep embedding). None means all target vision
-                frames are noisy, as in T2I/T2V.
-            control_latents: Optional transfer-control latents. Controls are
-                clean vision context and are packed before the noisy target.
-
-        Returns:
-            [B, C, t, h, w] velocity prediction, or
-            tuple outputs in video, action, sound order when action/sound streams
-            are provided. Transfer-control streams condition the video prediction
-            and are not returned.
-        """
-        if kwargs:
-            raise TypeError(f"Unexpected Cosmos3 transformer kwargs: {sorted(kwargs)}")
+    ) -> dict[str, Any]:
         t, h, w = video_shape
         hp, wp, _, _ = self._pad_to_patch_size(h, w)
-        text_lengths = text_mask.sum(dim=1)
-        min_real_len = int(text_lengths.min().item())
-        max_real_len = int(text_lengths.max().item())
-        if min_real_len != max_real_len:
-            raise ValueError(
-                f"Cosmos3 requires identical real text lengths within a batch "
-                f"(got min={min_real_len}, max={max_real_len})."
-            )
+        max_real_len: int | None = None
+        if text_mask is not None:
+            text_lengths = text_mask.sum(dim=1)
+            min_real_len = int(text_lengths.min().item())
+            max_real_len = int(text_lengths.max().item())
+            if min_real_len != max_real_len:
+                raise ValueError(
+                    f"Cosmos3 requires identical real text lengths within a batch "
+                    f"(got min={min_real_len}, max={max_real_len})."
+                )
         has_action = action_latents is not None
         has_sound = sound_latents is not None
         if control_latents is None:
@@ -1610,35 +1582,58 @@ class Cosmos3VFMTransformer(nn.Module):
             hidden_parts.append(hidden_sound)
         hidden_gen = torch.cat(hidden_parts, dim=1)
 
-        # Run UND pathway once and cache K/V (replicated across all ranks)
-        if self.cached_kv is None:
-            freqs_und, freqs_gen = self._compute_rope_freqs(
-                text_mask,
-                t,
-                hp,
-                wp,
-                fps,
-                hidden_states.device,
-                hidden_states.dtype,
-                t_action=s_action,
-                action_start_frame_offset=action_start_frame_offset,
-                action_fps=action_fps,
-                t_sound=s_sound,
-                num_vision_items=len(control_latent_list) + 1,
-                share_vision_temporal_positions=transfer_share_vision_temporal_positions,
-            )
-            cached_kv_full = self.language_model(text_ids, freqs_und)
-            self.cached_freqs_gen = freqs_gen
+        return {
+            "hidden_gen": hidden_gen,
+            "video_shape": video_shape,
+            "hp": hp,
+            "wp": wp,
+            "fps": fps,
+            "device": hidden_states.device,
+            "dtype": hidden_states.dtype,
+            "s_video": s_video,
+            "s_control": s_control,
+            "s_action": s_action,
+            "s_sound": s_sound,
+            "has_action": has_action,
+            "has_sound": has_sound,
+            "has_control": has_control,
+            "action_domain_ids": action_domain_ids,
+            "action_start_frame_offset": action_start_frame_offset,
+            "action_fps": action_fps,
+            "t_sound": s_sound,
+            "num_vision_items": len(control_latent_list) + 1,
+            "share_vision_temporal_positions": transfer_share_vision_temporal_positions,
+            "max_real_len": max_real_len,
+        }
 
-            # Trim to real text length (remove padding).  K/V stay replicated;
-            # the framework Attention layer head-slices them via joint_key/value.
-            self.cached_kv = [(k[:, :max_real_len], v[:, :max_real_len]) for k, v in cached_kv_full]
+    def _run_cached_gen(
+        self,
+        gen_inputs: dict[str, Any],
+        *,
+        cached_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+        cached_freqs_gen: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        cached_kv = self.cached_kv if cached_kv is None else cached_kv
+        cached_freqs_gen = self.cached_freqs_gen if cached_freqs_gen is None else cached_freqs_gen
+        if cached_kv is None or cached_freqs_gen is None:
+            raise RuntimeError("Cosmos3 GEN cache was not initialized before running GEN layers.")
+
+        hidden_gen = gen_inputs["hidden_gen"]
+        video_shape = gen_inputs["video_shape"]
+        s_video = gen_inputs["s_video"]
+        s_control = gen_inputs["s_control"]
+        s_action = gen_inputs["s_action"]
+        s_sound = gen_inputs["s_sound"]
+        has_action = gen_inputs["has_action"]
+        has_sound = gen_inputs["has_sound"]
+        has_control = gen_inputs["has_control"]
+        action_domain_ids = gen_inputs["action_domain_ids"]
+        t, h, w = video_shape
 
         # Run GEN layers.  UND K/V (replicated) is passed to each layer;
         # the Cosmos3CrossAttention forwards them as joint_key/value so the
         # framework Attention handles the Ulysses head-slicing internally.
-        if self.cached_kv is None or self.cached_freqs_gen is None:
-            raise RuntimeError("Cosmos3 GEN cache was not initialized before running GEN layers.")
+        ulysses_size, ulysses_rank, ulysses_pg = _get_ulysses_state()
         self._validate_gen_sequence_parallel(
             s_gen=hidden_gen.shape[1],
             s_video=s_video,
@@ -1650,36 +1645,19 @@ class Cosmos3VFMTransformer(nn.Module):
             has_control=has_control,
             ulysses_size=ulysses_size,
         )
-        freqs_cos, freqs_sin = self.cached_freqs_gen
+        freqs_cos, freqs_sin = cached_freqs_gen
         hidden_gen, freqs_cos, freqs_sin = self.gen_sp_prepare(hidden_gen, freqs_cos, freqs_sin)
         freqs_gen = (freqs_cos, freqs_sin)
-        sparse_window_metadata = None
-        ring_size = 1
-        if is_forward_context_available():
-            parallel_config = getattr(get_forward_context().omni_diffusion_config, "parallel_config", None)
-            ring_size = int(getattr(parallel_config, "ring_degree", 1))
-        if (
-            self.sparse_window_config.enabled
-            and ring_size == 1
-            and not has_control
-            and not has_action
-            and not has_sound
-        ):
-            local_token_start = ulysses_rank * hidden_gen.shape[1] if ulysses_size > 1 else 0
-            sparse_window_metadata = build_sparse_window_metadata(
-                config=self.sparse_window_config,
-                video_shape=video_shape,
-                patch_grid=(hp, wp),
-                local_token_start=local_token_start,
-                local_token_count=hidden_gen.shape[1],
-                rank=ulysses_rank,
-                world_size=ulysses_size,
-                process_group=ulysses_pg,
-                device=hidden_gen.device,
-            )
+        sparse_window_metadata = self._get_sparse_window_metadata(
+            gen_inputs,
+            hidden_gen=hidden_gen,
+            ulysses_rank=ulysses_rank,
+            ulysses_size=ulysses_size,
+            ulysses_pg=ulysses_pg,
+        )
 
-        if len(self.gen_layers) == len(self.cached_kv):
-            for layer, (k_und, v_und) in zip(self.gen_layers, self.cached_kv, strict=True):
+        if len(self.gen_layers) == len(cached_kv):
+            for layer, (k_und, v_und) in zip(self.gen_layers, cached_kv, strict=True):
                 hidden_gen = layer(
                     hidden_gen,
                     k_und=k_und,
@@ -1696,7 +1674,7 @@ class Cosmos3VFMTransformer(nn.Module):
             for layer in self.gen_layers:
                 hidden_gen = layer(
                     hidden_gen,
-                    cached_kv=self.cached_kv,
+                    cached_kv=cached_kv,
                     freqs_gen=freqs_gen,
                     sparse_window_metadata=sparse_window_metadata,
                 )
@@ -1737,6 +1715,192 @@ class Cosmos3VFMTransformer(nn.Module):
             hidden_sound = split_hidden[split_idx]
             outputs.append(self.unpack_sound(self.audio_proj_out(hidden_sound)))
         return tuple(outputs)
+
+    def _get_sparse_window_metadata(
+        self,
+        gen_inputs: dict[str, Any],
+        *,
+        hidden_gen: torch.Tensor,
+        ulysses_rank: int,
+        ulysses_size: int,
+        ulysses_pg: dist.ProcessGroup | None,
+    ) -> Cosmos3SparseWindowMetadata | None:
+        if not self.sparse_window_config.enabled:
+            return None
+        if gen_inputs["has_control"] or gen_inputs["has_action"] or gen_inputs["has_sound"]:
+            return None
+
+        ring_size = 1
+        if is_forward_context_available():
+            parallel_config = getattr(get_forward_context().omni_diffusion_config, "parallel_config", None)
+            ring_size = int(getattr(parallel_config, "ring_degree", 1))
+        if ring_size != 1:
+            return None
+
+        local_token_count = int(hidden_gen.shape[1])
+        local_token_start = int(ulysses_rank * local_token_count if ulysses_size > 1 else 0)
+        device = hidden_gen.device
+        cache_key = (
+            tuple(gen_inputs["video_shape"]),
+            int(gen_inputs["hp"]),
+            int(gen_inputs["wp"]),
+            local_token_start,
+            local_token_count,
+            int(ulysses_rank),
+            int(ulysses_size),
+            device.type,
+            device.index,
+            self.sparse_window_config.temporal_radius,
+            self.sparse_window_config.spatial_radius,
+            self.sparse_window_config.query_block_size,
+            self.sparse_window_config.min_latent_frames,
+        )
+        if cache_key not in self._sparse_window_metadata_cache:
+            self._sparse_window_metadata_cache[cache_key] = build_sparse_window_metadata(
+                config=self.sparse_window_config,
+                video_shape=gen_inputs["video_shape"],
+                patch_grid=(gen_inputs["hp"], gen_inputs["wp"]),
+                local_token_start=local_token_start,
+                local_token_count=local_token_count,
+                rank=ulysses_rank,
+                world_size=ulysses_size,
+                process_group=ulysses_pg,
+                device=device,
+            )
+        return self._sparse_window_metadata_cache[cache_key]
+
+    def forward_cached_gen(
+        self,
+        hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        video_shape: tuple[int, int, int],
+        fps: float | None = None,
+        action_latents: torch.Tensor | None = None,
+        action_domain_ids: torch.Tensor | None = None,
+        action_noisy_mask: torch.Tensor | None = None,
+        action_start_frame_offset: int = 1,
+        action_fps: float | None = None,
+        sound_latents: torch.Tensor | None = None,
+        noisy_frame_mask: torch.Tensor | None = None,
+        control_latents: list[torch.Tensor] | tuple[torch.Tensor, ...] | torch.Tensor | None = None,
+        cached_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+        cached_freqs_gen: tuple[torch.Tensor, torch.Tensor] | None = None,
+        transfer_share_vision_temporal_positions: bool = True,
+        **kwargs,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        """Run GEN with an already-built UND cache; used by CUDA graph replay."""
+        if kwargs:
+            raise TypeError(f"Unexpected Cosmos3 cached-GEN kwargs: {sorted(kwargs)}")
+        gen_inputs = self._prepare_gen_inputs(
+            hidden_states=hidden_states,
+            timestep=timestep,
+            video_shape=video_shape,
+            fps=fps,
+            action_latents=action_latents,
+            action_domain_ids=action_domain_ids,
+            action_noisy_mask=action_noisy_mask,
+            action_start_frame_offset=action_start_frame_offset,
+            action_fps=action_fps,
+            sound_latents=sound_latents,
+            noisy_frame_mask=noisy_frame_mask,
+            control_latents=control_latents,
+            transfer_share_vision_temporal_positions=transfer_share_vision_temporal_positions,
+        )
+        return self._run_cached_gen(gen_inputs, cached_kv=cached_kv, cached_freqs_gen=cached_freqs_gen)
+
+    # -- Forward -------------------------------------------------------------
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        text_ids: torch.Tensor,
+        text_mask: torch.Tensor,
+        video_shape: tuple[int, int, int],
+        fps: float | None = None,
+        action_latents: torch.Tensor | None = None,
+        action_domain_ids: torch.Tensor | None = None,
+        action_noisy_mask: torch.Tensor | None = None,
+        action_start_frame_offset: int = 1,
+        action_fps: float | None = None,
+        sound_latents: torch.Tensor | None = None,
+        noisy_frame_mask: torch.Tensor | None = None,
+        control_latents: list[torch.Tensor] | tuple[torch.Tensor, ...] | torch.Tensor | None = None,
+        transfer_share_vision_temporal_positions: bool = True,
+        **kwargs,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        """
+        Args:
+            hidden_states: [B, C, t, h, w] noisy latents
+            timestep: [B] diffusion timestep
+            text_ids: [B, S_text] tokenized text
+            text_mask: [B, S_text] attention mask (1=real, 0=pad)
+            video_shape: (t, h, w) in latent space
+            fps: video frame rate for temporal mRoPE modulation
+            action_latents: Optional [B, T_action, D_action] noisy action latents.
+            action_domain_ids: Optional [B] embodiment domain IDs for action projections.
+            action_noisy_mask: Optional [B, T_action, 1] mask where 1=noisy
+                action token and 0=clean conditioned token.
+            sound_latents: Optional [B, C_sound, T_sound] noisy sound latents.
+            noisy_frame_mask: Optional [B, 1, t, 1, 1] mask where 1=noisy (add
+                timestep embedding, predict velocity) and 0=conditioned (clean
+                context, skip timestep embedding). None means all target vision
+                frames are noisy, as in T2I/T2V.
+            control_latents: Optional transfer-control latents. Controls are
+                clean vision context and are packed before the noisy target.
+
+        Returns:
+            [B, C, t, h, w] velocity prediction, or
+            tuple outputs in video, action, sound order when action/sound streams
+            are provided. Transfer-control streams condition the video prediction
+            and are not returned.
+        """
+        if kwargs:
+            raise TypeError(f"Unexpected Cosmos3 transformer kwargs: {sorted(kwargs)}")
+        gen_inputs = self._prepare_gen_inputs(
+            hidden_states=hidden_states,
+            timestep=timestep,
+            video_shape=video_shape,
+            text_mask=text_mask,
+            fps=fps,
+            action_latents=action_latents,
+            action_domain_ids=action_domain_ids,
+            action_noisy_mask=action_noisy_mask,
+            action_start_frame_offset=action_start_frame_offset,
+            action_fps=action_fps,
+            sound_latents=sound_latents,
+            noisy_frame_mask=noisy_frame_mask,
+            control_latents=control_latents,
+            transfer_share_vision_temporal_positions=transfer_share_vision_temporal_positions,
+        )
+
+        # Run UND pathway once and cache K/V (replicated across all ranks)
+        if self.cached_kv is None:
+            freqs_und, freqs_gen = self._compute_rope_freqs(
+                text_mask,
+                video_shape[0],
+                gen_inputs["hp"],
+                gen_inputs["wp"],
+                fps,
+                gen_inputs["device"],
+                gen_inputs["dtype"],
+                t_action=gen_inputs["s_action"],
+                action_start_frame_offset=action_start_frame_offset,
+                action_fps=action_fps,
+                t_sound=gen_inputs["s_sound"],
+                num_vision_items=gen_inputs["num_vision_items"],
+                share_vision_temporal_positions=transfer_share_vision_temporal_positions,
+            )
+            cached_kv_full = self.language_model(text_ids, freqs_und)
+            self.cached_freqs_gen = freqs_gen
+
+            # Trim to real text length (remove padding).  K/V stay replicated;
+            # the framework Attention layer head-slices them via joint_key/value.
+            max_real_len = gen_inputs["max_real_len"]
+            assert max_real_len is not None
+            self.cached_kv = [(k[:, :max_real_len], v[:, :max_real_len]) for k, v in cached_kv_full]
+
+        return self._run_cached_gen(gen_inputs)
 
     def post_load_weights(self) -> None:
         """Post-load processing: ensure correct dtypes."""
