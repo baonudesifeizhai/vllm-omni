@@ -183,8 +183,6 @@ class DomainAwareLinear(nn.Module):
                 "Cosmos3 action domain_id batch size must match action tokens: "
                 f"tokens={x.shape[0]}, domain_id={domain_id.shape[0]}."
             )
-        if torch.any((domain_id < 0) | (domain_id >= self.num_domains)):
-            raise ValueError(f"Cosmos3 action domain_id must be in [0, {self.num_domains}), got {domain_id.tolist()}.")
 
         weight = self.fc(domain_id).view(domain_id.shape[0], self.input_size, self.output_size)
         bias = self.bias(domain_id).view(domain_id.shape[0], self.output_size)
