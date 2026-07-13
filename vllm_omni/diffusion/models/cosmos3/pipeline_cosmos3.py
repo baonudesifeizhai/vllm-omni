@@ -33,7 +33,7 @@ import json
 import math
 import os
 import time
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import fields
 from typing import Any, ClassVar
 
@@ -47,7 +47,7 @@ from transformers import AutoTokenizer
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
-from vllm_omni.diffusion.cuda_graph import DiffusionCUDAGraphManager
+from vllm_omni.diffusion.cuda_graph import DiffusionCUDAGraphConfig
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
@@ -88,6 +88,7 @@ from .action import (
     resolve_domain_id,
     vision_condition_indexes,
 )
+from .cuda_graph import Cosmos3CUDAGraphManager
 from .transfer import (
     Cosmos3TransferConfig,
     has_transfer_hints,
@@ -979,7 +980,7 @@ class Cosmos3OmniDiffusersPipeline(
         self._guidance_scale = None
         self._num_timesteps = None
         self._cosmos3_branch_caches: dict[str, tuple[Any, Any]] | None = None
-        self._cuda_graph_manager: DiffusionCUDAGraphManager | None = None
+        self._cuda_graph_manager: Cosmos3CUDAGraphManager | None = None
         self._cuda_graph_cache_generation = 0
         self._robolab_transform = None
 
@@ -1019,10 +1020,10 @@ class Cosmos3OmniDiffusersPipeline(
     def disable_omni_model_cpu_offload(self) -> None:
         self.transformer.disable_model_cpu_offload()
 
-    def get_cuda_graph_routines(self) -> dict[str, Callable[..., Any]]:
-        return {"cosmos3.cached_gen": self.transformer.forward_cached_gen}
+    def create_cuda_graph_manager(self, config: DiffusionCUDAGraphConfig) -> Cosmos3CUDAGraphManager:
+        return Cosmos3CUDAGraphManager(self.transformer.forward_cached_gen, config)
 
-    def bind_cuda_graph_manager(self, manager: DiffusionCUDAGraphManager | None) -> None:
+    def bind_cuda_graph_manager(self, manager: Cosmos3CUDAGraphManager | None) -> None:
         self._cuda_graph_manager = manager
         if manager is None or not manager.enabled:
             return
@@ -1060,23 +1061,19 @@ class Cosmos3OmniDiffusersPipeline(
         gen_kwargs["cached_kv"] = self.transformer.cached_kv
         gen_kwargs["cached_freqs_gen"] = self.transformer.cached_freqs_gen
         can_capture, reason = self._cuda_graph_capture_decision(transformer_kwargs)
-        extra_key = {
-            "branch": graph_branch,
-            "transformer_id": id(self.transformer),
-        }
-        output = manager.run(
-            "cosmos3.cached_gen",
-            graph_extra_key=extra_key,
-            graph_can_capture=can_capture,
-            graph_fallback_reason=reason,
-            graph_static_input_names=("cached_kv", "cached_freqs_gen"),
-            graph_static_input_token=self._cuda_graph_cache_generation,
+        if not can_capture:
+            logger.debug("Cosmos3 CUDA graph skipped for branch=%s reason=%s", graph_branch, reason)
+            return self.transformer.forward_cached_gen(**gen_kwargs)
+
+        output = manager.run_cached_gen(
+            branch=graph_branch,
+            cache_generation=self._cuda_graph_cache_generation,
             **gen_kwargs,
         )
         logger.debug(
             "Cosmos3 CUDA graph branch=%s info=%s",
             graph_branch,
-            manager.last_call_info("cosmos3.cached_gen"),
+            manager.last_call_info,
         )
         return output
 
