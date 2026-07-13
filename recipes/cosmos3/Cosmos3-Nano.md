@@ -120,9 +120,23 @@ auto-resolves from `model_index.json`; pass
 CUDA Graph is optional for Cosmos3. Enable it when serving latency-sensitive
 workloads where repeated requests use the same resolution, frame count, and
 branch pattern, especially small text-to-image or short/low-resolution video
-requests. It captures the cached GEN transformer forward;
-prompt processing, scheduler steps, and VAE encode/decode still run outside the
-graph.
+requests. The shared diffusion CUDA Graph code only owns the CLI/config surface;
+Cosmos3 provides its own `Cosmos3CUDAGraphManager`, which captures
+`Cosmos3Transformer.forward_cached_gen()`.
+
+Current capture scope:
+
+1. Request setup, prompt/token processing, latent initialization, and scheduler
+   setup run eager.
+2. The first transformer call that builds `cached_kv` and `cached_freqs_gen`
+   runs eager.
+3. Once those caches exist, each stable `single`, `cond`, or `uncond` branch can
+   capture/replay the cached GEN path. The captured region includes GEN input
+   preparation, Ulysses GEN prepare/gather, GEN transformer layers, final norm,
+   projection, unpatchify, and action/sound projection work in
+   `forward_cached_gen()`.
+4. CFG combine, scheduler step, VAE encode/decode, audio decode, muxing, and
+   response postprocessing remain eager.
 
 Do not combine `--enable-cuda-graph` with `--cache-backend cache_dit` or
 `--cache-backend tea_cache` for Cosmos3. These cache backends make per-step
@@ -135,15 +149,21 @@ Scope and recommended combinations:
 
 | Feature / path | Recommended? | CUDA Graph behavior |
 | --- | --- | --- |
-| Regular Cosmos3 denoising via `diffuse()` | Yes, for latency-sensitive workloads with stable resolution, frame count, and branch pattern | Graph replay applies to cached GEN transformer forward when shapes and graph keys are stable. |
+| Regular Cosmos3 denoising via `diffuse()` | Yes, for latency-sensitive workloads with stable resolution, frame count, and branch pattern | The first cache-building transformer call is eager; later cached GEN calls capture/replay when tensor shapes, strides, dtypes, devices, and branch keys are stable. |
 | `torch.compile` on non-cache paths | Yes | Supported with CUDA Graph. |
-| Ulysses / CFG branches | Yes, when shapes and branches are stable | Graph keys separate `cond`, `uncond`, and `single` branches. |
+| Ulysses / CFG branches | Yes, when shapes and branches are stable | Graph keys separate `cond`, `uncond`, and `single` branches. Ulysses GEN prepare/gather are inside the captured cached GEN path. |
 | Transfer/control denoising via `diffuse_transfer()` | No | Remains eager. |
 | Prompt encoding, scheduler steps, VAE encode/decode, sound tokenizer/audio decode | No | Remain eager. |
 | `cache_dit` / `tea_cache` | No; use as a separate cache-acceleration mode | Do not enable together with `--enable-cuda-graph`. |
-| CPU offload / layerwise offload | Benchmark first | Not a recommended CUDA Graph combination by default. |
+| CPU offload / layerwise offload | Benchmark first | Model CPU offload disables Cosmos3 CUDA Graph capture; benchmark any other offload mode before combining it with CUDA Graph. |
 | Sleep mode | Benchmark first | Validate wake-up behavior and memory impact for the target deployment before enabling with CUDA Graph. |
-| Custom pipelines | Only if the pipeline declares graph routines | Fall back to eager unless the pipeline implements CUDA Graph routine registration. |
+| Custom pipelines | Only if the pipeline implements `create_cuda_graph_manager()` | Fall back to eager unless the pipeline provides a model-specific CUDA Graph manager. |
+
+Cosmos3 capture requires `cached_kv` and `cached_freqs_gen` to be ready,
+`--cache-backend` unset or `none`, model CPU offload disabled, and static action
+metadata when action latents are present. The graph cache is keyed by branch and
+input tensor metadata, so changing resolution, frame count, modality layout, or
+branch shape captures a separate graph.
 
 It is not recommended as the first optimization for long/high-resolution video
 generation, where transformer compute and VAE work dominate launch overhead. The
