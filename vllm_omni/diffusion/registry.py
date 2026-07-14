@@ -333,6 +333,7 @@ _NO_CACHE_ACCELERATION = {
     # Pipelines that do not support cache acceleration (cache_dit / tea_cache).
     "NextStep11Pipeline",
     "AudioXPipeline",
+    "LingBotWorldCausalDMDPipeline",
 }
 
 
