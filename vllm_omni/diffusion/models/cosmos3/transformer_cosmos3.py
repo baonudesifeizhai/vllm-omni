@@ -174,7 +174,13 @@ class DomainAwareLinear(nn.Module):
         nn.init.xavier_uniform_(self.fc.weight)
         nn.init.zeros_(self.bias.weight)
 
-    def forward(self, x: torch.Tensor, domain_id: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        domain_id: torch.Tensor,
+        *,
+        validate_domain_id: bool = True,
+    ) -> torch.Tensor:
         if domain_id.ndim == 0:
             domain_id = domain_id.unsqueeze(0)
         domain_id = domain_id.to(device=x.device, dtype=torch.long).reshape(-1)
@@ -183,6 +189,9 @@ class DomainAwareLinear(nn.Module):
                 "Cosmos3 action domain_id batch size must match action tokens: "
                 f"tokens={x.shape[0]}, domain_id={domain_id.shape[0]}."
             )
+        assert not validate_domain_id or not torch.any((domain_id < 0) | (domain_id >= self.num_domains)), (
+            f"Cosmos3 action domain_id must be in [0, {self.num_domains}), got {domain_id.tolist()}."
+        )
 
         weight = self.fc(domain_id).view(domain_id.shape[0], self.input_size, self.output_size)
         bias = self.bias(domain_id).view(domain_id.shape[0], self.output_size)
@@ -1568,6 +1577,7 @@ class Cosmos3VFMTransformer(nn.Module):
         sound_latents: torch.Tensor | None = None,
         noisy_frame_mask: torch.Tensor | None = None,
         control_latents: list[torch.Tensor] | tuple[torch.Tensor, ...] | torch.Tensor | None = None,
+        validate_action_domain_ids: bool = True,
     ) -> dict[str, Any]:
         t, h, w = video_shape
         hp, wp, _, _ = self._pad_to_patch_size(h, w)
@@ -1623,7 +1633,11 @@ class Cosmos3VFMTransformer(nn.Module):
                 )
             if action_domain_ids is None:
                 action_domain_ids = torch.zeros(action_latents.shape[0], dtype=torch.long, device=action_latents.device)
-            hidden_action = self.action_proj_in(self.pack_action(action_latents), action_domain_ids)
+            hidden_action = self.action_proj_in(
+                self.pack_action(action_latents),
+                action_domain_ids,
+                validate_domain_id=validate_action_domain_ids,
+            )
             hidden_action = hidden_action + self.action_modality_embed.to(hidden_action.dtype)
             s_action = hidden_action.shape[1]
         if sound_latents is not None:
@@ -1699,6 +1713,7 @@ class Cosmos3VFMTransformer(nn.Module):
         *,
         cached_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
         cached_freqs_gen: tuple[torch.Tensor, torch.Tensor] | None = None,
+        validate_action_domain_ids: bool = True,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         cached_kv = self.cached_kv if cached_kv is None else cached_kv
         cached_freqs_gen = self.cached_freqs_gen if cached_freqs_gen is None else cached_freqs_gen
@@ -1784,7 +1799,15 @@ class Cosmos3VFMTransformer(nn.Module):
             hidden_action = split_hidden[split_idx]
             split_idx += 1
             assert action_domain_ids is not None
-            outputs.append(self.unpack_action(self.action_proj_out(hidden_action, action_domain_ids)))
+            outputs.append(
+                self.unpack_action(
+                    self.action_proj_out(
+                        hidden_action,
+                        action_domain_ids,
+                        validate_domain_id=validate_action_domain_ids,
+                    )
+                )
+            )
         if has_sound:
             hidden_sound = split_hidden[split_idx]
             outputs.append(self.unpack_sound(self.audio_proj_out(hidden_sound)))
@@ -1824,8 +1847,14 @@ class Cosmos3VFMTransformer(nn.Module):
                 sound_latents=sound_latents,
                 noisy_frame_mask=noisy_frame_mask,
                 control_latents=control_latents,
+                validate_action_domain_ids=False,
             )
-            return self._run_cached_gen(gen_inputs, cached_kv=cached_kv, cached_freqs_gen=cached_freqs_gen)
+            return self._run_cached_gen(
+                gen_inputs,
+                cached_kv=cached_kv,
+                cached_freqs_gen=cached_freqs_gen,
+                validate_action_domain_ids=False,
+            )
 
     # -- Forward -------------------------------------------------------------
 

@@ -75,7 +75,6 @@ class Cosmos3CUDAGraphManager:
             entry = self._capture(kwargs, cache_generation, hidden_states.device)
             self._cache[key] = entry
             self._evict_if_needed()
-            entry.graph.replay()
             entry.hits += 1
             self.last_call_info = {
                 "mode": "graph",

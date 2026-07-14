@@ -1030,8 +1030,6 @@ class Cosmos3OmniDiffusersPipeline(
         logger.info("Cosmos3 CUDA graphs enabled for cached GEN transformer forward.")
 
     def _cuda_graph_capture_decision(self, transformer_kwargs: Mapping[str, Any]) -> tuple[bool, str | None]:
-        if self.transformer.cached_kv is None or self.transformer.cached_freqs_gen is None:
-            return False, "cosmos3_cache_not_ready"
         if getattr(self.transformer, "_model_cpu_offload_enabled", False):
             return False, "model_cpu_offload"
         cache_backend = getattr(self.od_config, "cache_backend", None)
