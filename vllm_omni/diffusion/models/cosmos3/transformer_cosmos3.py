@@ -189,9 +189,8 @@ class DomainAwareLinear(nn.Module):
                 "Cosmos3 action domain_id batch size must match action tokens: "
                 f"tokens={x.shape[0]}, domain_id={domain_id.shape[0]}."
             )
-        assert not validate_domain_id or not torch.any((domain_id < 0) | (domain_id >= self.num_domains)), (
-            f"Cosmos3 action domain_id must be in [0, {self.num_domains}), got {domain_id.tolist()}."
-        )
+        if validate_domain_id and torch.any((domain_id < 0) | (domain_id >= self.num_domains)):
+            raise ValueError(f"Cosmos3 action domain_id must be in [0, {self.num_domains}), got {domain_id.tolist()}.")
 
         weight = self.fc(domain_id).view(domain_id.shape[0], self.input_size, self.output_size)
         bias = self.bias(domain_id).view(domain_id.shape[0], self.output_size)
@@ -1798,7 +1797,8 @@ class Cosmos3VFMTransformer(nn.Module):
         if has_action:
             hidden_action = split_hidden[split_idx]
             split_idx += 1
-            assert action_domain_ids is not None
+            if action_domain_ids is None:
+                raise ValueError("Cosmos3 action_domain_ids must be provided when action outputs are enabled.")
             outputs.append(
                 self.unpack_action(
                     self.action_proj_out(

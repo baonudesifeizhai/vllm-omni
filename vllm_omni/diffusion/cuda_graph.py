@@ -28,7 +28,8 @@ class DiffusionCUDAGraphConfig:
     name: str = "diffusion"
 
     def __post_init__(self) -> None:
-        assert self.max_graphs >= 1, "diffusion cuda_graph_config.max_graphs must be >= 1"
+        if self.max_graphs < 1:
+            raise ValueError("diffusion cuda_graph_config.max_graphs must be >= 1")
 
     @classmethod
     def from_value(
