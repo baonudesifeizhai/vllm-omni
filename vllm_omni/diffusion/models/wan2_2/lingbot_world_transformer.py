@@ -1123,6 +1123,7 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
 
         params = dict(self.named_parameters())
         loaded: set[str] = set()
+        loaded_qkv_shards: dict[str, set[str]] = {}
         qkv_mapping = (("q", "q"), ("k", "k"), ("v", "v"))
         for checkpoint_name, loaded_weight in weights:
             name = checkpoint_name
@@ -1153,4 +1154,9 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
                 with torch.no_grad():
                     param.copy_(loaded_weight)
             loaded.add(checkpoint_name)
+            if shard_id is not None:
+                shards = loaded_qkv_shards.setdefault(name, set())
+                shards.add(shard_id)
+                if shards == {"q", "k", "v"}:
+                    loaded.add(name)
         return loaded
