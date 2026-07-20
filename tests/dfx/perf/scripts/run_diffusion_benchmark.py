@@ -23,8 +23,9 @@ DIFFUSION_BENCHMARK_DIR environment variable). Each source JSON file gets one
 aggregated ``diffusion_result_{config_stem}_{hardware}_{timestamp}.json`` (JSON array
 of all runs from cases in that file). Bulk load without ``--test-config-file`` uses
 the same per-file aggregation; ``-m`` only selects which cases run.
-Optional top-level ``metadata`` in a benchmark config is copied into each result
-record for report-only fields such as ``CUDA Graph`` and ``Attn_backend``.
+Flat report fields such as ``CUDA Graph`` and ``Attn_backend`` are derived from
+the server config / environment; optional top-level ``metadata`` can override
+or add report-only fields in each result record.
 """
 
 import json
@@ -518,6 +519,24 @@ def _to_compile_value(framework: str, serve_args_dict: dict[str, Any]) -> str:
     return "disabled"
 
 
+def _to_cuda_graph_value(framework: str, serve_args_dict: dict[str, Any]) -> str:
+    if framework == "vllm-omni":
+        if bool(serve_args_dict.get("enable-cuda-graph")):
+            return "enabled"
+        config = serve_args_dict.get("cuda-graph-config")
+        if isinstance(config, dict) and bool(config.get("enabled")):
+            return "enabled"
+    return "disabled"
+
+
+def _to_attention_backend_value(framework: str, serve_args_dict: dict[str, Any]) -> str:
+    if framework == "vllm-omni":
+        backend = serve_args_dict.get("diffusion-attention-backend")
+        if backend:
+            return str(backend)
+    return os.environ.get("DIFFUSION_ATTENTION_BACKEND", "")
+
+
 def _to_quantization_value(framework: str, serve_args_dict: dict[str, Any]) -> str:
     if framework == "vllm-omni":
         quant = serve_args_dict.get("quantization")
@@ -789,6 +808,8 @@ def run_benchmark(
         "Quantization": _to_quantization_value(server_type, serve_args_dict),
         "offload": _to_offload_string(server_type, serve_args_dict),
         "compile": _to_compile_value(server_type, serve_args_dict),
+        "CUDA Graph": _to_cuda_graph_value(server_type, serve_args_dict),
+        "Attn_backend": _to_attention_backend_value(server_type, serve_args_dict),
         "num_inference_steps": params.get("num-inference-steps", ""),
         "completed": completed,
         "failed": failed,
