@@ -20,7 +20,13 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
 from vllm.config import ModelConfig, VllmConfig
 from vllm.inputs import PromptType, TokensPrompt
 from vllm.logger import init_logger
-from vllm.model_executor.models.interfaces import SupportsMRoPE, SupportsMultiModal, SupportsPP, SupportsRealtime
+from vllm.model_executor.models.interfaces import (
+    SupportsEagle3,
+    SupportsMRoPE,
+    SupportsMultiModal,
+    SupportsPP,
+    SupportsRealtime,
+)
 from vllm.model_executor.models.qwen3_asr_realtime import Qwen3ASRRealtimeBuffer
 from vllm.model_executor.models.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeConditionalGenerationMixin,
@@ -85,6 +91,7 @@ class Qwen3OmniMoeForConditionalGeneration(
     Qwen3OmniMoeConditionalGenerationMixin,
     CustomProcessMixin,
     SupportsMRoPE,
+    SupportsEagle3,
     SupportsRealtime,
 ):
     """
@@ -357,7 +364,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         logits_index: int | None = None,
         runtime_additional_information: list[dict[str, Any]] | None = None,
         **kwargs: object,
-    ) -> torch.Tensor | IntermediateTensors | OmniOutput:
+    ) -> torch.Tensor | IntermediateTensors | OmniOutput | tuple[Any, ...]:
         """
         Unified forward pass for all model stages.
 
@@ -393,7 +400,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                 }
 
             # Run thinker
-            text_hidden_states, captured_layer_dict = self.thinker(
+            return self.thinker(
                 input_ids=input_ids,
                 positions=positions,
                 intermediate_tensors=intermediate_tensors,
@@ -401,8 +408,6 @@ class Qwen3OmniMoeForConditionalGeneration(
                 **capture_kwargs,
                 **kwargs,
             )
-            return text_hidden_states, captured_layer_dict
-
         # ========== Stage 2.1: Talker ==========
         elif self.model_stage == "talker":
             if input_ids is None:
@@ -481,7 +486,11 @@ class Qwen3OmniMoeForConditionalGeneration(
             multimodal_outputs=None,
         )
 
-    def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput, **kwargs) -> OmniOutput:
+    def make_omni_output(
+        self,
+        model_outputs: torch.Tensor | OmniOutput | tuple[Any, ...],
+        **kwargs,
+    ) -> OmniOutput | tuple[OmniOutput, list[torch.Tensor]]:
         """
         Make an OmniOutput object from model outputs.
         Args:
@@ -491,6 +500,10 @@ class Qwen3OmniMoeForConditionalGeneration(
             return model_outputs
 
         if self.model_stage == "thinker":
+            aux_hidden_states = None
+            if isinstance(model_outputs, tuple) and len(model_outputs) == 2 and isinstance(model_outputs[1], list):
+                model_outputs, aux_hidden_states = model_outputs
+
             text_hidden_states, captured_layer_dict = model_outputs
             # Compute thinker-side TTS token embeddings for BOS/EOS/PAD and expose via multimodal outputs.
             # These will later be projected into talker text space by the talker stage.
@@ -512,10 +525,13 @@ class Qwen3OmniMoeForConditionalGeneration(
                 pass
 
             # Return text-only output (with multimodal sidecar)
-            return OmniOutput(
+            omni_output = OmniOutput(
                 text_hidden_states=(text_hidden_states.reshape(-1, text_hidden_states.shape[-1])),
                 multimodal_outputs=multimodal_outputs,
             )
+            if aux_hidden_states is not None:
+                return omni_output, aux_hidden_states
+            return omni_output
         elif self.model_stage == "talker":
             talker_hidden = model_outputs
             # merge the code_predictor_codes from the info_dict list into a single tensor
@@ -551,6 +567,16 @@ class Qwen3OmniMoeForConditionalGeneration(
             )
 
         return model_outputs
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        if self.model_stage != "thinker":
+            raise RuntimeError("Qwen3-Omni auxiliary hidden states are only available on the Thinker stage.")
+        self.thinker.set_aux_hidden_state_layers(layers)
+
+    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        if self.model_stage != "thinker":
+            raise RuntimeError("Qwen3-Omni auxiliary hidden states are only available on the Thinker stage.")
+        return self.thinker.get_eagle3_default_aux_hidden_state_layers()
 
     # ==================== Audio Generation ====================
 

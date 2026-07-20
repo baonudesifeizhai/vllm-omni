@@ -484,3 +484,59 @@ def _patch_cumem_free_callback_cuda() -> None:
 
 
 _patch_cumem_free_callback_cuda()
+
+
+# =============================================================================
+# Keep the example hidden-state connector alive when an unscheduled request is
+# aborted. The training client can be interrupted while a request is still in
+# the scheduler queue. In that case vLLM calls ``request_finished`` even though
+# ``build_connector_meta`` never populated ``_request_filenames`` for it. The
+# upstream example connector uses ``dict.pop(req_id)`` and raises ``KeyError``,
+# which is treated as a fatal EngineCore error and tears down every replica.
+# =============================================================================
+def _patch_example_hidden_states_connector_abort() -> None:
+    try:
+        from vllm.distributed.kv_transfer.kv_connector.v1.example_hidden_states_connector import (
+            ExampleHiddenStatesConnector,
+        )
+    except ImportError:
+        _PATCH_LOGGER.debug("ExampleHiddenStatesConnector is unavailable; skipping abort patch")
+        return
+
+    original_request_finished = ExampleHiddenStatesConnector.request_finished
+    if getattr(
+        original_request_finished,
+        "_omni_missing_filename_patched",
+        False,
+    ):
+        return
+
+    def _patched_request_finished(self, request, block_ids):
+        req_id = request.request_id
+        if req_id not in self._request_filenames:
+            _PATCH_LOGGER.warning(
+                "Hidden-state request %s finished before it was scheduled; skipping the pending save.",
+                req_id,
+            )
+            return False, None
+        return original_request_finished(self, request, block_ids)
+
+    _patched_request_finished._omni_missing_filename_patched = True
+    ExampleHiddenStatesConnector.request_finished = _patched_request_finished
+
+
+_patch_example_hidden_states_connector_abort()
+
+
+def _patch_qwen3_omni_dspark_modality_heads() -> None:
+    try:
+        from vllm_omni.model_executor.models.qwen3_omni.dspark_modality import (
+            install_qwen3_omni_dspark_modality_patch,
+        )
+    except ImportError as exc:
+        _PATCH_LOGGER.debug("Qwen3-Omni DSpark modality patch unavailable: %s", exc)
+        return
+    install_qwen3_omni_dspark_modality_patch()
+
+
+_patch_qwen3_omni_dspark_modality_heads()

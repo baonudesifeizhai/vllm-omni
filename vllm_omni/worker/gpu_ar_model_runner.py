@@ -1299,7 +1299,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 hidden_states = model_output
                 aux_hidden_states = None
 
-            hidden_states, multimodal_outputs = self.extract_multimodal_outputs(model_output)
+            hidden_states, multimodal_outputs = self.extract_multimodal_outputs(hidden_states)
             hidden_states_cpu = None
 
             # Async-write pipeline (replaces the per-step blocking
