@@ -1142,7 +1142,7 @@ stages:
     def test_load_qwen3_omni_moe_thinker_only_deploy_config(self):
         deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "qwen3_omni_moe_thinker_only.yaml"
         deploy = load_deploy_config(deploy_path)
-        pipeline = StageConfigFactory.resolve_pipeline_config(deploy.pipeline)
+        pipeline = resolve_pipeline_config(deploy.pipeline)
         stages = merge_pipeline_deploy(pipeline, deploy)
 
         assert deploy.pipeline == "qwen3_omni_moe_thinker_only"
