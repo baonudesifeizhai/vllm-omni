@@ -540,3 +540,17 @@ def _patch_qwen3_omni_dspark_modality_heads() -> None:
 
 
 _patch_qwen3_omni_dspark_modality_heads()
+
+
+def _patch_legacy_dspark_proposer() -> None:
+    try:
+        from vllm_omni.worker.dspark_proposer import (
+            install_legacy_dspark_proposer_patch,
+        )
+    except ImportError as exc:
+        _PATCH_LOGGER.debug("Qwen3-Omni DSpark proposer patch unavailable: %s", exc)
+        return
+    install_legacy_dspark_proposer_patch()
+
+
+_patch_legacy_dspark_proposer()

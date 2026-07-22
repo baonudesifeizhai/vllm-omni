@@ -72,6 +72,23 @@ def _install_config_patch() -> None:
         # Match the actual training layout instead of forcing the DFlash-style
         # bonus-anchor layout for every Speculators checkpoint.
         pre_trained_config["dspark_bonus_anchor"] = not bool(config_dict.get("sample_from_anchor", True))
+        # DSpark keeps these values at the top level, while vLLM's shared
+        # parallel-drafting proposer reads the mask token from the DFlash
+        # compatibility namespace.  Populate both layouts so a Speculators
+        # checkpoint can be served directly.
+        pre_trained_config["dflash_config"] = {
+            "mask_token_id": config_dict["mask_token_id"],
+            "target_layer_ids": pre_trained_config["target_layer_ids"],
+        }
+        # The verifier uses M-RoPE for multimodal fusion, but the Speculators
+        # draft transformer is trained over the flattened token sequence with
+        # ordinary 1D positions. Keeping mrope_section here makes vLLM treat
+        # the draft itself as a multimodal model and reject parallel drafting.
+        rope_parameters = dict(pre_trained_config.get("rope_parameters") or {})
+        rope_parameters.pop("mrope_section", None)
+        rope_parameters.pop("interleaved", None)
+        if rope_parameters:
+            pre_trained_config["rope_parameters"] = rope_parameters
         for key in ("modality_head_rank", "modality_token_ids"):
             if config_dict.get(key) is not None:
                 pre_trained_config[key] = config_dict[key]

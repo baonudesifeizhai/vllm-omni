@@ -26,12 +26,27 @@ def test_dspark_config_propagates_modality_heads_and_anchor_layout():
             "video": [151656],
         },
     }
-    converted = {}
+    converted = {
+        "rope_parameters": {
+            "rope_type": "default",
+            "rope_theta": 1_000_000,
+            "mrope_section": [24, 20, 20],
+            "interleaved": True,
+        }
+    }
     SUPPORTED_SPECULATORS_TYPES["dspark"](config, converted)
 
     assert converted["dspark_bonus_anchor"] is False
+    assert converted["dflash_config"] == {
+        "mask_token_id": config["mask_token_id"],
+        "target_layer_ids": [1, 12, 23, 34, 45],
+    }
     assert converted["modality_head_rank"] == 128
     assert converted["modality_token_ids"] == config["modality_token_ids"]
+    assert converted["rope_parameters"] == {
+        "rope_type": "default",
+        "rope_theta": 1_000_000,
+    }
 
 
 def test_dspark_config_preserves_bonus_anchor_mode_when_requested():
@@ -51,6 +66,7 @@ def test_dspark_config_preserves_bonus_anchor_mode_when_requested():
     converted = {}
     SUPPORTED_SPECULATORS_TYPES["dspark"](config, converted)
     assert converted["dspark_bonus_anchor"] is True
+    assert converted["dflash_config"]["mask_token_id"] == 127
 
 
 def test_finish_logits_gathers_once_then_applies_vocab_and_scale():
