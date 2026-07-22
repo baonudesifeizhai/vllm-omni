@@ -1669,6 +1669,43 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             self._omni_payload_copy_stream = stream
         return stream
 
+    def _build_verified_text_windows(
+        self,
+        req_ids: list[str],
+        valid_sampled_token_ids: list[list[int]],
+    ) -> dict[str, dict[str, object]]:
+        """Build Thinker->Talker windows from verifier-approved token IDs.
+
+        Speculative target forwards contain rows for both accepted and rejected
+        candidates.  Those rows cannot be forwarded as Talker conditioning.
+        Re-embedding ``valid_sampled_token_ids`` gives the exact, lossless text
+        window selected by the target verifier (k=7 in the deployment config).
+        """
+        model = getattr(self, "model", None)
+        if not self._async_chunk or getattr(model, "model_stage", None) != "thinker":
+            return {}
+
+        embed_input_ids = getattr(model, "embed_input_ids", None)
+        if not callable(embed_input_ids):
+            return {}
+
+        windows: dict[str, dict[str, object]] = {}
+        for req_id, accepted_ids in zip(req_ids, valid_sampled_token_ids, strict=True):
+            if not accepted_ids:
+                continue
+            token_ids = torch.tensor(accepted_ids, dtype=torch.long, device=self.device)
+            accepted_embeds = embed_input_ids(token_ids)
+            if not isinstance(accepted_embeds, torch.Tensor):
+                raise TypeError(
+                    "Thinker embed_input_ids must return a tensor for accepted speculative tokens, "
+                    f"got {type(accepted_embeds).__name__}."
+                )
+            windows[req_id] = {
+                "ids.accepted": list(accepted_ids),
+                "embed.accepted": _to_cpu_contiguous(accepted_embeds.reshape(len(accepted_ids), -1)),
+            }
+        return windows
+
     def _build_omni_model_runner_output_from_snapshot(
         self,
         *,
@@ -1679,6 +1716,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         req_ids_output_copy: list[str],
         req_id_to_index_output_copy: dict[str, int],
         valid_sampled_token_ids: list[list[int]],
+        verified_text_windows: dict[str, dict[str, object]],
         logprobs_lists: Any,
         prompt_logprobs_dict: dict[str, Any],
         num_nans_in_logits: Any,
@@ -1801,6 +1839,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         hidden_seq_len=hidden_seq_len,
                         scheduled_seq_len=scheduled_seq_len,
                     )
+                    payload.update(verified_text_windows.get(rid, {}))
                     pooler_output.append(flatten_payload(payload))
 
         pooler_output = pooler_output or []
@@ -1989,6 +2028,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             # tokens on the CPU, so they are run after bookkeeping.
             propose_draft_token_ids(valid_sampled_token_ids)
 
+        verified_text_windows = self._build_verified_text_windows(
+            req_ids_output_copy,
+            valid_sampled_token_ids,
+        )
+
         # Finalize KV connector (wait_for_save + clear metadata) after
         # draft model runs. Deferred from target model forward to allow
         # draft model to also save its KV cache.
@@ -2016,6 +2060,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         req_ids_output_snapshot = list(req_ids_output_copy)
         req_id_to_index_output_snapshot = dict(req_id_to_index_output_copy)
         valid_sampled_token_ids_snapshot = [list(token_ids) for token_ids in valid_sampled_token_ids]
+        verified_text_windows_snapshot = dict(verified_text_windows)
         logprobs_lists_snapshot = copy(logprobs_lists) if logprobs_lists is not None else None
         prompt_logprobs_dict_snapshot = dict(prompt_logprobs_dict) if prompt_logprobs_dict is not None else {}
         num_nans_in_logits_snapshot = (
@@ -2053,6 +2098,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     req_ids_output_copy=req_ids_output_snapshot,
                     req_id_to_index_output_copy=req_id_to_index_output_snapshot,
                     valid_sampled_token_ids=valid_sampled_token_ids_snapshot,
+                    verified_text_windows=verified_text_windows_snapshot,
                     logprobs_lists=logprobs_lists_snapshot,
                     prompt_logprobs_dict=prompt_logprobs_dict_snapshot,
                     num_nans_in_logits=num_nans_in_logits_snapshot,

@@ -411,6 +411,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.code_prompt_token_ids.pop(external_req_id, None)
         self.requests_num_chunks_sent.pop(external_req_id, None)
         self._pending_streaming_prefills.pop(external_req_id, None)
+        thinker_talker_states = getattr(self, "_qwen3_thinker_talker_window_states", None)
+        if isinstance(thinker_talker_states, dict):
+            thinker_talker_states.pop(external_req_id, None)
+        talker_codec_states = getattr(self, "_qwen3_talker_codec_trace_states", None)
+        if isinstance(talker_codec_states, dict):
+            talker_codec_states.pop(external_req_id, None)
 
         cached_ic = getattr(self, "_cached_ic", None)
         if cached_ic is not None:

@@ -281,6 +281,12 @@ class OmniConnectorModelRunnerMixin:
                     continue
                 self._put_req_chunk.pop(k, None)
                 self._send_side_request_payload.pop(k, None)
+                thinker_talker_states = getattr(self, "_qwen3_thinker_talker_window_states", None)
+                if isinstance(thinker_talker_states, dict):
+                    thinker_talker_states.pop(k, None)
+                talker_codec_states = getattr(self, "_qwen3_talker_codec_trace_states", None)
+                if isinstance(talker_codec_states, dict):
+                    talker_codec_states.pop(k, None)
                 self._code_prompt_token_ids.pop(k, None)
                 self._cached_ic.pop(k, None)
             self._kv_pending_transfers.pop(req_id, None)
@@ -300,10 +306,20 @@ class OmniConnectorModelRunnerMixin:
         self._cleanup_recv_delivery_state(req_id)
 
     def _drop_send_side_payload_state(self, req_id: str, ext_id: str | None) -> None:
+        thinker_talker_states = getattr(self, "_qwen3_thinker_talker_window_states", None)
+        talker_codec_states = getattr(self, "_qwen3_talker_codec_trace_states", None)
         if ext_id is not None:
             self._send_side_request_payload.pop(ext_id, None)
+            if isinstance(thinker_talker_states, dict):
+                thinker_talker_states.pop(ext_id, None)
+            if isinstance(talker_codec_states, dict):
+                talker_codec_states.pop(ext_id, None)
             self._cached_ic.pop(ext_id, None)
         self._send_side_request_payload.pop(req_id, None)
+        if isinstance(thinker_talker_states, dict):
+            thinker_talker_states.pop(req_id, None)
+        if isinstance(talker_codec_states, dict):
+            talker_codec_states.pop(req_id, None)
         self._cached_ic.pop(req_id, None)
 
     def _cleanup_recv_delivery_state(self, req_id: str) -> None:
@@ -1962,6 +1978,12 @@ class OmniConnectorModelRunnerMixin:
             if cleanup_req_id is not None:
                 self._put_req_chunk.pop(cleanup_req_id, None)
                 self._send_side_request_payload.pop(cleanup_req_id, None)
+                thinker_talker_states = getattr(self, "_qwen3_thinker_talker_window_states", None)
+                if isinstance(thinker_talker_states, dict):
+                    thinker_talker_states.pop(cleanup_req_id, None)
+                talker_codec_states = getattr(self, "_qwen3_talker_codec_trace_states", None)
+                if isinstance(talker_codec_states, dict):
+                    talker_codec_states.pop(cleanup_req_id, None)
                 self._code_prompt_token_ids.pop(cleanup_req_id, None)
                 self._cached_ic.pop(cleanup_req_id, None)
 

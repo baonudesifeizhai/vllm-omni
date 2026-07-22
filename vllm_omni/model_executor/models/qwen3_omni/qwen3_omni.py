@@ -935,25 +935,85 @@ class Qwen3OmniMoeForConditionalGeneration(
         embed: Embeddings,
         update_dict: OmniPayload,
     ) -> None:
-        """
-        Cache thinker embeds for decode stage.
-        """
-        thinker_decode_embeds = embed.get("decode", None)
-        if thinker_decode_embeds is not None:
-            cached_thinker_decode_embeds = embed.get("cached_decode", None)
-            if cached_thinker_decode_embeds is None:
-                update_dict.setdefault("embed", {})["cached_decode"] = thinker_decode_embeds
-            else:
-                cached_thinker_decode_embeds = cached_thinker_decode_embeds.to(
-                    device=self._module_device(self.talker), dtype=torch.bfloat16
+        """Initialize the FIFO with text left after Talker bootstrap."""
+        thinker_decode_embeds = embed.get("decode")
+        if isinstance(thinker_decode_embeds, torch.Tensor) and thinker_decode_embeds.numel() > 0:
+            if thinker_decode_embeds.ndim == 1:
+                thinker_decode_embeds = thinker_decode_embeds.unsqueeze(0)
+            start = int(embed.get("decode_token_start", 0) or 0)
+            end = int(embed.get("decode_token_end", start + thinker_decode_embeds.shape[0]))
+            if end - start != int(thinker_decode_embeds.shape[0]):
+                raise RuntimeError(
+                    "Invalid Thinker text window span during Talker prefill: "
+                    f"[{start}, {end}) for {thinker_decode_embeds.shape[0]} rows."
                 )
-                thinker_decode_embeds = thinker_decode_embeds.to(
-                    device=self._module_device(self.talker), dtype=torch.bfloat16
+            update_dict.setdefault("embed", {})["cached_decode"] = thinker_decode_embeds
+            update_dict.setdefault("meta", {})["text_queue_start"] = start
+            update_dict.setdefault("meta", {})["text_queue_end"] = end
+        update_dict.setdefault("meta", {})["text_queue_cursor"] = 0
+        update_embed = update_dict.setdefault("embed", {})
+        update_embed["decode"] = None
+        update_embed["decode_token_start"] = None
+        update_embed["decode_token_end"] = None
+
+    def _merge_thinker_text_window(
+        self,
+        embed: Embeddings,
+        meta: OmniPayloadMeta,
+        device: torch.device,
+        update_dict: OmniPayload,
+    ) -> tuple[torch.Tensor | None, int, int]:
+        """Merge either a delta or cumulative accepted window without duplicates."""
+        cached = embed.get("cached_decode")
+        if isinstance(cached, torch.Tensor):
+            if cached.ndim == 1:
+                cached = cached.unsqueeze(0)
+            cached = cached.to(device=device, dtype=torch.bfloat16)
+            cached_start = int(meta.get("text_queue_start", 0) or 0)
+            cached_end = cached_start + int(cached.shape[0])
+        else:
+            cached = None
+            cached_start = int(meta.get("text_queue_start", 0) or 0)
+            cached_end = cached_start
+
+        incoming = embed.get("decode")
+        if isinstance(incoming, torch.Tensor) and incoming.numel() > 0:
+            if incoming.ndim == 1:
+                incoming = incoming.unsqueeze(0)
+            incoming = incoming.to(device=device, dtype=torch.bfloat16)
+            incoming_start = embed.get("decode_token_start")
+            incoming_start = cached_end if incoming_start is None else int(incoming_start)
+            incoming_end = embed.get("decode_token_end")
+            incoming_end = incoming_start + incoming.shape[0] if incoming_end is None else int(incoming_end)
+            if incoming_end - incoming_start != int(incoming.shape[0]):
+                raise RuntimeError(
+                    "Invalid Thinker text window span during Talker decode: "
+                    f"[{incoming_start}, {incoming_end}) for {incoming.shape[0]} rows."
                 )
-                update_dict.setdefault("embed", {})["cached_decode"] = torch.cat(
-                    [cached_thinker_decode_embeds, thinker_decode_embeds], dim=0
+
+            if cached is None:
+                cached = incoming
+                cached_start, cached_end = incoming_start, incoming_end
+            elif incoming_start > cached_end:
+                raise RuntimeError(
+                    "Gap in verified Thinker text queue: "
+                    f"cached=[{cached_start}, {cached_end}), incoming=[{incoming_start}, {incoming_end})."
                 )
-        update_dict.setdefault("embed", {})["decode"] = None
+            elif incoming_end > cached_end:
+                overlap = max(0, cached_end - incoming_start)
+                cached = torch.cat((cached, incoming[overlap:]), dim=0)
+                cached_end = incoming_end
+
+        update_embed = update_dict.setdefault("embed", {})
+        update_embed["decode"] = None
+        update_embed["decode_token_start"] = None
+        update_embed["decode_token_end"] = None
+        if cached is not None:
+            update_embed["cached_decode"] = cached
+            update_meta = update_dict.setdefault("meta", {})
+            update_meta["text_queue_start"] = cached_start
+            update_meta["text_queue_end"] = cached_end
+        return cached, cached_start, cached_end
 
     def _thinker_to_talker_prefill(
         self,
@@ -1052,33 +1112,44 @@ class Qwen3OmniMoeForConditionalGeneration(
         embed = payload.get("embed", {})
         meta = payload.get("meta", {})
 
-        cached_thinker_decode_embeds = embed.get("cached_decode", None)
-        thinker_decode_embed = embed.get("decode", None)
-        start_index = meta.get("num_processed_tokens", 0)
+        queue, queue_start, queue_end = self._merge_thinker_text_window(embed, meta, device, update_dict)
+        cursor = int(meta.get("text_queue_cursor", 0) or 0)
+        queue_steps = int(meta.get("text_queue_steps", 0) or 0) + 1
+        update_meta = update_dict.setdefault("meta", {})
+        update_meta["text_queue_steps"] = queue_steps
+        if queue is not None and queue_start <= cursor < queue_end:
+            thinker_embed = queue[cursor - queue_start]
+            update_meta["text_queue_cursor"] = cursor + 1
+            return self.talker.text_projection(thinker_embed).to(device)
 
-        if cached_thinker_decode_embeds is not None and start_index < cached_thinker_decode_embeds.shape[0]:
-            cached_thinker_decode_embeds = cached_thinker_decode_embeds.to(device)
-            thinker_embed = cached_thinker_decode_embeds[start_index]
-            if thinker_decode_embed is not None:
-                thinker_decode_embed = thinker_decode_embed.to(device)
-                cached_thinker_decode_embeds = torch.cat([cached_thinker_decode_embeds, thinker_decode_embed], dim=0)
-                update_dict.setdefault("embed", {})["cached_decode"] = cached_thinker_decode_embeds
-
-        elif thinker_decode_embed is not None:
-            thinker_embed = thinker_decode_embed
-            if thinker_embed.device != device:
-                thinker_embed = thinker_embed.to(device)
-
+        finished = meta.get("finished", False)
+        if isinstance(finished, torch.Tensor):
+            finished = finished.numel() == 1 and bool(finished.item())
         else:
-            # When the tokens output by the thinker are exhausted, an EOS token needs to be appended.
-            # Use the finished_flag to mark that all tokens output by thinker have been consumed.
-            if meta.get("eos_emitted", False):
-                return self.tts_pad_embed.to(device)
-            update_dict.setdefault("meta", {})["eos_emitted"] = True
-            return self.tts_eos_embed.to(device)
+            finished = bool(finished)
 
-        update_dict.setdefault("embed", {})["decode"] = None
-        return self.talker.text_projection(thinker_embed).to(device)
+        # An empty but unfinished queue means the Talker caught up with the
+        # producer. Keep extending the current acoustic unit with PAD; only a
+        # terminal upstream marker is allowed to inject TTS EOS.
+        if not finished:
+            update_meta["text_queue_pad_steps"] = int(meta.get("text_queue_pad_steps", 0) or 0) + 1
+            return self.tts_pad_embed.to(device)
+
+        if not bool(meta.get("text_queue_summary_emitted", False)):
+            pad_steps = int(meta.get("text_queue_pad_steps", 0) or 0)
+            request_id = payload.get("request_id", "unknown")
+            logger.info(
+                "[TalkerQueueTrace] request=%s steps=%d pad_wait_steps=%d pad_wait_ratio=%.6f",
+                request_id,
+                queue_steps,
+                pad_steps,
+                pad_steps / max(queue_steps, 1),
+            )
+            update_meta["text_queue_summary_emitted"] = True
+        if meta.get("eos_emitted", False):
+            return self.tts_pad_embed.to(device)
+        update_meta["eos_emitted"] = True
+        return self.tts_eos_embed.to(device)
 
     def talker_preprocess_decode(
         self, input_ids: torch.Tensor, input_embeds: torch.Tensor, update_dict: OmniPayload, payload: OmniPayload

@@ -32,6 +32,9 @@ class HiddenStates(TypedDict, total=False):
 class Embeddings(TypedDict, total=False):
     prefill: torch.Tensor
     decode: torch.Tensor
+    decode_token_start: int
+    decode_token_end: int
+    accepted: torch.Tensor
     cached_decode: torch.Tensor
     tts_bos: torch.Tensor
     tts_eos: torch.Tensor
@@ -53,6 +56,7 @@ class Ids(TypedDict, total=False):
     all: list[int]
     prompt: list[int]
     output: list[int]
+    accepted: list[int]
     speech_token: list[int]
     prior_image: list[int]
 
@@ -66,6 +70,12 @@ class OmniPayloadMeta(TypedDict, total=False):
     right_holdback_size: int
     override_keys: list[tuple[str, str]]
     num_processed_tokens: int
+    text_queue_cursor: int
+    text_queue_start: int
+    text_queue_end: int
+    text_queue_steps: int
+    text_queue_pad_steps: int
+    text_queue_summary_emitted: bool
     next_stage_prompt_len: int
     ar_width: int
     eol_token_id: int
@@ -120,6 +130,7 @@ class EmbeddingsStruct(_StructBase):
     decode: torch.Tensor | None = None
     decode_token_start: int | None = None
     decode_token_end: int | None = None
+    accepted: torch.Tensor | None = None
     cached_decode: torch.Tensor | None = None
     tts_bos: torch.Tensor | None = None
     tts_eos: torch.Tensor | None = None
@@ -142,6 +153,7 @@ class IdsStruct(_StructBase):
     all: list[int] | None = None
     prompt: list[int] | None = None
     output: list[int] | None = None
+    accepted: list[int] | None = None
     speech_token: list[int] | None = None
     prior_image: list[int] | None = None
 
@@ -155,6 +167,12 @@ class MetaStruct(_StructBase):
     right_holdback_size: int | None = None
     override_keys: list[tuple[str, str]] | None = None
     num_processed_tokens: int | None = None
+    text_queue_cursor: int | None = None
+    text_queue_start: int | None = None
+    text_queue_end: int | None = None
+    text_queue_steps: int | None = None
+    text_queue_pad_steps: int | None = None
+    text_queue_summary_emitted: bool | None = None
     next_stage_prompt_len: int | None = None
     ar_width: int | None = None
     eol_token_id: int | None = None

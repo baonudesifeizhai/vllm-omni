@@ -4,6 +4,7 @@
 """Stage input processor for Qwen3 Omni MoE: Thinker → Talker transition."""
 
 import logging
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -45,6 +46,37 @@ _QWEN3_CODEC_CODEBOOK_SIZE = 2048
 _QWEN3_CODEC_PAD_TOKEN_ID = 4196
 _QWEN3_CODEC_BOS_TOKEN_ID = 4197
 _QWEN3_CODEC_EOS_TOKEN_ID = 4198
+# Code2Wav expands every Talker codec frame by
+# prod([2, 2] + [8, 5, 4, 3]) = 1920 samples at 24 kHz.
+_QWEN3_CODEC_FRAMES_PER_SECOND = 12.5
+
+
+@dataclass
+class _ThinkerTalkerWindowState:
+    """Per-request state for the verified Thinker -> Talker text stream."""
+
+    prompt_embeds: list[torch.Tensor] = field(default_factory=list)
+    prompt_hidden: list[torch.Tensor] = field(default_factory=list)
+    prompt_rows: int = 0
+    pending_ids: list[int] = field(default_factory=list)
+    pending_embeds: list[torch.Tensor] = field(default_factory=list)
+    output_tokens_seen: int = 0
+    decode_tokens_sent: int = 0
+    prefill_sent: bool = False
+    terminal_seen: bool = False
+    tts_bos: torch.Tensor | None = None
+    tts_eos: torch.Tensor | None = None
+    tts_pad: torch.Tensor | None = None
+
+
+@dataclass
+class _TalkerCodecTraceState:
+    """Lightweight per-request timing for Talker codec-frame production."""
+
+    first_frame_ts: float | None = None
+    last_frame_ts: float | None = None
+    frame_count: int = 0
+    ttfc_s: float | None = None
 
 
 def _layer_tensor(layers: dict[Any, Any], key: str) -> torch.Tensor | None:
@@ -102,9 +134,13 @@ def _compute_talker_prompt_ids_length(info: OmniPayload, device: torch.device | 
 
 def _ensure_list(x):
     """Convert ConstantList / tensor-like to Python list."""
+    if isinstance(x, torch.Tensor):
+        return x.detach().cpu().reshape(-1).tolist()
     if hasattr(x, "_x"):
         return list(x._x)
-    elif not isinstance(x, list):
+    if isinstance(x, tuple):
+        return list(x)
+    if not isinstance(x, list):
         return x
     return list(x)
 
@@ -437,18 +473,24 @@ def thinker2talker_async_chunk(
     request: OmniEngineCoreRequest,
     is_finished: bool = False,
 ) -> OmniPayloadStruct | None:
-    """
-    Process thinker outputs to create talker inputs.
-    1. thinker's text generation outputs (token IDs + hidden states)
-    2. Split hidden states into: prompt embeddings + generated embeddings
-    3. Package for talker with additional information
+    """Queue verifier-approved Thinker text windows for the Talker.
+
+    The target forward may contain hidden rows for rejected speculative
+    candidates.  Only ``ids.accepted``/``embed.accepted`` are authoritative.
+    The first accepted text token bootstraps Talker prefill; every later token
+    is sent as an ordered, span-labelled decode window.
     """
 
-    request_id = request.external_req_id
-    chunk_id = transfer_manager.put_req_chunk[request_id]
+    request_id = request.external_req_id or request.request_id
     if not isinstance(multimodal_output, Mapping):
         logger.debug("thinker2talker_async_chunk: skip non-dict multimodal_output for req=%s", request_id)
         return None
+
+    states = getattr(transfer_manager, "_qwen3_thinker_talker_window_states", None)
+    if states is None:
+        states = {}
+        setattr(transfer_manager, "_qwen3_thinker_talker_window_states", states)
+    state = states.setdefault(request_id, _ThinkerTalkerWindowState())
 
     thinker_hs = multimodal_output.get("hidden_states", {})
     thinker_layers = thinker_hs.get("layers", {}) if isinstance(thinker_hs, dict) else {}
@@ -456,74 +498,141 @@ def thinker2talker_async_chunk(
     thinker_embed = thinker_embed_raw if isinstance(thinker_embed_raw, dict) else {}
     thinker_emb = _layer_tensor(thinker_layers, _EMBED_LAYER_KEY)
     thinker_hid = _layer_tensor(thinker_layers, _HIDDEN_LAYER_KEY)
-    if thinker_emb is None or thinker_hid is None:
-        logger.debug(
-            "thinker2talker_async_chunk: missing thinker layers for req=%s (embed=%s hidden=%s)",
-            request_id,
-            thinker_emb is not None,
-            thinker_hid is not None,
-        )
-        return None
+
+    def _maybe_cpu(t: Any) -> torch.Tensor | None:
+        return t.detach().cpu().contiguous() if isinstance(t, torch.Tensor) else None
+
+    # Save the special embeddings as soon as the Thinker exposes them.
+    tts_bos = _maybe_cpu(thinker_embed.get("tts_bos"))
+    tts_eos = _maybe_cpu(thinker_embed.get("tts_eos"))
+    tts_pad = _maybe_cpu(thinker_embed.get("tts_pad"))
+    if tts_bos is not None:
+        state.tts_bos = tts_bos
+    if tts_eos is not None:
+        state.tts_eos = tts_eos
+    if tts_pad is not None:
+        state.tts_pad = tts_pad
+
+    prompt_token_ids = list(_ensure_list(request.prompt_token_ids) or [])
+    prompt_len = len(prompt_token_ids)
+    prompt_rows_needed = max(0, prompt_len - state.prompt_rows)
+    if prompt_rows_needed and isinstance(thinker_emb, torch.Tensor) and isinstance(thinker_hid, torch.Tensor):
+        rows = min(prompt_rows_needed, int(thinker_emb.shape[0]), int(thinker_hid.shape[0]))
+        if rows:
+            state.prompt_embeds.append(thinker_emb[:rows].detach().cpu().contiguous())
+            state.prompt_hidden.append(thinker_hid[:rows].detach().cpu().contiguous())
+            state.prompt_rows += rows
+
+    accepted_ids_raw = multimodal_output.get("ids", {})
+    accepted_ids_raw = accepted_ids_raw.get("accepted") if isinstance(accepted_ids_raw, Mapping) else None
+    accepted_ids = [int(token_id) for token_id in (_ensure_list(accepted_ids_raw) or [])]
+    accepted_embeds = thinker_embed.get("accepted")
+    if accepted_ids:
+        if not isinstance(accepted_embeds, torch.Tensor):
+            raise RuntimeError(f"Missing accepted-token embeddings for Thinker request {request_id}.")
+        accepted_embeds = accepted_embeds.detach().cpu().contiguous().reshape(len(accepted_ids), -1)
+
+        sampling_params = getattr(request, "sampling_params", None)
+        min_tokens = int(getattr(sampling_params, "min_tokens", 0) or 0)
+        eos_token_id = getattr(sampling_params, "eos_token_id", None)
+        stop_token_ids = set(getattr(sampling_params, "stop_token_ids", None) or ())
+        max_tokens = int(getattr(request, "max_tokens", 0) or 0)
+        content_count = len(accepted_ids)
+        for idx, token_id in enumerate(accepted_ids):
+            output_position = state.output_tokens_seen + idx + 1
+            reached_stop = output_position >= min_tokens and (token_id == eos_token_id or token_id in stop_token_ids)
+            if reached_stop:
+                content_count = idx
+                state.terminal_seen = True
+                break
+            if max_tokens and output_position >= max_tokens:
+                content_count = idx + 1
+                state.terminal_seen = True
+                break
+
+        state.output_tokens_seen += len(accepted_ids)
+        if content_count:
+            state.pending_ids.extend(accepted_ids[:content_count])
+            state.pending_embeds.append(accepted_embeds[:content_count])
+
+    prompt_ready = state.prompt_rows >= prompt_len
     speaker = extract_speaker_from_request(request)
     language = extract_language_from_request(request)
 
-    def _maybe_cpu(t: Any) -> torch.Tensor | None:
-        return t.detach().cpu() if isinstance(t, torch.Tensor) else None
+    if not state.prefill_sent:
+        if not prompt_ready or (not state.pending_ids and not is_finished):
+            return None
 
-    if chunk_id == 0:
-        all_token_ids = _ensure_list(request.all_token_ids)
-        prompt_token_ids = _ensure_list(request.prompt_token_ids)
+        prompt_embeds = torch.cat(state.prompt_embeds, dim=0) if state.prompt_embeds else None
+        prompt_hidden = torch.cat(state.prompt_hidden, dim=0) if state.prompt_hidden else None
+        if prompt_embeds is None or prompt_hidden is None:
+            logger.warning("Withholding Thinker->Talker prefill with incomplete prompt tensors for req=%s", request_id)
+            return None
+
+        pending_embeds = torch.cat(state.pending_embeds, dim=0) if state.pending_embeds else None
+        first_ids = state.pending_ids[:1]
+        if pending_embeds is not None:
+            prefill = torch.cat((prompt_embeds, pending_embeds[:1]), dim=0)
+            decode = pending_embeds[1:] if pending_embeds.shape[0] > 1 else None
+        else:
+            prefill = prompt_embeds
+            decode = None
+
+        decode_count = int(decode.shape[0]) if isinstance(decode, torch.Tensor) else 0
         payload = OmniPayloadStruct(
             embed=EmbeddingsStruct(
-                prefill=thinker_emb.detach().cpu(),
-                tts_bos=_maybe_cpu(thinker_embed.get("tts_bos")),
-                tts_eos=_maybe_cpu(thinker_embed.get("tts_eos")),
-                tts_pad=_maybe_cpu(thinker_embed.get("tts_pad")),
+                prefill=prefill,
+                decode=decode,
+                decode_token_start=0 if decode_count else None,
+                decode_token_end=decode_count if decode_count else None,
+                tts_bos=state.tts_bos,
+                tts_eos=state.tts_eos,
+                tts_pad=state.tts_pad,
             ),
-            hidden_states=HiddenStatesStruct(output=thinker_hid.detach().cpu()),
-            ids=IdsStruct(all=all_token_ids, prompt=prompt_token_ids),
+            hidden_states=HiddenStatesStruct(output=prompt_hidden),
+            ids=IdsStruct(
+                all=prompt_token_ids + first_ids,
+                prompt=prompt_token_ids,
+                output=first_ids + state.pending_ids[1:],
+            ),
             meta=MetaStruct(finished=torch.tensor(is_finished, dtype=torch.bool)),
             speaker=speaker,
             language=language,
+            request_id=request_id,
         )
-        if transfer_manager.request_payload.get(request_id) is None:
-            if not is_finished:
-                transfer_manager.request_payload[request_id] = to_dict(payload)
-                return None
-        else:
-            save_payload = transfer_manager.request_payload.pop(request_id)
-            payload.embed.prefill = torch.cat(
-                (save_payload.get("embed", {}).get("prefill"), payload.embed.prefill), dim=0
-            )
-            payload.hidden_states.output = torch.cat(
-                (save_payload.get("hidden_states", {}).get("output"), payload.hidden_states.output), dim=0
-            )
-            prefill_shape = payload.embed.prefill.shape[0]
-            if not is_finished and prefill_shape <= len(prompt_token_ids):
-                transfer_manager.request_payload[request_id] = to_dict(payload)
-                return None
+        state.prefill_sent = True
+        state.decode_tokens_sent = decode_count
+        state.pending_ids.clear()
+        state.pending_embeds.clear()
+        state.prompt_embeds.clear()
+        state.prompt_hidden.clear()
     else:
-        if request.resumable:
-            return _construct_thinker2talker_streaming_input_async_chunk(
-                is_finished, request, thinker_emb, thinker_hid, transfer_manager
-            )
-        if thinker_emb.shape[0] > 1:
-            logger.warning(
-                "Unexpected multiple embeddings in thinker2talker_async_chunk for chunk_id %d: "
-                "request_id %s, num_computed_tokens%d %s. Expected shape [1, D].",
-                chunk_id,
-                request_id,
-                request.num_computed_tokens,
-                thinker_emb.shape,
-            )
+        if not state.pending_ids and not is_finished:
             return None
-        meta = MetaStruct(finished=torch.tensor(is_finished, dtype=torch.bool))
+        decode = torch.cat(state.pending_embeds, dim=0) if state.pending_embeds else None
+        decode_count = int(decode.shape[0]) if isinstance(decode, torch.Tensor) else 0
+        decode_start = state.decode_tokens_sent
+        decode_end = decode_start + decode_count
         payload = OmniPayloadStruct(
-            meta=meta,
-            embed=EmbeddingsStruct(decode=thinker_emb.detach().cpu()),
+            embed=(
+                EmbeddingsStruct(
+                    decode=decode,
+                    decode_token_start=decode_start,
+                    decode_token_end=decode_end,
+                )
+                if decode_count
+                else None
+            ),
+            ids=IdsStruct(output=list(state.pending_ids)) if state.pending_ids else None,
+            meta=MetaStruct(finished=torch.tensor(is_finished, dtype=torch.bool)),
             speaker=speaker,
             language=language,
+            request_id=request_id,
         )
+        state.decode_tokens_sent = decode_end
+        state.pending_ids.clear()
+        state.pending_embeds.clear()
+
     return payload
 
 
@@ -694,10 +803,41 @@ def talker2code2wav_async_chunk(
     if code_predictor_codes is None:
         return None
 
+    request_id = request.external_req_id or request.request_id
+    trace_states = getattr(transfer_manager, "_qwen3_talker_codec_trace_states", None)
+    if trace_states is None:
+        trace_states = {}
+        setattr(transfer_manager, "_qwen3_talker_codec_trace_states", trace_states)
+    trace_state = trace_states.setdefault(request_id, _TalkerCodecTraceState())
+
+    def _finish_talker_trace() -> None:
+        state = trace_states.pop(request_id, None)
+        if state is None:
+            return
+        if state.first_frame_ts is None or state.last_frame_ts is None:
+            active_s = 0.0
+            frame_s = 0.0
+        else:
+            active_s = max(0.0, state.last_frame_ts - state.first_frame_ts)
+            frame_s = (state.frame_count - 1) / active_s if state.frame_count > 1 and active_s > 0 else 0.0
+        logger.info(
+            "[TalkerCodecTrace] request=%s frames=%d ttfc_s=%s active_s=%.6f frame_s=%.3f audio_realtime_x=%.3f",
+            request_id,
+            state.frame_count,
+            f"{state.ttfc_s:.6f}" if state.ttfc_s is not None else "nan",
+            active_s,
+            frame_s,
+            frame_s / _QWEN3_CODEC_FRAMES_PER_SECOND,
+        )
+
     if code_predictor_codes.numel() == 0:
+        if is_finished:
+            _finish_talker_trace()
         return None
 
     if not code_predictor_codes.any():
+        if is_finished:
+            _finish_talker_trace()
         return None
 
     connector = getattr(transfer_manager, "connector", None)
@@ -715,9 +855,23 @@ def talker2code2wav_async_chunk(
     first_codebook = int(code_predictor_codes[0, 0].item())
     if first_codebook in stop_token_ids:
         logger.debug("skip stop-token codec frame: first_codebook=%s", first_codebook)
+        _finish_talker_trace()
         return None
 
-    request_id = request.external_req_id
+    now = time.perf_counter()
+    new_frames = int(code_predictor_codes.shape[0]) if code_predictor_codes.ndim > 1 else 1
+    if trace_state.first_frame_ts is None:
+        trace_state.first_frame_ts = now
+        arrival_time = getattr(request, "arrival_time", None)
+        trace_state.ttfc_s = max(0.0, time.time() - float(arrival_time)) if arrival_time is not None else None
+        logger.info(
+            "[TalkerCodecTrace] request=%s first_frame ttfc_s=%s",
+            request_id,
+            f"{trace_state.ttfc_s:.6f}" if trace_state.ttfc_s is not None else "nan",
+        )
+    trace_state.last_frame_ts = now
+    trace_state.frame_count += new_frames
+
     chunk_id = transfer_manager.put_req_chunk[request_id]
     transfer_manager.code_prompt_token_ids[request_id].append(code_predictor_codes)
     length = len(transfer_manager.code_prompt_token_ids[request_id])
@@ -745,13 +899,17 @@ def talker2code2wav_async_chunk(
         torch.cat(transfer_manager.code_prompt_token_ids[request_id][-end_index:], dim=0).transpose(0, 1).reshape(-1)
     )
 
-    return OmniPayloadStruct(
+    payload = OmniPayloadStruct(
         codes=CodesStruct(audio=codes),
         meta=MetaStruct(
             left_context_size=left_context_size,
             finished=torch.tensor(is_finished, dtype=torch.bool),
         ),
+        request_id=request_id,
     )
+    if is_finished:
+        _finish_talker_trace()
+    return payload
 
 
 def talker2code2wav_full_payload(
