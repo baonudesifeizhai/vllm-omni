@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import importlib
+import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -18,6 +20,25 @@ from ..utils.logging import get_connector_logger
 from .base import OmniTransferAdapterBase
 
 logger = get_connector_logger(__name__)
+
+
+@dataclass
+class _TalkerTextCreditState:
+    """Scheduler-side shadow of the Qwen3-Omni Talker text FIFO."""
+
+    enqueued_end: int = 0
+    available: int = 0
+    windows: int = 0
+    bootstrap_rows: int = 0
+    enqueued_rows: int = 0
+    consumed_rows: int = 0
+    duplicate_rows: int = 0
+    max_credit: int = 0
+    wait_steps: int = 0
+    wait_time_s: float = 0.0
+    wait_started_s: float | None = None
+    upstream_finished: bool = False
+    summary_emitted: bool = False
 
 
 class OmniChunkTransferAdapter(OmniTransferAdapterBase):
@@ -58,6 +79,14 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.connector = self.create_connector(model_config)
         super().__init__(model_config)
         self.model_mode = getattr(model_config, "worker_type", None) or "ar"
+        self._talker_text_credit_enabled = (
+            bool(getattr(model_config, "async_chunk", False))
+            and getattr(model_config, "model_arch", None) == "Qwen3OmniMoeForConditionalGeneration"
+            and getattr(model_config, "model_stage", None) == "talker"
+        )
+        self._talker_text_credits: dict[str, _TalkerTextCreditState] = {}
+        if self._talker_text_credit_enabled:
+            logger.info("Qwen3-Omni Talker verified-text FIFO credit scheduling enabled.")
         # State specific to Chunk management
         self.custom_process_next_stage_input_func: Callable[..., OmniPayloadStruct | None] | None = None
         custom_process_next_stage_input_func = getattr(model_config, "custom_process_next_stage_input_func", None)
@@ -94,6 +123,145 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if isinstance(value, torch.Tensor):
             return value.numel() == 1 and bool(value.item())
         return bool(value) if value is not None else False
+
+    def _talker_text_credit_state(self, request_id: str) -> _TalkerTextCreditState | None:
+        if not getattr(self, "_talker_text_credit_enabled", False):
+            return None
+        states = getattr(self, "_talker_text_credits", None)
+        if states is None:
+            states = {}
+            self._talker_text_credits = states
+        return states.setdefault(request_id, _TalkerTextCreditState())
+
+    def _register_talker_text_window(self, request_id: str, payload: Mapping[str, Any]) -> None:
+        """Turn a verified Thinker text span into Talker scheduling credit."""
+        state = self._talker_text_credit_state(request_id)
+        if state is None:
+            return
+
+        now = time.monotonic()
+        if state.wait_started_s is not None:
+            state.wait_time_s += now - state.wait_started_s
+            state.wait_started_s = None
+
+        meta = payload.get("meta")
+        if isinstance(meta, Mapping):
+            state.upstream_finished = state.upstream_finished or self._is_truthy_scalar(meta.get("finished"))
+
+        embed = payload.get("embed")
+        ids = payload.get("ids")
+        if (
+            state.bootstrap_rows == 0
+            and isinstance(embed, Mapping)
+            and embed.get("prefill") is not None
+            and isinstance(ids, Mapping)
+            and bool(ids.get("output"))
+        ):
+            # The first accepted text token is consumed by Talker prefill, not
+            # by a cached decode step, so it is traced but not granted as credit.
+            state.bootstrap_rows = 1
+
+        if not isinstance(embed, Mapping):
+            return
+        start = embed.get("decode_token_start")
+        end = embed.get("decode_token_end")
+        if start is None or end is None:
+            return
+        start = int(start)
+        end = int(end)
+        if start < 0 or end < start:
+            logger.error(
+                "[TalkerCreditTrace] invalid verified text span request=%s span=[%d,%d)",
+                request_id,
+                start,
+                end,
+            )
+            return
+
+        state.windows += 1
+        if start > state.enqueued_end:
+            logger.error(
+                "[TalkerCreditTrace] gap in verified text spans request=%s expected_start=%d actual_start=%d end=%d",
+                request_id,
+                state.enqueued_end,
+                start,
+                end,
+            )
+            return
+
+        span_rows = end - start
+        new_start = max(start, state.enqueued_end)
+        new_rows = max(0, end - new_start)
+        state.duplicate_rows += span_rows - new_rows
+        if new_rows:
+            state.enqueued_end = end
+            state.enqueued_rows += new_rows
+            state.available += new_rows
+            state.max_credit = max(state.max_credit, state.available)
+
+    def _has_talker_text_credit(self, request_id: str) -> bool:
+        if not getattr(self, "_talker_text_credit_enabled", False):
+            return False
+        state = getattr(self, "_talker_text_credits", {}).get(request_id)
+        return state is not None and state.available > 0
+
+    def _begin_talker_text_wait(self, request_id: str) -> None:
+        state = self._talker_text_credit_state(request_id)
+        if state is None or state.upstream_finished or state.wait_started_s is not None:
+            return
+        state.wait_steps += 1
+        state.wait_started_s = time.monotonic()
+
+    def _consume_talker_text_credit(self, request: Request, num_scheduled_tokens: int) -> None:
+        state = self._talker_text_credit_state(request.request_id)
+        if state is None or state.available <= 0:
+            return
+
+        # postprocess_scheduler_output runs after vLLM advances
+        # num_computed_tokens. Only the part strictly beyond the Talker prompt
+        # invokes decode and consumes one text FIFO row per scheduled token.
+        scheduled_end = int(request.num_computed_tokens)
+        scheduled_start = max(0, scheduled_end - int(num_scheduled_tokens))
+        prompt_end = int(request.num_prompt_tokens)
+        decode_steps = max(0, scheduled_end - max(scheduled_start, prompt_end))
+        if decode_steps <= 0:
+            return
+        consumed = min(decode_steps, state.available)
+        state.available -= consumed
+        state.consumed_rows += consumed
+        if consumed != decode_steps:
+            logger.error(
+                "[TalkerCreditTrace] scheduler over-consumed text credit request=%s requested=%d available=%d",
+                request.request_id,
+                decode_steps,
+                consumed,
+            )
+
+    def _log_talker_text_credit_summary(self, request_id: str) -> None:
+        state = getattr(self, "_talker_text_credits", {}).get(request_id)
+        if state is None or state.summary_emitted:
+            return
+        if state.wait_started_s is not None:
+            state.wait_time_s += time.monotonic() - state.wait_started_s
+            state.wait_started_s = None
+        state.summary_emitted = True
+        logger.info(
+            "[TalkerCreditTrace] request=%s windows=%d accepted_rows=%d bootstrap_rows=%d "
+            "enqueued_rows=%d consumed_rows=%d duplicate_rows=%d max_credit=%d "
+            "scheduler_wait_events=%d scheduler_wait_ms=%.3f remaining_credit=%d upstream_finished=%s",
+            request_id,
+            state.windows,
+            state.bootstrap_rows + state.enqueued_rows,
+            state.bootstrap_rows,
+            state.enqueued_rows,
+            state.consumed_rows,
+            state.duplicate_rows,
+            state.max_credit,
+            state.wait_steps,
+            state.wait_time_s * 1000.0,
+            state.available,
+            state.upstream_finished,
+        )
 
     @staticmethod
     def _confirmed_num_computed_tokens(request: Request) -> int:
@@ -223,6 +391,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             payload_finished = self._is_truthy_scalar(meta.get("finished"))
             payload_segment_finished = self._is_truthy_scalar(meta.get("is_segment_finished"))
             if self.model_mode == "ar":
+                self._register_talker_text_window(req_id, payload_data)
                 request.additional_information = payload_data
                 if chunk_id > 0 and request.resumable:
                     # For new streaming input segment, we should update prompt from payload
@@ -384,6 +553,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         Idempotent: calling with an already-cleaned or unknown id is safe.
         """
+        self._log_talker_text_credit_summary(request_id)
+        getattr(self, "_talker_text_credits", {}).pop(request_id, None)
         if request_id in self.finished_requests:
             self._evict_finished_active_streams({request_id})
         else:
@@ -573,10 +744,16 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     # Requests that have loaded chunk from last round
                     # of schedule, but have not scheduled
                     continue
+                if self._has_talker_text_credit(request.request_id):
+                    # A verified Thinker window can feed several consecutive
+                    # Talker decode steps. Keep scheduling until its FIFO
+                    # credit is exhausted instead of waiting for another chunk.
+                    continue
                 if self.is_done_receiving_chunks(request.request_id):
                     request.additional_information = None
                     continue
                 # Requests that waiting for chunk
+                self._begin_talker_text_wait(request.request_id)
                 self.load_async(request)
                 request.status = RequestStatus.WAITING_FOR_CHUNK
             else:
@@ -672,6 +849,16 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         if requests is not None:
             self.attach_cached_additional_information(scheduler_output, requests)
+            cached_reqs = getattr(scheduler_output, "scheduled_cached_reqs", None)
+            scheduled_counts = getattr(scheduler_output, "num_scheduled_tokens", {})
+            if self._talker_text_credit_enabled and cached_reqs:
+                for req_id in cached_reqs.req_ids:
+                    request = requests.get(req_id) if req_id else None
+                    if request is not None:
+                        self._consume_talker_text_credit(
+                            request,
+                            int(scheduled_counts.get(req_id, 1)),
+                        )
         scheduled_req_ids = self._scheduled_request_ids(scheduler_output)
         self._clear_chunk_ready(scheduler_output)
         if scheduled_req_ids:
@@ -722,10 +909,15 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     # Requests that have loaded chunk from last round
                     # of schedule, but have not scheduled
                     continue
+                if self._has_talker_text_credit(request.request_id):
+                    # Keep the request runnable while the worker-side Talker
+                    # FIFO still has verified text rows.
+                    continue
                 if self.is_done_receiving_chunks(request.request_id):
                     request.additional_information = None
                     continue
                 # Requests that waiting for chunk
+                self._begin_talker_text_wait(request.request_id)
                 self.load_async(request)
                 request.status = RequestStatus.WAITING_FOR_CHUNK
             else:
@@ -779,6 +971,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         )
 
         for req_id in request_ids:
+            self._log_talker_text_credit_summary(req_id)
+            getattr(self, "_talker_text_credits", {}).pop(req_id, None)
             self.requests_with_ready_chunks.discard(req_id)
             self.finished_requests.discard(req_id)
             self._finished_load_reqs.discard(req_id)

@@ -1128,22 +1128,39 @@ class Qwen3OmniMoeForConditionalGeneration(
         else:
             finished = bool(finished)
 
-        # An empty but unfinished queue means the Talker caught up with the
-        # producer. Keep extending the current acoustic unit with PAD; only a
-        # terminal upstream marker is allowed to inject TTS EOS.
+        # The scheduler-side FIFO credit gate should never run Talker with an
+        # empty unfinished text queue. Keep PAD only as a defensive fallback:
+        # it preserves the old acoustic-continuation behavior if scheduler and
+        # worker state ever diverge, while the trace makes the violation loud.
         if not finished:
-            update_meta["text_queue_pad_steps"] = int(meta.get("text_queue_pad_steps", 0) or 0) + 1
+            fallback_steps = int(meta.get("text_queue_starvation_fallback_steps", 0) or 0) + 1
+            update_meta["text_queue_starvation_fallback_steps"] = fallback_steps
+            # Retain the old field for log consumers while making its meaning
+            # explicit: these are starvation fallbacks, not normal wait steps.
+            update_meta["text_queue_pad_steps"] = fallback_steps
+            request_id = payload.get("request_id", "unknown")
+            logger.warning(
+                "[TalkerQueueTrace] unexpected empty unfinished FIFO request=%s "
+                "cursor=%d queue=[%d,%d) starvation_fallback_steps=%d",
+                request_id,
+                cursor,
+                queue_start,
+                queue_end,
+                fallback_steps,
+            )
             return self.tts_pad_embed.to(device)
 
         if not bool(meta.get("text_queue_summary_emitted", False)):
-            pad_steps = int(meta.get("text_queue_pad_steps", 0) or 0)
+            fallback_steps = int(meta.get("text_queue_starvation_fallback_steps", 0) or 0)
             request_id = payload.get("request_id", "unknown")
             logger.info(
-                "[TalkerQueueTrace] request=%s steps=%d pad_wait_steps=%d pad_wait_ratio=%.6f",
+                "[TalkerQueueTrace] request=%s steps=%d starvation_fallback_steps=%d "
+                "pad_wait_steps=%d starvation_fallback_ratio=%.6f",
                 request_id,
                 queue_steps,
-                pad_steps,
-                pad_steps / max(queue_steps, 1),
+                fallback_steps,
+                fallback_steps,
+                fallback_steps / max(queue_steps, 1),
             )
             update_meta["text_queue_summary_emitted"] = True
         if meta.get("eos_emitted", False):

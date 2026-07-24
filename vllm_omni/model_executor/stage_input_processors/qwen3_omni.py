@@ -583,8 +583,8 @@ def thinker2talker_async_chunk(
             embed=EmbeddingsStruct(
                 prefill=prefill,
                 decode=decode,
-                decode_token_start=0 if decode_count else None,
-                decode_token_end=decode_count if decode_count else None,
+                decode_token_start=0,
+                decode_token_end=decode_count,
                 tts_bos=state.tts_bos,
                 tts_eos=state.tts_eos,
                 tts_pad=state.tts_pad,

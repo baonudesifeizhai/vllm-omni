@@ -75,6 +75,7 @@ class OmniPayloadMeta(TypedDict, total=False):
     text_queue_end: int
     text_queue_steps: int
     text_queue_pad_steps: int
+    text_queue_starvation_fallback_steps: int
     text_queue_summary_emitted: bool
     next_stage_prompt_len: int
     ar_width: int
@@ -172,6 +173,7 @@ class MetaStruct(_StructBase):
     text_queue_end: int | None = None
     text_queue_steps: int | None = None
     text_queue_pad_steps: int | None = None
+    text_queue_starvation_fallback_steps: int | None = None
     text_queue_summary_emitted: bool | None = None
     next_stage_prompt_len: int | None = None
     ar_width: int | None = None
