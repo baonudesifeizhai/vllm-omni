@@ -44,7 +44,14 @@ class DiffusionCUDAGraphConfig:
             config = value
         elif isinstance(value, Mapping):
             valid_fields = {field.name for field in fields(cls)}
-            config = cls(**{key: item for key, item in value.items() if key in valid_fields})
+            unknown_fields = set(value) - valid_fields
+            if unknown_fields:
+                raise ValueError(
+                    "Unknown diffusion cuda_graph_config field(s): "
+                    f"{sorted(str(field) for field in unknown_fields)}. "
+                    f"Valid fields are: {sorted(valid_fields)}."
+                )
+            config = cls(**dict(value))
         else:
             raise TypeError(
                 f"cuda_graph_config must be a DiffusionCUDAGraphConfig, mapping, or None, got {type(value)!r}"
