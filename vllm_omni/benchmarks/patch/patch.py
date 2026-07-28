@@ -35,8 +35,6 @@ from vllm.benchmarks.lib.endpoint_request_func import (
 from vllm.logger import init_logger
 from vllm.tokenizers import TokenizerLike
 
-logger = init_logger(__name__)
-
 from vllm_omni.benchmarks.audio_continuity import compute_continuity_stats
 from vllm_omni.benchmarks.data_modules.daily_omni_dataset import DailyOmniDataset, DailyOmniSampleRequest
 from vllm_omni.benchmarks.data_modules.random_multi_modal_dataset import OmniRandomMultiModalDataset
@@ -50,10 +48,11 @@ from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
 from vllm_omni.benchmarks.data_modules.sound_effect_dataset import SoundEffectDataset
 from vllm_omni.benchmarks.data_modules.ttsd_dataset import TTSDDataset
 from vllm_omni.metrics import definitions as defs
+from vllm_omni.metrics.utils import coerce_positive_int_scalar
+
+logger = init_logger(__name__)
 
 _AUDIO_CONTINUITY_THRESHOLD_ENV = "VLLM_OMNI_BENCH_AUDIO_CONTINUITY_THRESHOLD_S"
-_AUDIO_SAMPLE_RATE_ENV = "VLLM_OMNI_BENCH_AUDIO_SAMPLE_RATE"
-_AUDIO_CHANNELS_ENV = "VLLM_OMNI_BENCH_AUDIO_CHANNELS"
 RETURN_STAGE_METRICS_FIELD = "return_stage_metrics"
 _IMAGE_STAGE_METRICS_BACKENDS = frozenset({"openai-image-edits-omni"})
 _PRINT_STAGE = False
@@ -111,30 +110,28 @@ def _audio_continuity_threshold_s() -> float:
     return max(value, 0.0)
 
 
-def _audio_pcm_format() -> tuple[int, int]:
-    """Return ``(sample_rate, channels)`` of the streamed PCM response.
+def _pcm_s16le_to_seed_tts_wer_bytes(
+    pcm_bytes: bytes,
+    *,
+    sample_rate: int,
+    channels: int,
+) -> bytes:
+    """Normalize streamed raw PCM to the 24 kHz mono PCM used by Seed-TTS WER."""
+    if not pcm_bytes:
+        return b""
+    channels = max(1, int(channels))
+    pcm = np.frombuffer(pcm_bytes, dtype=np.int16)
+    if channels > 1:
+        usable = (pcm.size // channels) * channels
+        pcm = pcm[:usable].reshape(-1, channels).mean(axis=1)
+    pcm_f32 = pcm.astype(np.float32) / 32767.0
+    if int(sample_rate) != 24000 and pcm_f32.size:
+        from vllm.multimodal.audio import AudioResampler
 
-    Defaults to 24 kHz mono (Qwen3-TTS / VoxCPM2 / most MOSS-TTS variants).
-    Override for models with a different codec output format (e.g.
-    MOSS-TTS-Local-Transformer-v1.5, which streams 48 kHz stereo PCM) via
-    ``VLLM_OMNI_BENCH_AUDIO_SAMPLE_RATE`` / ``VLLM_OMNI_BENCH_AUDIO_CHANNELS`` -
-    getting this wrong silently skews audio_duration/audio_rtf/underrun stats.
-    """
-    sample_rate = 24000
-    channels = 1
-    raw_sr = os.environ.get(_AUDIO_SAMPLE_RATE_ENV)
-    if raw_sr:
-        try:
-            sample_rate = int(raw_sr)
-        except ValueError:
-            logger.warning("Invalid %s=%r; using default %d", _AUDIO_SAMPLE_RATE_ENV, raw_sr, sample_rate)
-    raw_ch = os.environ.get(_AUDIO_CHANNELS_ENV)
-    if raw_ch:
-        try:
-            channels = int(raw_ch)
-        except ValueError:
-            logger.warning("Invalid %s=%r; using default %d", _AUDIO_CHANNELS_ENV, raw_ch, channels)
-    return sample_rate, channels
+        resampler = AudioResampler(target_sr=24000)
+        pcm_f32 = resampler.resample(pcm_f32, orig_sr=int(sample_rate))
+    pcm_f32 = np.clip(pcm_f32, -1.0, 1.0)
+    return (pcm_f32 * 32767).astype(np.int16).tobytes()
 
 
 get_samples_old = datasets.get_samples
@@ -528,16 +525,8 @@ def _add_image_edit_extra_body_to_form(form: aiohttp.FormData, extra_body: dict[
             form.add_field(key, str(value))
 
 
-def _coerce_positive_int(value: Any) -> int | None:
-    try:
-        coerced = int(value)
-    except (TypeError, ValueError):
-        return None
-    return coerced if coerced > 0 else None
-
-
 def _extract_output_tokens_from_metrics(metrics: dict[str, Any]) -> int | None:
-    top_level_tokens = _coerce_positive_int(metrics.get(defs.NUM_TOKENS_OUT))
+    top_level_tokens = coerce_positive_int_scalar(metrics.get(defs.NUM_TOKENS_OUT))
     if top_level_tokens is not None:
         return top_level_tokens
 
@@ -549,7 +538,7 @@ def _extract_output_tokens_from_metrics(metrics: dict[str, Any]) -> int | None:
     for info in stage_snapshot.values():
         if not isinstance(info, dict):
             continue
-        num_tokens_out = _coerce_positive_int(info.get(defs.NUM_TOKENS_OUT))
+        num_tokens_out = coerce_positive_int_scalar(info.get(defs.NUM_TOKENS_OUT))
         if num_tokens_out is None:
             continue
         if info.get("final_output_type") == "text" or info.get("output_unit_type") == "token":
@@ -560,9 +549,9 @@ def _extract_output_tokens_from_metrics(metrics: dict[str, Any]) -> int | None:
 
 def _apply_usage_to_output(output: MixRequestFuncOutput, usage: dict[str, Any]) -> int | None:
     """Apply OpenAI ``usage`` fields to the benchmark output."""
-    if (pt := _coerce_positive_int(usage.get("prompt_tokens"))) is not None:
+    if (pt := coerce_positive_int_scalar(usage.get("prompt_tokens"))) is not None:
         output.prompt_len = pt
-    completion_tokens = _coerce_positive_int(usage.get("completion_tokens"))
+    completion_tokens = coerce_positive_int_scalar(usage.get("completion_tokens"))
     if completion_tokens is not None:
         output.output_tokens = max(int(output.output_tokens or 0), completion_tokens)
     return completion_tokens
@@ -905,12 +894,22 @@ async def async_request_openai_chat_omni_completions(
                     audio_frames = 0
                     if response_format == "wav" and wav_pcm_buffer and wav_audio_params is not None:
                         channels, sample_width, frame_rate = wav_audio_params
-                        frame_width = sample_width * channels
-                        if frame_width > 0:
-                            audio_frames = len(wav_pcm_buffer) // frame_width
-                            audio_duration_sec = audio_frames / frame_rate
+                        audio_frames = defs.compute_audio_frames(
+                            len(wav_pcm_buffer),
+                            sample_width=sample_width,
+                            channels=channels,
+                        )
+                        if audio_frames > 0 and frame_rate > 0:
+                            audio_duration_sec = audio_frames / float(frame_rate)
                         else:
-                            logger.warning("Audio frame width is zero")
+                            logger.warning(
+                                "Unable to derive audio frames/duration from wav pcm "
+                                "(pcm_nbytes=%d, sample_width=%d, channels=%d, sample_rate=%d)",
+                                len(wav_pcm_buffer),
+                                sample_width,
+                                channels,
+                                frame_rate,
+                            )
                     elif audio_bytes_buffer:
                         try:
                             from vllm.multimodal.audio import get_audio_duration
@@ -929,10 +928,8 @@ async def async_request_openai_chat_omni_completions(
                         output.audio_duration = audio_duration_sec
                         output.audio_frames = audio_frames
                         audio_duration = output.audio_duration
-                        if audio_duration > 0:
-                            output.audio_rtf = audio_generate_time / output.audio_duration
-                        else:
-                            output.audio_rtf = 0
+                        output.audio_rtf = defs.compute_audio_rtf(audio_generate_time, audio_duration)
+                        if audio_duration <= 0:
                             logger.warning("Audio duration is zero")
                         if _seed_tts_capture_pcm_for_wer() and getattr(request_func_input, "seed_tts_row", False):
                             try:
@@ -1163,10 +1160,9 @@ async def async_request_openai_audio_speech(
     output = MixRequestFuncOutput()
     output.prompt_len = request_func_input.prompt_len
 
-    # PCM format: 16-bit signed; sample_rate/channels are model-dependent
-    # (see _audio_pcm_format docstring).
-    sample_rate, channels = _audio_pcm_format()
-    sample_width = 2  # 16-bit = 2 bytes
+    # PCM format: 16-bit signed; sample_rate/channels are model-dependent.
+    sample_rate, channels = defs.stream_pcm_format_from_env()
+    sample_width = defs.DEFAULT_AUDIO_SAMPLE_WIDTH
 
     st = time.perf_counter()
     output.start_time = st
@@ -1195,13 +1191,17 @@ async def async_request_openai_audio_speech(
                 end_time = time.perf_counter()
                 output.latency = end_time - st
 
-                total_samples = total_pcm_bytes // (sample_width * channels)
-                output.audio_duration = total_samples / sample_rate
+                total_samples = defs.compute_audio_frames(
+                    total_pcm_bytes,
+                    sample_width=sample_width,
+                    channels=channels,
+                )
                 output.audio_frames = total_samples
-                if output.audio_duration > 0:
-                    output.audio_rtf = output.latency / output.audio_duration
-                else:
-                    output.audio_rtf = 0
+                output.audio_duration = (
+                    float(total_samples) / float(sample_rate) if total_samples > 0 and sample_rate > 0 else 0.0
+                )
+                output.audio_rtf = defs.compute_audio_rtf(output.latency, output.audio_duration)
+                if output.audio_duration <= 0:
                     logger.warning("Audio duration is zero")
 
                 continuity = compute_continuity_stats(
@@ -1216,7 +1216,15 @@ async def async_request_openai_audio_speech(
                 output.audio_continuity_ok = continuity.is_continuous
                 output.audio_underrun_event_count = continuity.underrun_event_count
                 if pcm_capture is not None and pcm_capture:
-                    output.tts_output_pcm_bytes = bytes(pcm_capture)
+                    try:
+                        output.tts_output_pcm_bytes = _pcm_s16le_to_seed_tts_wer_bytes(
+                            bytes(pcm_capture),
+                            sample_rate=sample_rate,
+                            channels=channels,
+                        )
+                    except Exception as ex:
+                        logger.warning("Seed-TTS WER PCM normalization failed: %s", ex)
+                        output.tts_output_pcm_bytes = bytes(pcm_capture)
                 elif capture_wer_pcm:
                     ct = response.headers.get("Content-Type", "")
                     logger.warning(
@@ -1261,7 +1269,7 @@ if "daily-omni" not in OPENAI_COMPATIBLE_BACKENDS:
 # Prevent import order from causing patch failures
 from vllm.benchmarks import serve
 from vllm.benchmarks.lib.ready_checker import wait_for_endpoint
-from vllm.benchmarks.serve import TaskType, _merge_overrides, calculate_metrics_for_embeddings, get_request
+from vllm.benchmarks.serve import TaskType, calculate_metrics_for_embeddings, get_request
 
 from vllm_omni.benchmarks.metrics.metrics import (
     MultiModalsBenchmarkMetrics,
@@ -1271,6 +1279,19 @@ from vllm_omni.benchmarks.metrics.metrics import (
 # ruff: noqa: E402
 
 benchmark_old = serve.benchmark
+
+
+def _merge_overrides(base: dict | None, overrides: dict | None) -> dict | None:
+    """Merge benchmark extra_body with per-request overrides.
+
+    vLLM 0.24 removed the private helper from ``vllm.benchmarks.serve``.
+    Keep the same shallow-merge behavior here, with request overrides winning.
+    """
+    if not base and not overrides:
+        return None
+    merged = dict(base or {})
+    merged.update(overrides or {})
+    return merged
 
 
 async def benchmark(

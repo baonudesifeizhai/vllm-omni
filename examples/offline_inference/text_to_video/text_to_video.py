@@ -124,6 +124,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override model class name (e.g., LTX2TwoStagesVideoPipeline).",
     )
+    parser.add_argument(
+        "--deploy-config",
+        default=None,
+        help="Optional deploy config YAML to use for pipeline-backed runs.",
+    )
     parser.add_argument("--prompt", default="A serene lakeside sunrise with mist over the water.", help="Text prompt.")
     parser.add_argument("--negative-prompt", default="", help="Negative prompt.")
     parser.add_argument(
@@ -227,7 +232,7 @@ def parse_args() -> argparse.Namespace:
         "--quantization",
         type=str,
         default=None,
-        choices=["fp8", "mxfp8", "mxfp4", "mxfp4_dualscale", "int8", "gguf"],
+        choices=["fp8", "mxfp8", "mxfp4", "mxfp4_dualscale", "int8"],
         help="Quantization method for the transformer. mxfp8: W8A8 MXFP8 (NPU). mxfp4: W4A4 MXFP4 (NPU). mxfp4_dualscale: W4A4 MXFP4 dual-scale + BF16 fallback mixed (NPU). fp8: online FP8 (GPU).",
     )
 
@@ -375,6 +380,8 @@ def main():
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
         profiler_config=args.profiler_config,
     )
+    if args.deploy_config:
+        omni_kwargs["deploy_config"] = args.deploy_config
     if args.boundary_ratio is not None:
         omni_kwargs["boundary_ratio"] = args.boundary_ratio
     if args.flow_shift is not None:
@@ -455,6 +462,7 @@ def main():
         print(f"Worker peak GPU memory (reserved): {peak_mb:.2f} MiB ({peak_mb / 1024:.2f} GiB)")
 
     audio = None
+    audio_sample_rate = args.audio_sample_rate
     if isinstance(frames, list):
         frames = frames[0] if frames else None
 
@@ -465,11 +473,13 @@ def main():
             )
         if frames.multimodal_output and "audio" in frames.multimodal_output:
             audio = frames.multimodal_output["audio"]
+            audio_sample_rate = frames.multimodal_output.get("audio_sample_rate", audio_sample_rate)
         if frames.is_pipeline_output and frames.request_output is not None:
             inner_output = frames.request_output
             if isinstance(inner_output, OmniRequestOutput):
                 if inner_output.multimodal_output and "audio" in inner_output.multimodal_output:
                     audio = inner_output.multimodal_output["audio"]
+                    audio_sample_rate = inner_output.multimodal_output.get("audio_sample_rate", audio_sample_rate)
                 frames = inner_output
         if isinstance(frames, OmniRequestOutput):
             if frames.images:
@@ -477,6 +487,7 @@ def main():
                     frames, audio = frames.images[0]
                 elif len(frames.images) == 1 and isinstance(frames.images[0], dict):
                     audio = frames.images[0].get("audio")
+                    audio_sample_rate = frames.images[0].get("audio_sample_rate", audio_sample_rate)
                     frames = frames.images[0].get("frames") or frames.images[0].get("video")
                 else:
                     frames = frames.images
@@ -489,6 +500,7 @@ def main():
             frames, audio = first_item
         elif isinstance(first_item, dict):
             audio = first_item.get("audio")
+            audio_sample_rate = first_item.get("audio_sample_rate", audio_sample_rate)
             frames = first_item.get("frames") or first_item.get("video")
         elif isinstance(first_item, list):
             frames = first_item
@@ -497,6 +509,7 @@ def main():
         frames, audio = frames
     elif isinstance(frames, dict):
         audio = frames.get("audio")
+        audio_sample_rate = frames.get("audio_sample_rate", audio_sample_rate)
         frames = frames.get("frames") or frames.get("video")
 
     if frames is None:
@@ -611,7 +624,7 @@ def main():
             frames_u8,
             audio_np,
             fps=float(args.fps),
-            audio_sample_rate=args.audio_sample_rate,
+            audio_sample_rate=audio_sample_rate,
         )
         with open(str(output_path), "wb") as f:
             f.write(video_bytes)

@@ -24,7 +24,7 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import Dist
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents, PipelineParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
-from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
+from vllm_omni.diffusion.forward_context import DenoiseProgressMixin
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
@@ -187,7 +187,7 @@ def get_wan22_post_process_func(
     ):
         if output_type == "latent":
             return video
-        custom_output = {}
+        video_metadata = {}
         if sampling_params is not None and getattr(sampling_params, "enable_frame_interpolation", False):
             video, multiplier = interpolate_video_tensor(
                 video,
@@ -195,10 +195,10 @@ def get_wan22_post_process_func(
                 scale=sampling_params.frame_interpolation_scale,
                 model_path=sampling_params.frame_interpolation_model_path,
             )
-            custom_output["video_fps_multiplier"] = multiplier
+            video_metadata["video_fps_multiplier"] = multiplier
         return {
-            "video": video_processor.postprocess_video(video, output_type=output_type),
-            "custom_output": custom_output,
+            "payload": {"video": video_processor.postprocess_video(video, output_type=output_type)},
+            "metadata": {"video": video_metadata} if video_metadata else {},
         }
 
     return post_process_func
@@ -264,6 +264,7 @@ class Wan22Pipeline(
     PipelineParallelMixin,
     CFGParallelMixin,
     ProgressBarMixin,
+    DenoiseProgressMixin,
     DiffusionPipelineProfilerMixin,
     SupportsComponentDiscovery,
 ):
@@ -460,7 +461,7 @@ class Wan22Pipeline(
         with self.progress_bar(total=len(timesteps)) as pbar:
             for step_idx, t in enumerate(timesteps):
                 self._current_timestep = t
-                set_forward_context_denoise_step_idx(step_idx)
+                self.record_denoise_step(step_idx, t)
 
                 # Select model based on timestep and boundary_ratio
                 # High noise stage (t >= boundary_timestep): use transformer
@@ -540,38 +541,27 @@ class Wan22Pipeline(
 
         return latents
 
-    def forward(
-        self,
-        req: DiffusionRequestBatch,
-        prompt: str | None = None,
-        negative_prompt: str | None = None,
-        height: int = 480,
-        width: int = 832,
-        num_inference_steps: int = 40,
-        guidance_scale: float | tuple[float, float] = 4.0,
-        frame_num: int = 81,
-        output_type: str | None = "np",
-        generator: torch.Generator | list[torch.Generator] | None = None,
-        prompt_embeds: torch.Tensor | None = None,
-        negative_prompt_embeds: torch.Tensor | None = None,
-        attention_kwargs: dict | None = None,
-        **kwargs,
-    ) -> DiffusionOutput:
-        # Get parameters from request or arguments
+    def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
+        prompt: str | None = None
+        negative_prompt: str | None = None
+        prompt_embeds: torch.Tensor | None = None
+        negative_prompt_embeds: torch.Tensor | None = None
         if len(req.prompts) > 1:
             raise ValueError(
                 """This model only supports a single prompt, not a batched request.""",
                 """Please pass in a single prompt object or string, or a single-item list.""",
             )
-        if len(req.prompts) == 1:  # If req.prompt is empty, default to prompt & neg_prompt in param list
-            prompt = req.prompts[0] if isinstance(req.prompts[0], str) else req.prompts[0].get("prompt")
-            negative_prompt = None if isinstance(req.prompts[0], str) else req.prompts[0].get("negative_prompt")
-        if prompt is None and prompt_embeds is None:
-            raise ValueError("Prompt or prompt_embeds is required for Wan2.2 generation.")
+        if len(req.prompts) == 1:
+            first_prompt = req.prompts[0]
+            prompt = first_prompt if isinstance(first_prompt, str) else (first_prompt.get("prompt") or "")
+            negative_prompt = None if isinstance(first_prompt, str) else first_prompt.get("negative_prompt")
 
-        height = req.sampling_params.height or height
-        width = req.sampling_params.width or width
-        num_frames = req.sampling_params.num_frames if req.sampling_params.num_frames else frame_num
+        if not prompt:
+            raise ValueError("Prompt is required for Wan2.2 generation.")
+
+        height = req.sampling_params.height or 480
+        width = req.sampling_params.width or 832
+        num_frames = req.sampling_params.num_frames or 81
 
         # Ensure dimensions are compatible with VAE and patch size
         # For expand_timesteps mode, we need latent dims to be even (divisible by patch_size)
@@ -579,11 +569,16 @@ class Wan22Pipeline(
         mod_value = self.vae_scale_factor_spatial * patch_size[1]  # 16*2=32 for TI2V, 8*2=16 for I2V
         height = (height // mod_value) * mod_value
         width = (width // mod_value) * mod_value
-        num_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        num_steps = 40 if req.sampling_params.num_inference_steps is None else req.sampling_params.num_inference_steps
 
         # Respect per-request guidance_scale when explicitly provided.
         if req.sampling_params.guidance_scale_provided:
             guidance_scale = req.sampling_params.guidance_scale
+        else:
+            guidance_scale = 4.0
+
+        output_type = req.sampling_params.output_type or "np"
+        attention_kwargs: dict | None = None
 
         guidance_low = guidance_scale if isinstance(guidance_scale, (int, float)) else guidance_scale[0]
         guidance_high = (
@@ -634,8 +629,7 @@ class Wan22Pipeline(
             dtype = self.text_encoder.dtype
 
         # Seed / generator
-        if generator is None:
-            generator = req.sampling_params.generator
+        generator = req.sampling_params.generator
         if generator is None and req.sampling_params.seed is not None:
             generator = torch.Generator(device=device).manual_seed(req.sampling_params.seed)
 
@@ -644,24 +638,16 @@ class Wan22Pipeline(
             current_omni_platform.synchronize()
             _t_pipeline_start = time.perf_counter()
             _t_text_enc_start = _t_pipeline_start
-        if prompt_embeds is None:
-            prompt_embeds, negative_prompt_embeds = self.encode_prompt(
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                do_classifier_free_guidance=guidance_low > 1.0 or guidance_high > 1.0,
-                num_videos_per_prompt=req.sampling_params.num_outputs_per_prompt or 1,
-                max_sequence_length=req.sampling_params.max_sequence_length or 512,
-                device=device,
-                dtype=dtype,
-            )
-        else:
-            prompt_embeds = prompt_embeds.to(device=device, dtype=dtype)
-            if negative_prompt_embeds is not None:
-                negative_prompt_embeds = negative_prompt_embeds.to(device=device, dtype=dtype)
-            elif guidance_low > 1.0 or guidance_high > 1.0:
-                raise ValueError(
-                    "negative_prompt_embeds must be provided when prompt_embeds are given and guidance > 1."
-                )
+        prompt_embeds, negative_prompt_embeds = self.encode_prompt(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            do_classifier_free_guidance=guidance_low > 1.0 or guidance_high > 1.0,
+            num_videos_per_prompt=req.sampling_params.num_outputs_per_prompt or 1,
+            max_sequence_length=req.sampling_params.max_sequence_length or 512,
+            device=device,
+            dtype=dtype,
+        )
+
         if DEBUG_PERF:
             current_omni_platform.synchronize()
             _t_text_enc_ms = (time.perf_counter() - _t_text_enc_start) * 1000

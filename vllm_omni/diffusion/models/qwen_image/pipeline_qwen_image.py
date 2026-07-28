@@ -48,7 +48,7 @@ from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, spli
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.worker.input_batch import InputBatch
-    from vllm_omni.diffusion.worker.utils import DiffusionRequestState
+    from vllm_omni.diffusion.worker.utils import StepRequestState
 
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
@@ -73,8 +73,19 @@ def get_qwen_image_post_process_func(
     image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor * 2)
 
     def post_process_func(
-        images: torch.Tensor,
+        images: torch.Tensor | dict[str, Any],
     ):
+        if isinstance(images, dict) and isinstance(images.get("payload"), dict):
+            payload = dict(images["payload"])
+            image_payload = payload.get("image")
+            if image_payload is None:
+                raise ValueError("Qwen-Image postprocess expected payload['image'] in output envelope.")
+            payload["image"] = image_processor.postprocess(image_payload)
+            metadata = images.get("metadata") or {}
+            return {
+                "payload": payload,
+                "metadata": metadata if isinstance(metadata, dict) else {},
+            }
         return image_processor.postprocess(images)
 
     return post_process_func
@@ -298,9 +309,8 @@ class QwenImagePipeline(
             model, subfolder="scheduler", local_files_only=local_files_only
         )
         # ``from_pretrained_with_prefetch`` re-prefetches and retries on a
-        # half-written cache (missing-shard ``OSError`` *and* the default
-        # -config size-mismatch ``RuntimeError`` that ``retry_on_missing_shard``
-        # could not recover) instead of crashing the worker.
+        # half-written cache (missing-shard ``OSError`` and the default
+        # -config size-mismatch ``RuntimeError``) instead of crashing the worker.
         self.text_encoder = from_pretrained_with_prefetch(
             Qwen2_5_VLForConditionalGeneration.from_pretrained,
             model,
@@ -760,9 +770,9 @@ class QwenImagePipeline(
 
     def prepare_encode(
         self,
-        state: "DiffusionRequestState",
+        state: "StepRequestState",
         **kwargs: Any,
-    ) -> "DiffusionRequestState":
+    ) -> "StepRequestState":
         """Populate *state* with encoded prompts, latents, timesteps, and CFG config."""
         sampling = state.sampling
         prompt, negative_prompt = self._extract_prompts([state.prompt] if state.prompt is not None else [])
@@ -949,7 +959,7 @@ class QwenImagePipeline(
 
     def step_scheduler(
         self,
-        state: "DiffusionRequestState",
+        state: "StepRequestState",
         noise_pred: torch.Tensor,
         **kwargs: Any,
     ) -> None:
@@ -970,7 +980,7 @@ class QwenImagePipeline(
 
     def post_decode(
         self,
-        state: "DiffusionRequestState",
+        state: "StepRequestState",
         **kwargs: Any,
     ) -> DiffusionOutput:
         """Decode final latents from *state*."""
@@ -978,58 +988,34 @@ class QwenImagePipeline(
 
         height = state.sampling.height or self.default_sample_size * self.vae_scale_factor
         width = state.sampling.width or self.default_sample_size * self.vae_scale_factor
-        output_type = kwargs.get("output_type", "pil")
+        output_type = kwargs.get("output_type") or state.sampling.output_type or "pil"
 
         return self._decode_latents(state.latents, height, width, output_type)
 
-    def forward(
-        self,
-        req: DiffusionRequestBatch,
-        prompt: str | list[str] | None = None,
-        negative_prompt: str | list[str] | None = None,
-        true_cfg_scale: float = 4.0,
-        height: int | None = None,
-        width: int | None = None,
-        num_inference_steps: int = 50,
-        sigmas: list[float] | None = None,
-        guidance_scale: float = 1.0,
-        num_images_per_prompt: int = 1,
-        generator: torch.Generator | list[torch.Generator] | None = None,
-        latents: torch.Tensor | None = None,
-        prompt_embeds: torch.Tensor | None = None,
-        prompt_embeds_mask: torch.Tensor | None = None,
-        negative_prompt_embeds: torch.Tensor | None = None,
-        negative_prompt_embeds_mask: torch.Tensor | None = None,
-        output_type: str | None = "pil",
-        attention_kwargs: dict[str, Any] | None = None,
-        callback_on_step_end_tensor_inputs: list[str] = ["latents"],
-        max_sequence_length: int = 1024,
-    ) -> list[DiffusionOutput]:
+    def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
         sampling_params_list = req.sampling_params_list
         common_sampling_params = sampling_params_list[0]
         extracted_prompt, negative_prompt = self._extract_prompts(req.prompts)
-        prompt = extracted_prompt or prompt
+        prompt = extracted_prompt
 
         height = common_sampling_params.height or self.default_sample_size * self.vae_scale_factor
         width = common_sampling_params.width or self.default_sample_size * self.vae_scale_factor
         height, width = normalize_min_aligned_size(height, width, self.vae_scale_factor * 2)
-        num_inference_steps = common_sampling_params.num_inference_steps or num_inference_steps
-        sigmas = common_sampling_params.sigmas or sigmas
-        max_sequence_length = common_sampling_params.max_sequence_length or max_sequence_length
+        num_inference_steps = common_sampling_params.num_inference_steps or 50
+        sigmas = common_sampling_params.sigmas
+        max_sequence_length = common_sampling_params.max_sequence_length or 1024
         num_images_per_prompt = (
-            common_sampling_params.num_outputs_per_prompt
-            if common_sampling_params.num_outputs_per_prompt > 0
-            else num_images_per_prompt
+            common_sampling_params.num_outputs_per_prompt if common_sampling_params.num_outputs_per_prompt > 0 else 1
         )
-        generator = req.collate_request_generators(num_images_per_prompt, generator)
-        latents = req.collate_request_tensors("latents", latents)
+        generator = req.collate_request_generators(num_images_per_prompt, None)
+        latents = req.collate_request_tensors("latents", None)
         prompt_fields = DiffusionRequestBatch.collate_prompt_field_map(
             req.prompts,
             {
-                "prompt_embeds": prompt_embeds,
-                "prompt_embeds_mask": prompt_embeds_mask,
-                "negative_prompt_embeds": negative_prompt_embeds,
-                "negative_prompt_embeds_mask": negative_prompt_embeds_mask,
+                "prompt_embeds": None,
+                "prompt_embeds_mask": None,
+                "negative_prompt_embeds": None,
+                "negative_prompt_embeds_mask": None,
             },
         )
         prompt_embeds = prompt_fields["prompt_embeds"]
@@ -1040,9 +1026,16 @@ class QwenImagePipeline(
             prompt = None
         if negative_prompt_embeds is not None:
             negative_prompt = None
-        true_cfg_scale = common_sampling_params.true_cfg_scale or true_cfg_scale
+        true_cfg_scale = common_sampling_params.true_cfg_scale or 4.0
         if common_sampling_params.guidance_scale_provided:
             guidance_scale = common_sampling_params.guidance_scale
+        else:
+            guidance_scale = 1.0
+
+        latents = req.collate_request_tensors("latents", None)
+        output_type = common_sampling_params.output_type or "pil"
+        attention_kwargs = None
+        callback_on_step_end_tensor_inputs = ["latents"]
 
         ctx = self._prepare_generation_context(
             prompt=prompt,
@@ -1087,6 +1080,7 @@ class QwenImagePipeline(
         )
 
         self._current_timestep = None
+
         result = self._decode_latents(latents, height, width, output_type)
         return split_diffusion_output_by_request(
             result,

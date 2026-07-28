@@ -30,7 +30,7 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
     when the selected_backend is not specified.
 
     So the behaviour of the attention backend overriding logic currently lives in
-    extract_stage_metadata in `vllm_omni/engine/stage_init_utils.py`
+    extract_legacy_stage_metadata in `vllm_omni/engine/stage_init_utils.py`
 
     ```
     if current_omni_platform.is_rocm():
@@ -88,6 +88,14 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
 
         if selected_backend is not None:
             backend_upper = selected_backend.upper()
+            if backend_upper in ("FLASH_ATTN_HUB", "FLASH_ATTN_3_HUB"):
+                logger.warning(
+                    "HuggingFace kernels-backed FlashAttention is "
+                    "not supported on ROCm. Falling back to local "
+                    "FLASH_ATTN."
+                )
+                backend_upper = "FLASH_ATTN"
+
             if backend_upper == "FLASH_ATTN" and not aiter_supported:
                 logger.warning(
                     "Flash Attention requires `aiter` library which is only supported "
@@ -114,7 +122,7 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
 
     @classmethod
     def get_default_stage_config_path(cls) -> str:
-        return "vllm_omni/platforms/rocm/stage_configs"
+        return "vllm_omni/deploy"
 
     @classmethod
     def get_torch_device(cls, local_rank: int | None = None) -> torch.device:
