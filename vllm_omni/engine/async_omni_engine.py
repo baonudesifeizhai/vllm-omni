@@ -64,11 +64,85 @@ from vllm_omni.entrypoints.utils import (
 )
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.metrics.prometheus import OmniRequestCounter
+from vllm_omni.runtime_policy import (
+    RUNTIME_POLICY_SHARED_DOWNSTREAM_DEVICE_ENV,
+)
 
 logger = init_logger(__name__)
 
 _STARTUP_POLL_INTERVAL_S = 1.0
 _REQUEST_QUEUE_MAXSIZE = 256
+
+
+def _configured_stage_devices(stage_config: Any) -> set[str] | None:
+    """Return configured device IDs, or None when a stage uses all visible GPUs."""
+    runtime = getattr(stage_config, "runtime", None)
+    if runtime is None:
+        return None
+    raw_devices = runtime.get("devices") if hasattr(runtime, "get") else getattr(runtime, "devices", None)
+    if raw_devices is None:
+        return None
+    if isinstance(raw_devices, (list, tuple, set)):
+        values = [str(value).strip() for value in raw_devices]
+    else:
+        text = str(raw_devices).strip()
+        if text.lower() == "cpu":
+            return set()
+        values = text.split(",")
+    return {value for value in (item.strip() for item in values) if value}
+
+
+def _inject_runtime_policy_topology(stage_configs: list[Any]) -> None:
+    """Tell stage 0 whether lowering K can free a downstream physical device.
+
+    Device IDs are compared in the common launcher-visible namespace. Unknown
+    placement means "all visible devices" and is conservatively treated as
+    overlapping. A deployment may explicitly override the auto-detected value
+    in stage-0 ``runtime.env``.
+    """
+    if not stage_configs:
+        return
+
+    stage0 = stage_configs[0]
+    thinker_devices = _configured_stage_devices(stage0)
+    shares_downstream_device = False
+    for downstream in stage_configs[1:]:
+        downstream_devices = _configured_stage_devices(downstream)
+        if downstream_devices == set():
+            continue
+        if thinker_devices is None or downstream_devices is None:
+            shares_downstream_device = True
+            break
+        if thinker_devices.intersection(downstream_devices):
+            shares_downstream_device = True
+            break
+
+    runtime = getattr(stage0, "runtime", None)
+    if runtime is None:
+        return
+    raw_env = runtime.get("env") if hasattr(runtime, "get") else getattr(runtime, "env", None)
+    runtime_env = dict(raw_env or {})
+    if RUNTIME_POLICY_SHARED_DOWNSTREAM_DEVICE_ENV in runtime_env:
+        logger.info(
+            "[OmniRuntimePolicy] preserving explicit stage-0 %s=%s",
+            RUNTIME_POLICY_SHARED_DOWNSTREAM_DEVICE_ENV,
+            runtime_env[RUNTIME_POLICY_SHARED_DOWNSTREAM_DEVICE_ENV],
+        )
+        return
+    runtime_env[RUNTIME_POLICY_SHARED_DOWNSTREAM_DEVICE_ENV] = "1" if shares_downstream_device else "0"
+    if hasattr(runtime, "__setitem__"):
+        runtime["env"] = runtime_env
+    else:
+        runtime.env = runtime_env
+    logger.info(
+        "[OmniRuntimePolicy] stage-0/downstream device overlap=%s (thinker=%s, downstream=%s)",
+        shares_downstream_device,
+        sorted(thinker_devices) if thinker_devices is not None else "all",
+        [
+            (sorted(devices) if (devices := _configured_stage_devices(stage)) is not None else "all")
+            for stage in stage_configs[1:]
+        ],
+    )
 
 
 # ============================================================================
@@ -294,6 +368,7 @@ class AsyncOmniEngine:
             kwargs,
             trust_remote_code=trust_remote_code,
         )
+        _inject_runtime_policy_topology(self.stage_configs)
 
         self.num_stages = len(self.stage_configs)
         stage0_args = getattr(self.stage_configs[0], "engine_args", None) if self.num_stages > 0 else None
@@ -764,7 +839,6 @@ class AsyncOmniEngine:
             # output routing (output.request_id lookup) can find the req_state.
             request.external_req_id = request_id
             request = _apply_omni_final_stage_metadata(request, final_stage_id)
-
             # Registration with stage 0's output processor is deferred to the
             # orchestrator thread (see Orchestrator._handle_add_request), which
             # now routes admission through StagePool.submit_initial().

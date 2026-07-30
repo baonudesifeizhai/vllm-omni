@@ -5,13 +5,18 @@ import importlib
 import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
 from vllm.v1.request import Request, RequestStatus
 
 from vllm_omni.data_entry_keys import MetaStruct, OmniPayloadStruct, unflatten_payload
+from vllm_omni.runtime_observability import (
+    emit_runtime_event,
+    resolve_runtime_request_id,
+    runtime_observability_enabled,
+)
 
 from ..adapter import construct_next_stage_streaming_input_prompt
 from ..factory import OmniConnectorFactory
@@ -39,6 +44,25 @@ class _TalkerTextCreditState:
     wait_started_s: float | None = None
     upstream_finished: bool = False
     summary_emitted: bool = False
+    observation_request_id: str | None = None
+
+
+@dataclass
+class _Code2WavWorkState:
+    """Observable Code2Wav work queued by Talker codec chunks."""
+
+    pending_chunks: deque[tuple[int, int]] = field(default_factory=deque)
+    pending_total_frames: int = 0
+    pending_new_frames: int = 0
+    enqueued_chunks: int = 0
+    scheduled_chunks: int = 0
+    enqueued_total_frames: int = 0
+    enqueued_new_frames: int = 0
+    scheduled_total_frames: int = 0
+    scheduled_new_frames: int = 0
+    max_pending_total_frames: int = 0
+    summary_emitted: bool = False
+    observation_request_id: str | None = None
 
 
 class OmniChunkTransferAdapter(OmniTransferAdapterBase):
@@ -87,6 +111,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._talker_text_credits: dict[str, _TalkerTextCreditState] = {}
         if self._talker_text_credit_enabled:
             logger.info("Qwen3-Omni Talker verified-text FIFO credit scheduling enabled.")
+        self._code2wav_work_enabled = (
+            runtime_observability_enabled()
+            and getattr(model_config, "model_arch", None) == "Qwen3OmniMoeForConditionalGeneration"
+            and getattr(model_config, "model_stage", None) == "code2wav"
+        )
+        self._code2wav_work_states: dict[str, _Code2WavWorkState] = {}
         # State specific to Chunk management
         self.custom_process_next_stage_input_func: Callable[..., OmniPayloadStruct | None] | None = None
         custom_process_next_stage_input_func = getattr(model_config, "custom_process_next_stage_input_func", None)
@@ -138,11 +168,25 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         state = self._talker_text_credit_state(request_id)
         if state is None:
             return
+        state.observation_request_id = resolve_runtime_request_id(
+            self.request_ids_mapping.get(request_id, request_id),
+            payload,
+        )
+        observation_request_id = state.observation_request_id
 
         now = time.monotonic()
         if state.wait_started_s is not None:
-            state.wait_time_s += now - state.wait_started_s
+            wait_s = now - state.wait_started_s
+            state.wait_time_s += wait_s
             state.wait_started_s = None
+            emit_runtime_event(
+                "talker_text_wait_end",
+                request_id=observation_request_id,
+                stage="talker",
+                unit="seconds",
+                delta=wait_s,
+                inventory=state.available,
+            )
 
         meta = payload.get("meta")
         if isinstance(meta, Mapping):
@@ -160,6 +204,14 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             # The first accepted text token is consumed by Talker prefill, not
             # by a cached decode step, so it is traced but not granted as credit.
             state.bootstrap_rows = 1
+            emit_runtime_event(
+                "talker_text_bootstrap",
+                request_id=observation_request_id,
+                stage="talker",
+                unit="text_rows",
+                delta=1,
+                inventory=state.available,
+            )
 
         if not isinstance(embed, Mapping):
             return
@@ -198,6 +250,16 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             state.enqueued_rows += new_rows
             state.available += new_rows
             state.max_credit = max(state.max_credit, state.available)
+            emit_runtime_event(
+                "talker_text_enqueue",
+                request_id=observation_request_id,
+                stage="talker",
+                unit="text_rows",
+                delta=new_rows,
+                inventory=state.available,
+                span_start=new_start,
+                span_end=end,
+            )
 
     def _has_talker_text_credit(self, request_id: str) -> bool:
         if not getattr(self, "_talker_text_credit_enabled", False):
@@ -229,6 +291,16 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         consumed = min(decode_steps, state.available)
         state.available -= consumed
         state.consumed_rows += consumed
+        emit_runtime_event(
+            "talker_text_consume",
+            request_id=state.observation_request_id
+            or self.request_ids_mapping.get(request.request_id, request.request_id),
+            stage="talker",
+            unit="text_rows",
+            delta=-consumed,
+            inventory=state.available,
+            scheduled_decode_steps=decode_steps,
+        )
         if consumed != decode_steps:
             logger.error(
                 "[TalkerCreditTrace] scheduler over-consumed text credit request=%s requested=%d available=%d",
@@ -261,6 +333,137 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             state.wait_time_s * 1000.0,
             state.available,
             state.upstream_finished,
+        )
+        emit_runtime_event(
+            "talker_text_summary",
+            request_id=state.observation_request_id or self.request_ids_mapping.get(request_id, request_id),
+            stage="talker",
+            unit="text_rows",
+            inventory=state.available,
+            windows=state.windows,
+            bootstrap_rows=state.bootstrap_rows,
+            enqueued_rows=state.enqueued_rows,
+            consumed_rows=state.consumed_rows,
+            duplicate_rows=state.duplicate_rows,
+            max_credit=state.max_credit,
+            wait_events=state.wait_steps,
+            wait_time_s=state.wait_time_s,
+            upstream_finished=state.upstream_finished,
+        )
+
+    @staticmethod
+    def _int_scalar(value: Any, default: int = 0) -> int:
+        if isinstance(value, torch.Tensor):
+            if value.numel() != 1:
+                return default
+            return int(value.item())
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _register_code2wav_chunk(
+        self,
+        request_id: str,
+        external_request_id: str,
+        payload: Mapping[str, Any],
+    ) -> None:
+        """Register real codec-frame work received by the Code2Wav stage."""
+        if not self._code2wav_work_enabled:
+            return
+        codes = payload.get("codes")
+        audio_codes = codes.get("audio") if isinstance(codes, Mapping) else None
+        if isinstance(audio_codes, torch.Tensor):
+            num_codes = int(audio_codes.numel())
+        elif isinstance(audio_codes, (list, tuple)):
+            num_codes = len(audio_codes)
+        else:
+            return
+        if num_codes <= 0:
+            return
+        if num_codes % 16 != 0:
+            logger.warning(
+                "[Code2WavInventoryTrace] codec count is not divisible by 16 request=%s count=%d",
+                request_id,
+                num_codes,
+            )
+        total_frames = (num_codes + 15) // 16
+        meta = payload.get("meta")
+        left_context_frames = self._int_scalar(meta.get("left_context_size")) if isinstance(meta, Mapping) else 0
+        left_context_frames = max(0, min(total_frames, left_context_frames))
+        new_frames = total_frames - left_context_frames
+
+        state = self._code2wav_work_states.setdefault(request_id, _Code2WavWorkState())
+        state.observation_request_id = resolve_runtime_request_id(
+            external_request_id,
+            payload,
+        )
+        state.pending_chunks.append((total_frames, new_frames))
+        state.pending_total_frames += total_frames
+        state.pending_new_frames += new_frames
+        state.enqueued_chunks += 1
+        state.enqueued_total_frames += total_frames
+        state.enqueued_new_frames += new_frames
+        state.max_pending_total_frames = max(
+            state.max_pending_total_frames,
+            state.pending_total_frames,
+        )
+        emit_runtime_event(
+            "code2wav_codec_enqueue",
+            request_id=state.observation_request_id,
+            stage="code2wav",
+            unit="codec_frames",
+            delta=total_frames,
+            inventory=state.pending_total_frames,
+            new_frames=new_frames,
+            left_context_frames=left_context_frames,
+            pending_new_frames=state.pending_new_frames,
+            pending_chunks=len(state.pending_chunks),
+        )
+
+    def _schedule_code2wav_chunk(self, request_id: str) -> None:
+        if not self._code2wav_work_enabled:
+            return
+        state = self._code2wav_work_states.get(request_id)
+        if state is None or not state.pending_chunks:
+            return
+        total_frames, new_frames = state.pending_chunks.popleft()
+        state.pending_total_frames = max(0, state.pending_total_frames - total_frames)
+        state.pending_new_frames = max(0, state.pending_new_frames - new_frames)
+        state.scheduled_chunks += 1
+        state.scheduled_total_frames += total_frames
+        state.scheduled_new_frames += new_frames
+        emit_runtime_event(
+            "code2wav_codec_schedule",
+            request_id=state.observation_request_id or self.request_ids_mapping.get(request_id, request_id),
+            stage="code2wav",
+            unit="codec_frames",
+            delta=-total_frames,
+            inventory=state.pending_total_frames,
+            new_frames=new_frames,
+            pending_new_frames=state.pending_new_frames,
+            pending_chunks=len(state.pending_chunks),
+        )
+
+    def _log_code2wav_work_summary(self, request_id: str) -> None:
+        state = self._code2wav_work_states.get(request_id)
+        if state is None or state.summary_emitted:
+            return
+        state.summary_emitted = True
+        emit_runtime_event(
+            "code2wav_codec_summary",
+            request_id=state.observation_request_id or self.request_ids_mapping.get(request_id, request_id),
+            stage="code2wav",
+            unit="codec_frames",
+            inventory=state.pending_total_frames,
+            pending_new_frames=state.pending_new_frames,
+            enqueued_chunks=state.enqueued_chunks,
+            scheduled_chunks=state.scheduled_chunks,
+            enqueued_total_frames=state.enqueued_total_frames,
+            enqueued_new_frames=state.enqueued_new_frames,
+            scheduled_total_frames=state.scheduled_total_frames,
+            scheduled_new_frames=state.scheduled_new_frames,
+            max_pending_total_frames=state.max_pending_total_frames,
         )
 
     @staticmethod
@@ -409,6 +612,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 if payload_segment_finished:
                     self.segment_finished_requests.add(req_id)
 
+                self._register_code2wav_chunk(
+                    req_id,
+                    external_req_id,
+                    payload_data,
+                )
                 new_ids = payload_data.get("codes", {}).get("audio")
                 has_tensor_codes = isinstance(new_ids, torch.Tensor)
                 use_tensor_codes = has_tensor_codes and new_ids.ndim >= 2
@@ -554,7 +762,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         Idempotent: calling with an already-cleaned or unknown id is safe.
         """
         self._log_talker_text_credit_summary(request_id)
+        self._log_code2wav_work_summary(request_id)
         getattr(self, "_talker_text_credits", {}).pop(request_id, None)
+        self._code2wav_work_states.pop(request_id, None)
         if request_id in self.finished_requests:
             self._evict_finished_active_streams({request_id})
         else:
@@ -860,6 +1070,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                             int(scheduled_counts.get(req_id, 1)),
                         )
         scheduled_req_ids = self._scheduled_request_ids(scheduler_output)
+        for req_id in scheduled_req_ids:
+            self._schedule_code2wav_chunk(req_id)
         self._clear_chunk_ready(scheduler_output)
         if scheduled_req_ids:
             # Terminal chunks must stay active until they are scheduled once.
@@ -972,7 +1184,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         for req_id in request_ids:
             self._log_talker_text_credit_summary(req_id)
+            self._log_code2wav_work_summary(req_id)
             getattr(self, "_talker_text_credits", {}).pop(req_id, None)
+            self._code2wav_work_states.pop(req_id, None)
             self.requests_with_ready_chunks.discard(req_id)
             self.finished_requests.discard(req_id)
             self._finished_load_reqs.discard(req_id)

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import time
 from collections.abc import Mapping
 from dataclasses import replace
 
@@ -37,6 +38,11 @@ from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
 
 from vllm_omni.outputs import OmniModelRunnerOutput
+from vllm_omni.runtime_observability import (
+    emit_runtime_event,
+    resolve_runtime_request_id,
+    runtime_observability_enabled,
+)
 from vllm_omni.utils.mm_outputs import partition_payload_list
 from vllm_omni.worker.gpu_ar_model_runner import ExecuteModelState, _ensure_tensor_values
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
@@ -108,6 +114,11 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
     ) -> OmniModelRunnerOutput | IntermediateTensors:
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
+
+        released_by_request = getattr(self, "_omni_waveform_samples_released", None)
+        if released_by_request is not None:
+            for req_id in scheduler_output.finished_req_ids:
+                released_by_request.pop(req_id, None)
 
         if self.routed_experts_initialized:
             self.routed_experts_capturer.clear_buffer()
@@ -330,6 +341,8 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
+        observe_runtime = runtime_observability_enabled()
+        model_call_start_ns = time.monotonic_ns() if observe_runtime else 0
         with (
             set_forward_context(
                 attn_metadata,
@@ -355,6 +368,16 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                 model_kwargs=model_kwargs,
                 logits_indices=logits_indices,
             )
+        self._omni_last_generation_call = (
+            (
+                model_call_start_ns,
+                time.monotonic_ns(),
+                list(req_ids[:num_reqs]),
+                list(tokens),
+            )
+            if observe_runtime
+            else None
+        )
 
         _, multimodal_outputs = self.extract_multimodal_outputs(outputs)
         self.execute_model_state = ExecuteModelState(
@@ -472,6 +495,77 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         # [Omni] Copy req_id mappings to avoid async scheduling mutation.
         req_ids_output_copy = self.input_batch.req_ids.copy()
         req_id_to_index_output_copy = self.input_batch.req_id_to_index.copy()
+        generation_call = getattr(self, "_omni_last_generation_call", None)
+        self._omni_last_generation_call = None
+        if generation_call is not None:
+            call_start_ns, call_end_ns, call_req_ids, call_token_counts = generation_call
+            call_duration_ns = max(0, call_end_ns - call_start_ns)
+            for rid, token_count in zip(call_req_ids, call_token_counts, strict=False):
+                request = self.requests.get(rid)
+                request_info = getattr(request, "additional_information_cpu", None)
+                observation_request_id = resolve_runtime_request_id(
+                    self._resolve_external_req_id(request, rid),
+                    request_info,
+                )
+                emit_runtime_event(
+                    "code2wav_model_forward",
+                    request_id=observation_request_id,
+                    stage="code2wav",
+                    unit="nanoseconds",
+                    delta=call_duration_ns,
+                    batch_size=len(call_req_ids),
+                    codec_input_tokens=token_count,
+                    codec_input_frames=token_count // 16,
+                    timing_scope="host_model_call",
+                )
+
+        if runtime_observability_enabled():
+            released_by_request = getattr(
+                self,
+                "_omni_waveform_samples_released",
+                None,
+            )
+            if released_by_request is None:
+                released_by_request = {}
+                self._omni_waveform_samples_released = released_by_request
+            for rid, payload in zip(
+                req_ids_output_copy,
+                per_req_payloads,
+                strict=False,
+            ):
+                waveform = payload.get("model_outputs")
+                if not isinstance(waveform, torch.Tensor):
+                    continue
+                samples = int(waveform.numel())
+                released = int(released_by_request.get(rid, 0)) + samples
+                released_by_request[rid] = released
+                sample_rate_value = payload.get("sr")
+                if isinstance(sample_rate_value, torch.Tensor) and sample_rate_value.numel() == 1:
+                    sample_rate = int(sample_rate_value.item())
+                elif isinstance(sample_rate_value, (int, float)):
+                    sample_rate = int(sample_rate_value)
+                else:
+                    sample_rate = 0
+                request = self.requests.get(rid)
+                request_info = getattr(
+                    request,
+                    "additional_information_cpu",
+                    None,
+                )
+                observation_request_id = resolve_runtime_request_id(
+                    self._resolve_external_req_id(request, rid),
+                    request_info,
+                )
+                emit_runtime_event(
+                    "code2wav_waveform_release",
+                    request_id=observation_request_id,
+                    stage="code2wav",
+                    unit="audio_samples",
+                    delta=samples,
+                    inventory=released,
+                    sample_rate=sample_rate,
+                    audio_duration_ms=(samples * 1000.0 / sample_rate if sample_rate > 0 else None),
+                )
         routed_experts_lists = None
         if self.routed_experts_initialized:
             routed_experts_lists = self._omni_extract_routed_experts(scheduler_output)

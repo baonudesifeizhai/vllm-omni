@@ -20,10 +20,13 @@ See ``--help`` for all options.
 """
 
 import asyncio
+import json
 import logging
 import os
 import time
 import uuid
+from contextlib import suppress
+from pathlib import Path
 from typing import NamedTuple
 
 import numpy as np
@@ -41,6 +44,7 @@ from vllm.multimodal.image import convert_image_mode
 from vllm.multimodal.media.audio import load_audio
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.runtime_observability import emit_runtime_event
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 
 logger = logging.getLogger(__name__)
@@ -229,6 +233,72 @@ async def run_single_request(
     wav_file = os.path.join(output_dir, f"output_{request_id}.wav")
     sf_writer: sf.SoundFile | None = None
     audio_samples_written: int = 0
+    playout_buffer_samples = 0
+    playout_arrived_samples = 0
+    playout_consumed_samples = 0
+    playout_unmet_samples = 0
+    playout_last_ts: float | None = None
+    playout_fractional_samples = 0.0
+
+    def _advance_playout(now: float) -> None:
+        nonlocal playout_buffer_samples
+        nonlocal playout_consumed_samples
+        nonlocal playout_unmet_samples
+        nonlocal playout_last_ts
+        nonlocal playout_fractional_samples
+        if playout_last_ts is None or audio_sr is None or audio_sr <= 0:
+            playout_last_ts = now
+            return
+        elapsed_s = max(0.0, now - playout_last_ts)
+        exact_demand = elapsed_s * audio_sr + playout_fractional_samples
+        demanded_samples = int(exact_demand)
+        playout_fractional_samples = exact_demand - demanded_samples
+        playout_last_ts = now
+        if demanded_samples <= 0:
+            return
+        consumed_samples = min(playout_buffer_samples, demanded_samples)
+        unmet_samples = demanded_samples - consumed_samples
+        playout_buffer_samples -= consumed_samples
+        playout_consumed_samples += consumed_samples
+        playout_unmet_samples += unmet_samples
+        emit_runtime_event(
+            "terminal_playout_advance",
+            request_id=request_id,
+            stage="terminal",
+            unit="audio_samples",
+            delta=-consumed_samples,
+            inventory=playout_buffer_samples,
+            demanded_samples=demanded_samples,
+            consumed_samples=consumed_samples,
+            unmet_samples=unmet_samples,
+            cumulative_unmet_ms=playout_unmet_samples * 1000.0 / audio_sr,
+            playable_buffer_ms=playout_buffer_samples * 1000.0 / audio_sr,
+        )
+
+    def _record_audio_arrival(chunks: list[torch.Tensor], now: float) -> None:
+        nonlocal playout_buffer_samples
+        nonlocal playout_arrived_samples
+        nonlocal playout_last_ts
+        if not chunks or audio_sr is None or audio_sr <= 0:
+            return
+        if playout_last_ts is None:
+            playout_last_ts = now
+        else:
+            _advance_playout(now)
+        arrived_samples = sum(int(chunk.numel()) for chunk in chunks)
+        playout_buffer_samples += arrived_samples
+        playout_arrived_samples += arrived_samples
+        emit_runtime_event(
+            "terminal_audio_arrive",
+            request_id=request_id,
+            stage="terminal",
+            unit="audio_samples",
+            delta=arrived_samples,
+            inventory=playout_buffer_samples,
+            sample_rate=audio_sr,
+            playable_buffer_ms=playout_buffer_samples * 1000.0 / audio_sr,
+            cumulative_arrived_samples=playout_arrived_samples,
+        )
 
     try:
         async for omni_output in async_omni.generate(
@@ -262,6 +332,7 @@ async def run_single_request(
                     else:
                         new_chunks = []
 
+                    _record_audio_arrival(new_chunks, time.perf_counter())
                     if stream_audio_to_disk and new_chunks:
                         if sf_writer is None:
                             sf_writer = sf.SoundFile(
@@ -282,10 +353,38 @@ async def run_single_request(
             sf_writer.close()
 
     t_end = time.perf_counter()
+    if playout_last_ts is not None:
+        _advance_playout(t_end)
+        emit_runtime_event(
+            "terminal_playout_summary",
+            request_id=request_id,
+            stage="terminal",
+            unit="audio_samples",
+            inventory=playout_buffer_samples,
+            arrived_samples=playout_arrived_samples,
+            consumed_samples=playout_consumed_samples,
+            unmet_samples=playout_unmet_samples,
+            sample_rate=audio_sr,
+            playable_buffer_ms=(
+                playout_buffer_samples * 1000.0 / audio_sr if audio_sr is not None and audio_sr > 0 else None
+            ),
+            cumulative_unmet_ms=(
+                playout_unmet_samples * 1000.0 / audio_sr if audio_sr is not None and audio_sr > 0 else None
+            ),
+        )
     result = {
         "request_id": request_id,
         "e2e_latency_s": t_end - t_start,
         "saved_files": [],
+        "playout_buffer_samples": playout_buffer_samples,
+        "playout_unmet_samples": playout_unmet_samples,
+        "playout_buffer_ms": (
+            playout_buffer_samples * 1000.0 / audio_sr if audio_sr is not None and audio_sr > 0 else None
+        ),
+        "playout_unmet_ms": (
+            playout_unmet_samples * 1000.0 / audio_sr if audio_sr is not None and audio_sr > 0 else None
+        ),
+        "stage_0_first_output_s": (stage_0_first_output_ts - t_start if stage_0_first_output_ts is not None else None),
     }
 
     # Save text output
@@ -381,6 +480,7 @@ async def run_all(args):
     # Create AsyncOmni
     print(f"[Info] Creating AsyncOmni with deploy_config={args.deploy_config}")
     async_omni = None
+    runtime_state_trace_task: asyncio.Task | None = None
     try:
         # ``from_cli_args`` forwards only explicitly-passed CLI args so
         # argparse defaults do not silently override deploy YAML values.
@@ -401,6 +501,32 @@ async def run_all(args):
         semaphore = asyncio.Semaphore(args.max_in_flight)
         request_timeout = getattr(args, "request_timeout_s", None)
         stream_audio = getattr(args, "stream_audio_to_disk", False)
+        runtime_state_trace_output = getattr(args, "runtime_state_trace_output", None)
+        runtime_state_trace_interval_ms = max(
+            1.0,
+            float(getattr(args, "runtime_state_trace_interval_ms", 25.0)),
+        )
+        runtime_state_trace: list[dict] = []
+        runtime_state_trace_stop = asyncio.Event()
+
+        async def _sample_runtime_state() -> None:
+            while not runtime_state_trace_stop.is_set():
+                runtime_state_trace.append(
+                    {
+                        "sample_monotonic_ns": time.monotonic_ns(),
+                        "state": async_omni.get_runtime_state_snapshot(),
+                    }
+                )
+                try:
+                    await asyncio.wait_for(
+                        runtime_state_trace_stop.wait(),
+                        timeout=runtime_state_trace_interval_ms / 1000.0,
+                    )
+                except TimeoutError:
+                    pass
+
+        if runtime_state_trace_output:
+            runtime_state_trace_task = asyncio.create_task(_sample_runtime_state())
 
         async def _run_one(idx: int, prompt: dict):
             async with semaphore:
@@ -422,6 +548,56 @@ async def run_all(args):
         tasks = [_run_one(i, p) for i, p in enumerate(prompts)]
         all_results = await asyncio.gather(*tasks, return_exceptions=True)
         wall_end = time.perf_counter()
+        # Runtime events are received on a background localhost collector.
+        # This post-measurement grace period does not affect reported wall
+        # time; it only lets the final state events reach the reducer.
+        await asyncio.sleep(0.05)
+        runtime_state = async_omni.get_runtime_state_snapshot()
+        if runtime_state_trace_task is not None:
+            runtime_state_trace_stop.set()
+            await runtime_state_trace_task
+            runtime_state_trace_task = None
+            runtime_state_trace.append(
+                {
+                    "sample_monotonic_ns": time.monotonic_ns(),
+                    "state": runtime_state,
+                }
+            )
+            trace_path = Path(runtime_state_trace_output)
+            trace_path.parent.mkdir(parents=True, exist_ok=True)
+            trace_path.write_text(
+                "".join(
+                    json.dumps(record, separators=(",", ":"), sort_keys=True) + "\n" for record in runtime_state_trace
+                ),
+                encoding="utf-8",
+            )
+        runtime_state_output = getattr(args, "runtime_state_output", None)
+        if runtime_state_output:
+            state_path = Path(runtime_state_output)
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            state_path.write_text(
+                json.dumps(runtime_state, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+        results_output = getattr(args, "results_output", None)
+        if results_output:
+            results_path = Path(results_output)
+            results_path.parent.mkdir(parents=True, exist_ok=True)
+            serializable_results = [
+                (
+                    {
+                        "error_type": type(result).__name__,
+                        "error": str(result),
+                    }
+                    if isinstance(result, Exception)
+                    else result
+                )
+                for result in all_results
+            ]
+            results_path.write_text(
+                json.dumps(serializable_results, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
 
         # Print summary
         print("\n" + "=" * 60)
@@ -435,15 +611,43 @@ async def run_all(args):
             else:
                 success_count += 1
                 total_audio_dur += r.get("audio_duration_s", 0.0)
-                print(f"  [{r['request_id']}] e2e={r['e2e_latency_s']:.3f}s  files={r['saved_files']}")
+                ttfa = r.get("time_to_first_audio_s")
+                unmet_ms = r.get("playout_unmet_ms")
+                ttfa_text = f"{ttfa:.3f}s" if ttfa is not None else "N/A"
+                unmet_text = f"{unmet_ms:.3f}ms" if unmet_ms is not None else "N/A"
+                print(
+                    f"  [{r['request_id']}] "
+                    f"e2e={r['e2e_latency_s']:.3f}s "
+                    f"ttfa={ttfa_text} "
+                    f"playout_unmet={unmet_text} "
+                    f"files={r['saved_files']}"
+                )
         wall_time = wall_end - wall_start
         print(f"\nTotal: {success_count}/{len(prompts)} succeeded")
         print(f"Wall time: {wall_time:.3f}s")
         if total_audio_dur > 0:
             print(f"Total audio duration: {total_audio_dur:.2f}s")
             print(f"Real-time factor: {total_audio_dur / wall_time:.2f}x")
+        for request_id, state in runtime_state.get("requests", {}).items():
+            playout = state["playout"]
+            policy = state.get("policy", {})
+            print(
+                f"Runtime state [{request_id}]: "
+                f"talker_credit={state['talker']['fifo_credit_rows']} "
+                f"code2wav_pending={state['code2wav']['pending_new_frames']} "
+                f"buffer_ms={playout['playable_buffer_ms']:.3f} "
+                f"slack_ms={playout['deadline_slack_ms']:.3f} "
+                f"valid={state['transport_valid']} "
+                f"policy_k={policy.get('applied_k')} "
+                f"k_histogram={policy.get('k_histogram', {})} "
+                f"policy_fallbacks={policy.get('fallback_decisions', 0)}"
+            )
         print("=" * 60)
     finally:
+        if runtime_state_trace_task is not None:
+            runtime_state_trace_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await runtime_state_trace_task
         if async_omni is not None:
             async_omni.shutdown()
 
@@ -498,6 +702,15 @@ def parse_args():
         help="Timeout for initializing a single stage (seconds).",
     )
     parser.add_argument(
+        "--init-timeout",
+        type=int,
+        default=600,
+        help=(
+            "Total timeout for all stages and the orchestrator to become "
+            "ready (seconds). This is distinct from --stage-init-timeout."
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
         type=str,
         default="output_audio_async_chunk",
@@ -550,6 +763,30 @@ def parse_args():
             "accumulating in memory. Useful for very long audio or "
             "high --max-in-flight to reduce memory footprint."
         ),
+    )
+    parser.add_argument(
+        "--runtime-state-output",
+        type=str,
+        default=None,
+        help="Optional path for the final live runtime-state snapshot JSON.",
+    )
+    parser.add_argument(
+        "--results-output",
+        type=str,
+        default=None,
+        help="Optional JSON path for per-request latency and playout results.",
+    )
+    parser.add_argument(
+        "--runtime-state-trace-output",
+        type=str,
+        default=None,
+        help="Optional JSONL path for periodically sampled live request state.",
+    )
+    parser.add_argument(
+        "--runtime-state-trace-interval-ms",
+        type=float,
+        default=25.0,
+        help="Live runtime-state sampling interval in milliseconds.",
     )
     parser.add_argument(
         "--modalities",

@@ -11,6 +11,10 @@ from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.request import RequestStatus
 
 from vllm_omni.core.sched.output import OmniChunkRecvHandle, OmniSchedulerOutput
+from vllm_omni.runtime_observability import (
+    emit_runtime_event,
+    runtime_observability_enabled,
+)
 
 logger = init_logger(__name__)
 
@@ -39,6 +43,42 @@ except ValueError:
 
 class OmniSchedulerMixin:
     """Shared scheduler helpers for omni-specific request handling."""
+
+    def _mark_runtime_action(self, scheduler_output: SchedulerOutput) -> None:
+        """Mark one scheduled batch for stage-level round-trip timing."""
+        if not runtime_observability_enabled() or not scheduler_output.num_scheduled_tokens:
+            return
+        sequence = int(getattr(self, "_runtime_action_sequence", 0)) + 1
+        self._runtime_action_sequence = sequence
+        scheduler_output.runtime_action_id = sequence
+        scheduler_output.runtime_action_start_ns = time.monotonic_ns()
+
+    def _emit_runtime_action_complete(
+        self,
+        scheduler_output: SchedulerOutput,
+    ) -> None:
+        """Emit scheduler-dispatch to output-return latency for one stage."""
+        action_id = int(getattr(scheduler_output, "runtime_action_id", -1))
+        started_ns = int(getattr(scheduler_output, "runtime_action_start_ns", 0) or 0)
+        if action_id < 0 or started_ns <= 0:
+            return
+        model_config = self.vllm_config.model_config
+        stage_id = int(getattr(model_config, "stage_id", -1) or -1)
+        stage = str(getattr(model_config, "model_stage", None) or f"stage_{stage_id}")
+        action_wall_ns = max(0, time.monotonic_ns() - started_ns)
+        request_ids = list(scheduler_output.num_scheduled_tokens)
+        emit_runtime_event(
+            "omni_stage_action_complete",
+            request_id=(request_ids[0] if request_ids else "__stage_batch__"),
+            stage=stage,
+            stage_id=stage_id,
+            unit="nanoseconds",
+            delta=action_wall_ns,
+            action_id=action_id,
+            batch_size=len(request_ids),
+            scheduled_tokens=sum(scheduler_output.num_scheduled_tokens.values()),
+            action_wall_ms=action_wall_ns / 1_000_000.0,
+        )
 
     def _free_input_coordinator_request(self, request_id: str) -> None:
         """Prune full-payload coordinator state for a completed request."""
@@ -149,6 +189,37 @@ class OmniSchedulerMixin:
             **base_data,
             finished_requests_needing_kv_transfer=finished_requests_needing_kv_transfer or {},
             pending_input_registrations=pending_input_registrations,
+            num_spec_tokens_to_schedule_by_request=getattr(
+                base,
+                "num_spec_tokens_to_schedule_by_request",
+                {},
+            ),
+            runtime_action_id=getattr(base, "runtime_action_id", -1),
+            runtime_action_start_ns=getattr(
+                base,
+                "runtime_action_start_ns",
+                0,
+            ),
+            speculative_action_id=getattr(
+                base,
+                "speculative_action_id",
+                -1,
+            ),
+            speculative_action_start_ns=getattr(
+                base,
+                "speculative_action_start_ns",
+                0,
+            ),
+            speculative_verify_k_by_request=getattr(
+                base,
+                "speculative_verify_k_by_request",
+                {},
+            ),
+            speculative_proposal_k_by_request=getattr(
+                base,
+                "speculative_proposal_k_by_request",
+                {},
+            ),
         )
 
     def make_stats(self, *args, **kwargs) -> SchedulerStats | None:

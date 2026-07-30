@@ -94,3 +94,24 @@ class OmniSchedulerOutput(SchedulerOutput):
 
     finished_requests_needing_kv_transfer: dict[str, dict] = field(default_factory=dict)
     pending_input_registrations: list[OmniChunkRecvHandle] = field(default_factory=list)
+    # The upstream scheduler exposes only one speculative depth for the whole
+    # batch.  Omni's runtime policy is request-scoped, so carry the ragged
+    # depths to the DSpark proposer explicitly.  The scalar inherited from
+    # SchedulerOutput remains the maximum depth in this batch and therefore
+    # still sizes the rectangular output buffers used by vLLM.
+    num_spec_tokens_to_schedule_by_request: dict[str, int] = field(default_factory=dict)
+    # Observation-only scheduler round-trip marker shared by every stage.
+    # Unlike the speculative fields below, this also covers Talker and
+    # Code2Wav so shared-device blocking can be measured without synchronizing
+    # CUDA inside the model runner.
+    runtime_action_id: int = -1
+    runtime_action_start_ns: int = 0
+    # Observation-only identifiers for one scheduler -> model runner ->
+    # scheduler round trip.  ``verify_k`` describes draft tokens consumed by
+    # this call, while ``proposal_k`` describes drafts produced for the next
+    # call; both are needed to measure a depth transition without shifting it
+    # by one decoding step.
+    speculative_action_id: int = -1
+    speculative_action_start_ns: int = 0
+    speculative_verify_k_by_request: dict[str, int] = field(default_factory=dict)
+    speculative_proposal_k_by_request: dict[str, int] = field(default_factory=dict)

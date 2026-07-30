@@ -27,6 +27,11 @@ from vllm_omni.metrics.stats import OrchestratorAggregator
 from vllm_omni.metrics.transfer import OmniTransferMetrics
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.runtime_state import (
+    RuntimeStateCollector,
+    acquire_runtime_state_collector,
+    release_runtime_state_collector,
+)
 from vllm_omni.utils.tracking_parser import TrackingNamespace
 
 logger = init_logger(__name__)
@@ -49,12 +54,16 @@ class OmniEngineDeadError(EngineDeadError):
         self.error_stage_id = error_stage_id
 
 
-def _weak_shutdown_engine(engine: AsyncOmniEngine) -> None:
+def _weak_shutdown_engine(
+    engine: AsyncOmniEngine,
+    runtime_state_collector: RuntimeStateCollector | None,
+) -> None:
     """Best-effort engine cleanup for GC finalization."""
     try:
         engine.shutdown()
     except Exception:
         pass
+    release_runtime_state_collector(runtime_state_collector)
 
 
 def omni_snapshot_download(model_id: str) -> str:
@@ -165,22 +174,36 @@ class OmniBase(PDDisaggregationMixin):
         self.tts_batch_max_items: int = kwargs.pop("tts_batch_max_items", 32)
 
         logger.info("[%s] Initializing with model %s", self.__class__.__name__, model)
+        # Start the collector before stage workers so they inherit its local
+        # endpoint. It is absent unless observability, live state, or the
+        # runtime policy is explicitly enabled.
+        self.runtime_state_collector = acquire_runtime_state_collector()
         # Construct transfer_metrics first so we can hand it to AsyncOmniEngine
         # (which forwards it to the Orchestrator background thread for
         # TX-side emit; see Orchestrator._forward_to_next_stage).
         self.transfer_metrics = OmniTransferMetrics(model_name=model, log_stats=log_stats)
         st = time.time()
-        self.engine = AsyncOmniEngine(
-            model=model,
-            init_timeout=init_timeout,
-            stage_init_timeout=stage_init_timeout,
-            diffusion_batch_size=diffusion_batch_size,
-            transfer_emitter=self.transfer_metrics,
-            log_stats=log_stats,
-            **kwargs,
-        )
+        try:
+            self.engine = AsyncOmniEngine(
+                model=model,
+                init_timeout=init_timeout,
+                stage_init_timeout=stage_init_timeout,
+                diffusion_batch_size=diffusion_batch_size,
+                transfer_emitter=self.transfer_metrics,
+                log_stats=log_stats,
+                **kwargs,
+            )
+        except Exception:
+            release_runtime_state_collector(self.runtime_state_collector)
+            self.runtime_state_collector = None
+            raise
         self._shutdown_called = False
-        self._weak_finalizer = weakref.finalize(self, _weak_shutdown_engine, self.engine)
+        self._weak_finalizer = weakref.finalize(
+            self,
+            _weak_shutdown_engine,
+            self.engine,
+            self.runtime_state_collector,
+        )
         et = time.time()
         logger.info("[%s] AsyncOmniEngine initialized in %.2f seconds", self.__class__.__name__, et - st)
         # Authoritative: ``AsyncOmniEngine`` resolves (pipeline + deploy YAML +
@@ -626,6 +649,22 @@ class OmniBase(PDDisaggregationMixin):
     def close(self) -> None:
         self.shutdown()
 
+    def get_runtime_state_snapshot(
+        self,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Return the latest observation-only state for one or all requests."""
+        collector = getattr(self, "runtime_state_collector", None)
+        if collector is None:
+            return {
+                "transport": {
+                    "valid": False,
+                    "reason": "runtime observability is disabled",
+                },
+                "requests": {},
+            }
+        return collector.snapshot(request_id)
+
     def start_profile(
         self,
         profile_prefix: str | None = None,
@@ -664,4 +703,9 @@ class OmniBase(PDDisaggregationMixin):
         finalizer = getattr(self, "_weak_finalizer", None)
         if finalizer is not None and finalizer.alive:
             finalizer.detach()
-        self.engine.shutdown()
+        try:
+            self.engine.shutdown()
+        finally:
+            collector = getattr(self, "runtime_state_collector", None)
+            release_runtime_state_collector(collector)
+            self.runtime_state_collector = None

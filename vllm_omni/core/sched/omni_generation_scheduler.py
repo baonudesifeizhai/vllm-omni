@@ -220,6 +220,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 res = super().schedule(throttle_prefills)
                 if self.input_coordinator:
                     self.input_coordinator.restore_queues(self.waiting, self.running)
+                self._mark_runtime_action(res)
                 return self._wrap_omni_scheduler_output(res)
 
         # Compute common prefix blocks (aligned with v1)
@@ -348,6 +349,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             if self.input_coordinator:
                 self.input_coordinator.restore_queues(self.waiting, self.running)
 
+        self._mark_runtime_action(scheduler_output)
         return self._wrap_omni_scheduler_output(scheduler_output)
 
     def finish_requests(self, request_ids, finished_status: RequestStatus) -> list[tuple[str, int]]:
@@ -425,6 +427,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         kv_connector_output = model_runner_output.kv_connector_output
 
         cudagraph_stats: CUDAGraphStat | None = model_runner_output.cudagraph_stats
+        self._emit_runtime_action_complete(scheduler_output)
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
             perf_stats = self.perf_metrics.get_step_perf_stats_per_gpu(scheduler_output)

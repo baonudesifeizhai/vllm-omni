@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import asdict, dataclass
-from time import time
+from time import monotonic_ns, time
 from typing import Any
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
@@ -32,6 +32,14 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapt
 from vllm_omni.engine import OmniEngineCoreOutput
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.outputs import OmniConnectorOutput
+from vllm_omni.runtime_observability import (
+    emit_runtime_event,
+    runtime_observability_enabled,
+)
+from vllm_omni.runtime_policy import (
+    RuntimePolicyClient,
+    runtime_policy_enabled,
+)
 
 logger = init_logger(__name__)
 
@@ -94,6 +102,16 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._latest_omni_connector_output: OmniConnectorOutput | None = None
         # Snapshot prompt length for each streaming input update
         self._new_prompt_len_snapshot: dict[str, int] = {}
+        stage_id = int(getattr(model_config, "stage_id", 0) or 0)
+        self.runtime_policy_client = (
+            RuntimePolicyClient.from_env()
+            if runtime_policy_enabled() and stage_id == 0 and int(getattr(self, "num_spec_tokens", 0) or 0) > 0
+            else None
+        )
+        self._speculative_action_trace_enabled = (
+            runtime_observability_enabled() and stage_id == 0 and int(getattr(self, "num_spec_tokens", 0) or 0) > 0
+        )
+        self._speculative_action_sequence = 0
 
     def _get_confirmed_num_computed_tokens(self, request: Request) -> int:
         """num_computed_tokens minus async placeholders (KV actually on GPU)."""
@@ -136,6 +154,237 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     def _should_defer_waiting_admission(self) -> bool:
         return False
+
+    def _apply_runtime_speculative_policy(
+        self,
+        scheduler_output: SchedulerOutput,
+    ) -> None:
+        client = self.runtime_policy_client
+        if client is None or not scheduler_output.num_scheduled_tokens:
+            return
+
+        requests: list[dict[str, Any]] = []
+        for request_id in scheduler_output.num_scheduled_tokens:
+            request = self.requests.get(request_id)
+            if request is None:
+                continue
+            requests.append(
+                {
+                    "request_id": request_id,
+                    "downstream_active": (not self._request_omits_kv_transfer_to_next_stage(request)),
+                }
+            )
+        if not requests:
+            return
+
+        maximum_k = int(getattr(self, "num_spec_tokens", 0) or 0)
+        decision = client.decide(
+            requests=requests,
+            maximum_k=maximum_k,
+        )
+        per_request = {
+            str(item.get("request_id")): item for item in decision.get("per_request", []) if isinstance(item, dict)
+        }
+        request_depths = {
+            str(request["request_id"]): max(
+                1,
+                min(
+                    int(
+                        per_request.get(str(request["request_id"]), {}).get(
+                            "k",
+                            decision.get("batch_k", 1),
+                        )
+                    ),
+                    maximum_k,
+                ),
+            )
+            for request in requests
+        }
+        proposal_k = max(request_depths.values(), default=1)
+        # vLLM's public scalar continues to size proposer output buffers.  The
+        # Omni output carries the real per-request depths to the ragged DSpark
+        # proposer and back to the scheduler when draft rows are committed.
+        scheduler_output.num_spec_tokens_to_schedule = proposal_k
+        scheduler_output.num_spec_tokens_to_schedule_by_request = request_depths
+
+        for request in requests:
+            request_id = str(request["request_id"])
+            request_decision = per_request.get(request_id, {})
+            desired_k = request_depths[request_id]
+            emit_runtime_event(
+                "speculative_depth_decision",
+                request_id=request_id,
+                stage="thinker",
+                unit="scheduler_step",
+                delta=1,
+                inventory=desired_k,
+                desired_k=desired_k,
+                proposal_batch_k=proposal_k,
+                policy_reason=str(
+                    request_decision.get(
+                        "reason",
+                        decision.get("reason", "unknown"),
+                    )
+                ),
+                batch_reason=str(decision.get("reason", "unknown")),
+                batch_size=len(requests),
+                maximum_k=maximum_k,
+                fallback=bool(decision.get("fallback", False)),
+                query_latency_us=float(decision.get("query_latency_us", 0.0) or 0.0),
+                deadline_slack_ms=request_decision.get("deadline_slack_ms"),
+                playable_buffer_ms=request_decision.get("playable_buffer_ms"),
+                fifo_credit_rows=request_decision.get("fifo_credit_rows"),
+                code2wav_pending_frames=request_decision.get("code2wav_pending_frames"),
+                raw_k=request_decision.get("raw_k"),
+                candidate_k=request_decision.get("candidate_k"),
+                residency_steps=request_decision.get("residency_steps"),
+                held_by=request_decision.get("held_by"),
+                cost_adjusted=request_decision.get("cost_adjusted"),
+                estimated_current_call_saved_ms=request_decision.get("estimated_current_call_saved_ms"),
+                estimated_extra_call_cost_ms=request_decision.get("estimated_extra_call_cost_ms"),
+            )
+
+    def _update_after_schedule(
+        self,
+        scheduler_output: SchedulerOutput,
+    ) -> None:
+        self._apply_runtime_speculative_policy(scheduler_output)
+        self._mark_runtime_action(scheduler_output)
+        if self._speculative_action_trace_enabled and scheduler_output.num_scheduled_tokens:
+            self._speculative_action_sequence += 1
+            scheduler_output.speculative_action_id = self._speculative_action_sequence
+            scheduler_output.speculative_action_start_ns = monotonic_ns()
+            scheduler_output.speculative_verify_k_by_request = {
+                request_id: len(
+                    scheduler_output.scheduled_spec_decode_tokens.get(
+                        request_id,
+                        (),
+                    )
+                )
+                for request_id in scheduler_output.num_scheduled_tokens
+            }
+            configured_depths = getattr(
+                scheduler_output,
+                "num_spec_tokens_to_schedule_by_request",
+                {},
+            )
+            scalar_depth = int(
+                getattr(
+                    scheduler_output,
+                    "num_spec_tokens_to_schedule",
+                    0,
+                )
+                or 0
+            )
+            scheduler_output.speculative_proposal_k_by_request = {
+                request_id: int(configured_depths.get(request_id, scalar_depth))
+                for request_id in scheduler_output.num_scheduled_tokens
+            }
+        super()._update_after_schedule(scheduler_output)
+
+    @staticmethod
+    def _depth_histogram(depths: list[int]) -> dict[str, int]:
+        histogram: dict[str, int] = {}
+        for depth in depths:
+            key = str(int(depth))
+            histogram[key] = histogram.get(key, 0) + 1
+        return histogram
+
+    def _emit_speculative_action_complete(
+        self,
+        scheduler_output: SchedulerOutput,
+        model_runner_output: ModelRunnerOutput,
+    ) -> None:
+        """Record one complete target verification + next-draft action.
+
+        This is deliberately measured at the scheduler boundary.  CUDA model
+        calls enqueue asynchronously, whereas this interval ends only after
+        sampled/verified token IDs have returned to the scheduler.  It is the
+        useful wall-clock cost a scheduling policy actually pays.
+        """
+        if not self._speculative_action_trace_enabled:
+            return
+        action_id = int(getattr(scheduler_output, "speculative_action_id", -1) or -1)
+        started_ns = int(
+            getattr(
+                scheduler_output,
+                "speculative_action_start_ns",
+                0,
+            )
+            or 0
+        )
+        if action_id < 0 or started_ns <= 0:
+            return
+
+        verify_depths = getattr(
+            scheduler_output,
+            "speculative_verify_k_by_request",
+            {},
+        )
+        proposal_depths = getattr(
+            scheduler_output,
+            "speculative_proposal_k_by_request",
+            {},
+        )
+        sampled_token_ids = model_runner_output.sampled_token_ids or []
+        per_request_verify_k: list[int] = []
+        per_request_proposal_k: list[int] = []
+        accepted_lengths: list[int] = []
+        released_lengths: list[int] = []
+        drafted_tokens = 0
+        accepted_draft_tokens = 0
+        released_tokens = 0
+        transition_requests = 0
+        decode_requests = 0
+        event_request_id = "__speculative_batch__"
+
+        for request_id in scheduler_output.num_scheduled_tokens:
+            output_index = model_runner_output.req_id_to_index.get(request_id)
+            if output_index is None:
+                continue
+            verify_k = max(0, int(verify_depths.get(request_id, 0) or 0))
+            proposal_k = max(
+                0,
+                int(proposal_depths.get(request_id, 0) or 0),
+            )
+            generated = sampled_token_ids[output_index] if output_index < len(sampled_token_ids) else []
+            released = len(generated)
+            accepted = min(verify_k, max(0, released - 1))
+            per_request_verify_k.append(verify_k)
+            per_request_proposal_k.append(proposal_k)
+            if verify_k > 0:
+                decode_requests += 1
+                drafted_tokens += verify_k
+                accepted_draft_tokens += accepted
+                released_tokens += released
+                accepted_lengths.append(accepted)
+                released_lengths.append(released)
+                transition_requests += int(verify_k != proposal_k)
+            if event_request_id == "__speculative_batch__":
+                event_request_id = request_id
+
+        action_wall_ns = max(0, monotonic_ns() - started_ns)
+        emit_runtime_event(
+            "speculative_action_complete",
+            request_id=event_request_id,
+            stage="thinker",
+            unit="nanoseconds",
+            delta=action_wall_ns,
+            action_id=action_id,
+            batch_size=len(per_request_verify_k),
+            decode_requests=decode_requests,
+            scheduled_tokens=sum(scheduler_output.num_scheduled_tokens.values()),
+            verify_k_histogram=self._depth_histogram(per_request_verify_k),
+            proposal_k_histogram=self._depth_histogram(per_request_proposal_k),
+            accepted_length_histogram=self._depth_histogram(accepted_lengths),
+            released_length_histogram=self._depth_histogram(released_lengths),
+            drafted_tokens=drafted_tokens,
+            accepted_draft_tokens=accepted_draft_tokens,
+            released_tokens=released_tokens,
+            transition_requests=transition_requests,
+            steady_requests=max(0, decode_requests - transition_requests),
+            action_wall_ms=action_wall_ns / 1_000_000.0,
+        )
 
     def _process_kv_transfer_trigger(self, request: Request, new_token_ids: list[int]) -> bool:
         """
@@ -307,6 +556,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats: CUDAGraphStat | None = model_runner_output.cudagraph_stats
+
+        self._emit_runtime_action_complete(scheduler_output)
+        self._emit_speculative_action_complete(
+            scheduler_output,
+            model_runner_output,
+        )
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():

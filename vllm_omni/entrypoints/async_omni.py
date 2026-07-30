@@ -38,6 +38,7 @@ from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.runtime_observability import emit_runtime_event
 
 if TYPE_CHECKING:
     from vllm.inputs.preprocess import InputPreprocessor
@@ -309,6 +310,12 @@ class AsyncOmni(EngineClient, OmniBase):
         # only for internal tracking throughout the request's life.
         external_request_id = request_id
         request_id = self._get_unique_request_id(external_request_id)
+        emit_runtime_event(
+            "request_id_map",
+            request_id=external_request_id or request_id,
+            stage="client",
+            internal_request_id=request_id,
+        )
 
         # Wait until generation is resumed if the engine is paused
         async with self._pause_cond:

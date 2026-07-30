@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import gc
 import threading
+import time
 from collections.abc import Callable, Sequence
 from contextlib import nullcontext
 from copy import copy
@@ -24,7 +25,11 @@ from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.outputs import AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
+from vllm.v1.outputs import (
+    AsyncModelRunnerOutput,
+    DraftTokenIds,
+    make_empty_encoder_model_runner_output,
+)
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
@@ -43,6 +48,11 @@ from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.outputs import OmniModelRunnerOutput
+from vllm_omni.runtime_observability import (
+    emit_runtime_event,
+    resolve_runtime_request_id,
+    runtime_observability_enabled,
+)
 from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
@@ -1252,6 +1262,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
+        observe_runtime = runtime_observability_enabled()
+        model_call_start_ns = time.monotonic_ns() if observe_runtime else 0
         try:
             with (
                 nullcontext(),
@@ -1289,6 +1301,28 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         finally:
             if runner_assisted_context_enabled:
                 self._set_runner_assisted_full_attention_metadata_context(enabled=False)
+        if observe_runtime:
+            model_call_duration_ns = max(
+                0,
+                time.monotonic_ns() - model_call_start_ns,
+            )
+            model_stage = str(getattr(self.model_config, "model_stage", None) or "ar")
+            for rid, token_count in zip(
+                req_ids[:num_reqs],
+                tokens,
+                strict=False,
+            ):
+                emit_runtime_event(
+                    "ar_model_forward",
+                    request_id=self._resolve_global_request_id(rid),
+                    stage=model_stage,
+                    unit="nanoseconds",
+                    delta=model_call_duration_ns,
+                    batch_size=num_reqs,
+                    scheduled_tokens=token_count,
+                    timing_scope="host_model_call",
+                    speculative=bool(self.speculative_config is not None),
+                )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -1958,6 +1992,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
+            self._configure_ragged_speculative_depths(
+                scheduler_output,
+                spec_decode_common_attn_metadata.batch_size(),
+            )
             with record_function_or_nullcontext("gpu_model_runner: draft"):
                 self._draft_token_ids = self.propose_draft_token_ids(
                     scheduler_output,
@@ -2149,15 +2187,53 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
     def _resolve_global_request_id(self, req_id: str) -> str:
         """Resolve global request ID from request state."""
         req_state = self.requests.get(req_id)
-        if not req_state:
-            return req_id
-
         add_info = self.model_intermediate_buffer.get(req_id, {})
-        global_id = add_info.get("global_request_id")
-        if global_id:
-            if isinstance(global_id, list) and global_id:
-                global_id = global_id[0]
-            if isinstance(global_id, bytes):
-                return global_id.decode("utf-8")
-            return str(global_id)
-        return req_id
+        request_info = getattr(req_state, "additional_information_cpu", None)
+        fallback = self._resolve_external_req_id(req_state, req_id)
+        return resolve_runtime_request_id(
+            fallback,
+            add_info,
+            request_info,
+        )
+
+    def _configure_ragged_speculative_depths(
+        self,
+        scheduler_output: SchedulerOutput,
+        batch_size: int,
+    ) -> None:
+        """Pass scheduler-selected request depths to an Omni DSpark drafter."""
+        setter = getattr(self.drafter, "set_request_depths", None)
+        if not callable(setter):
+            self._omni_draft_depths_by_request = {}
+            return
+
+        scalar_k = int(scheduler_output.num_spec_tokens_to_schedule)
+        requested = getattr(
+            scheduler_output,
+            "num_spec_tokens_to_schedule_by_request",
+            {},
+        )
+        req_ids = self.input_batch.req_ids[:batch_size]
+        depths = [max(1, min(int(requested.get(req_id, scalar_k)), scalar_k)) for req_id in req_ids]
+        setter(depths)
+        self._omni_draft_depths_by_request = dict(zip(req_ids, depths, strict=True))
+
+    def take_draft_token_ids(self) -> DraftTokenIds | None:
+        """Return only the request-specific number of computed DSpark rows."""
+        output = super().take_draft_token_ids()
+        if output is None:
+            return None
+        depths = getattr(self, "_omni_draft_depths_by_request", {})
+        if not depths:
+            return output
+        return DraftTokenIds(
+            req_ids=output.req_ids,
+            draft_token_ids=[
+                token_ids[: depths.get(req_id, len(token_ids))]
+                for req_id, token_ids in zip(
+                    output.req_ids,
+                    output.draft_token_ids,
+                    strict=True,
+                )
+            ],
+        )

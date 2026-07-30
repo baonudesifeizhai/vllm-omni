@@ -30,6 +30,7 @@ from vllm_omni.model_executor.stage_input_processors.tts_utils import (
     extract_speaker_from_prompt,
     extract_speaker_from_request,
 )
+from vllm_omni.runtime_observability import emit_runtime_event
 
 logger = logging.getLogger(__name__)
 
@@ -871,6 +872,14 @@ def talker2code2wav_async_chunk(
         )
     trace_state.last_frame_ts = now
     trace_state.frame_count += new_frames
+    emit_runtime_event(
+        "talker_codec_produce",
+        request_id=request_id,
+        stage="talker",
+        unit="codec_frames",
+        delta=new_frames,
+        inventory=trace_state.frame_count,
+    )
 
     chunk_id = transfer_manager.put_req_chunk[request_id]
     transfer_manager.code_prompt_token_ids[request_id].append(code_predictor_codes)
@@ -906,6 +915,19 @@ def talker2code2wav_async_chunk(
             finished=torch.tensor(is_finished, dtype=torch.bool),
         ),
         request_id=request_id,
+    )
+    emit_runtime_event(
+        "talker_codec_chunk_release",
+        request_id=request_id,
+        stage="talker_to_code2wav",
+        unit="codec_frames",
+        delta=context_length,
+        inventory=trace_state.frame_count,
+        total_frames=context_length + left_context_size,
+        new_frames=context_length,
+        left_context_frames=left_context_size,
+        chunk_id=chunk_id,
+        finished=is_finished,
     )
     if is_finished:
         _finish_talker_trace()
