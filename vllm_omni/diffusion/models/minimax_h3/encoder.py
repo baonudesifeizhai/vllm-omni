@@ -50,13 +50,6 @@ MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER = 50
 MINIMAX_H3_QWEN3VL_HIDDEN_DIM = 5120
 
 MINIMAX_H3_TEXT_ENCODER_QUANT_MAPPER = WeightsMapper(
-    orig_to_new_substr={
-        ".self_attn.q_proj": ".self_attn.qkv_proj",
-        ".self_attn.k_proj": ".self_attn.qkv_proj",
-        ".self_attn.v_proj": ".self_attn.qkv_proj",
-        ".mlp.gate_proj": ".mlp.gate_up_proj",
-        ".mlp.up_proj": ".mlp.gate_up_proj",
-    },
     orig_to_new_prefix={"model.language_model": "text_model"},
 )
 
