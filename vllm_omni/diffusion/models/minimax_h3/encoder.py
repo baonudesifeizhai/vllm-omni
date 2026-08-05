@@ -38,11 +38,27 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from vllm.logger import init_logger
+from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.models.utils import WeightsMapper
+
+from vllm_omni.quantization import build_quant_config
 
 from vllm_omni.diffusion.layers.norm import RMSNorm as DiffusionRMSNorm
 
 MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER = 50
 MINIMAX_H3_QWEN3VL_HIDDEN_DIM = 5120
+
+MINIMAX_H3_TEXT_ENCODER_QUANT_MAPPER = WeightsMapper(
+    orig_to_new_substr={
+        ".self_attn.q_proj": ".self_attn.qkv_proj",
+        ".self_attn.k_proj": ".self_attn.qkv_proj",
+        ".self_attn.v_proj": ".self_attn.qkv_proj",
+        ".mlp.gate_proj": ".mlp.gate_up_proj",
+        ".mlp.up_proj": ".mlp.gate_up_proj",
+    },
+    orig_to_new_prefix={"model.language_model": "text_model"},
+)
 
 logger = init_logger(__name__)
 
@@ -114,7 +130,7 @@ class MiniMaxH3Qwen3VLVocabParallelEmbedding(nn.Module):
         param.data.copy_(loaded_weight.narrow(0, start_idx, shard_size))
 
 
-class MiniMaxH3Qwen3VLMergedColumnParallelLinear(nn.Module):
+class MiniMaxH3Qwen3VLMergedColumnParallelLinear(LinearBase):
     """Packed gate/up projection sharded along the output dimension."""
 
     def __init__(
@@ -123,36 +139,72 @@ class MiniMaxH3Qwen3VLMergedColumnParallelLinear(nn.Module):
         input_size: int,
         intermediate_size: int,
         dtype: torch.dtype,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ) -> None:
-        super().__init__()
         self.group = group
-        self.input_size = input_size
         self.intermediate_size = intermediate_size
         tp_rank, tp_size = _tp_range(group)
         assert intermediate_size % tp_size == 0, (
             f"intermediate_size {intermediate_size} must be divisible by text_encoder_tp_size {tp_size}"
         )
         self.intermediate_size_per_partition = intermediate_size // tp_size
-        self.weight = nn.Parameter(torch.empty(2 * self.intermediate_size_per_partition, input_size, dtype=dtype))
-        self.weight.weight_loader = self.weight_loader  # type: ignore[attr-defined]
         self._tp_rank = tp_rank
         self._tp_size = tp_size
+        super().__init__(
+            input_size=input_size,
+            output_size=2 * intermediate_size,
+            params_dtype=dtype,
+            quant_config=quant_config,
+            prefix=prefix,
+            return_bias=False,
+            disable_tp=True,
+        )
+        self.quant_method.create_weights(
+            self,
+            input_size_per_partition=input_size,
+            output_partition_sizes=[
+                self.intermediate_size_per_partition,
+                self.intermediate_size_per_partition,
+            ],
+            input_size=input_size,
+            output_size=2 * intermediate_size,
+            params_dtype=dtype,
+            weight_loader=self.weight_loader,
+        )
+
+    @property
+    def uses_quantized_kernel(self) -> bool:
+        return not isinstance(self.quant_method, UnquantizedLinearMethod)
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
-        return F.linear(input_, self.weight)
+        return self.quant_method.apply(self, input_)
 
     def weight_loader(
-        self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str | None = None
+        self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: int | None = None
     ) -> None:
+        shard_id = 0 if loaded_shard_id is None else loaded_shard_id
         shard_size = self.intermediate_size_per_partition
         start_idx = self._tp_rank * shard_size
-        if loaded_shard_id == 1:  # up_proj
+        if param.ndim == 1:
+            scales = loaded_weight.reshape(-1)
+            if param.numel() == 2:
+                # Static per-tensor ModelOpt FP8: one scale per logical shard.
+                param.data[shard_id].copy_(scales[0])
+            else:
+                # Dynamic per-token activation / per-output-channel weight:
+                # keep the gate/up output-channel scales aligned with the TP
+                # shard selected for the corresponding weight rows.
+                target = param.data[shard_id * shard_size : (shard_id + 1) * shard_size]
+                target.copy_(scales.narrow(0, start_idx, shard_size))
+            return
+        if shard_id == 1:  # up_proj
             param.data[shard_size : 2 * shard_size].copy_(loaded_weight.narrow(0, start_idx, shard_size))
         else:  # gate_proj
             param.data[0:shard_size].copy_(loaded_weight.narrow(0, start_idx, shard_size))
 
 
-class MiniMaxH3Qwen3VLQKVParallelLinear(nn.Module):
+class MiniMaxH3Qwen3VLQKVParallelLinear(LinearBase):
     """QKV projection with GQA head sharding along the output dimension."""
 
     def __init__(
@@ -163,8 +215,9 @@ class MiniMaxH3Qwen3VLQKVParallelLinear(nn.Module):
         num_kv_heads: int,
         head_dim: int,
         dtype: torch.dtype,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ) -> None:
-        super().__init__()
         self.group = group
         self.hidden_size = hidden_size
         self.num_heads = num_heads
@@ -181,13 +234,33 @@ class MiniMaxH3Qwen3VLQKVParallelLinear(nn.Module):
         self.local_num_kv_heads = num_kv_heads // tp_size
         q_local = self.local_num_heads * head_dim
         kv_local = self.local_num_kv_heads * head_dim
-        self.weight = nn.Parameter(torch.empty(q_local + 2 * kv_local, hidden_size, dtype=dtype))
-        self.weight.weight_loader = self.weight_loader  # type: ignore[attr-defined]
         self._tp_rank = tp_rank
         self._tp_size = tp_size
+        super().__init__(
+            input_size=hidden_size,
+            output_size=(num_heads + 2 * num_kv_heads) * head_dim,
+            params_dtype=dtype,
+            quant_config=quant_config,
+            prefix=prefix,
+            return_bias=False,
+            disable_tp=True,
+        )
+        self.quant_method.create_weights(
+            self,
+            input_size_per_partition=hidden_size,
+            output_partition_sizes=[q_local, kv_local, kv_local],
+            input_size=hidden_size,
+            output_size=(num_heads + 2 * num_kv_heads) * head_dim,
+            params_dtype=dtype,
+            weight_loader=self.weight_loader,
+        )
+
+    @property
+    def uses_quantized_kernel(self) -> bool:
+        return not isinstance(self.quant_method, UnquantizedLinearMethod)
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
-        return F.linear(input_, self.weight)
+        return self.quant_method.apply(self, input_)
 
     def weight_loader(
         self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str | None = None
@@ -195,6 +268,20 @@ class MiniMaxH3Qwen3VLQKVParallelLinear(nn.Module):
         head_dim = self.head_dim
         q_local = self.local_num_heads * head_dim
         kv_local = self.local_num_kv_heads * head_dim
+        if param.ndim == 1:
+            scale_index = {"q": 0, "k": 1, "v": 2}.get(loaded_shard_id)
+            if scale_index is None:
+                raise ValueError(f"unexpected QKV scale shard id {loaded_shard_id!r}")
+            scales = loaded_weight.reshape(-1)
+            if param.numel() == 3:
+                # Static per-tensor ModelOpt FP8: one scale per Q/K/V shard.
+                param.data[scale_index].copy_(scales[0])
+            else:
+                local_size = q_local if loaded_shard_id == "q" else kv_local
+                start_idx = self._tp_rank * local_size
+                target_start = {"q": 0, "k": q_local, "v": q_local + kv_local}[loaded_shard_id]
+                param.data[target_start : target_start + local_size].copy_(scales.narrow(0, start_idx, local_size))
+            return
         if loaded_shard_id == "q":
             start_idx = self._tp_rank * q_local
             param.data[0:q_local].copy_(loaded_weight.narrow(0, start_idx, q_local))
@@ -240,7 +327,7 @@ def _verify_fused_shards_complete(
     raise RuntimeError(f"MiniMax H3 text encoder fused weights are missing source shards: {details}")
 
 
-class MiniMaxH3Qwen3VLRowParallelLinear(nn.Module):
+class MiniMaxH3Qwen3VLRowParallelLinear(LinearBase):
     def __init__(
         self,
         group: Any,
@@ -248,19 +335,34 @@ class MiniMaxH3Qwen3VLRowParallelLinear(nn.Module):
         output_size: int,
         dtype: torch.dtype,
         input_is_parallel: bool = True,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ) -> None:
-        super().__init__()
         self.group = group
-        self.input_size = input_size
-        self.output_size = output_size
         self.input_is_parallel = input_is_parallel
         tp_rank, tp_size = _tp_range(group)
         assert input_size % tp_size == 0, f"input_size {input_size} must be divisible by text_encoder_tp_size {tp_size}"
         self.input_size_per_partition = input_size // tp_size
-        self.weight = nn.Parameter(torch.empty(output_size, self.input_size_per_partition, dtype=dtype))
-        self.weight.weight_loader = self.weight_loader  # type: ignore[attr-defined]
         self._tp_rank = tp_rank
         self._tp_size = tp_size
+        super().__init__(
+            input_size=input_size,
+            output_size=output_size,
+            params_dtype=dtype,
+            quant_config=quant_config,
+            prefix=prefix,
+            return_bias=False,
+            disable_tp=True,
+        )
+        self.quant_method.create_weights(
+            self,
+            input_size_per_partition=self.input_size_per_partition,
+            output_partition_sizes=[output_size],
+            input_size=input_size,
+            output_size=output_size,
+            params_dtype=dtype,
+            weight_loader=self.weight_loader,
+        )
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
         if self.input_is_parallel:
@@ -268,21 +370,36 @@ class MiniMaxH3Qwen3VLRowParallelLinear(nn.Module):
         else:
             split_input = input_.split(self.input_size_per_partition, dim=-1)
             input_parallel = split_input[self._tp_rank].contiguous()
-        output_parallel = F.linear(input_parallel, self.weight)
+        output_parallel = self.quant_method.apply(self, input_parallel)
         if self._tp_size > 1:
             # Reduce in fp32: the reference path accumulates the full (K=8192)
             # dot product inside a single cuBLAS GEMM before rounding to bf16.
             # A bf16 all-reduce of the per-rank partial GEMMs would round twice
             # and amplify error on this model's large-magnitude activations.
+            output_dtype = output_parallel.dtype
             output_parallel = output_parallel.float()
             self.group.all_reduce(output_parallel)
-            output_parallel = output_parallel.to(self.weight.dtype)
+            output_parallel = output_parallel.to(output_dtype)
         return output_parallel
 
     def weight_loader(
         self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str | None = None
     ) -> None:
         del loaded_shard_id
+        if param.ndim == 1:
+            scales = loaded_weight.reshape(-1)
+            if param.numel() == 1:
+                param.data[0].copy_(scales[0])
+            else:
+                # Row-parallel sharding splits input columns only; every rank
+                # retains all output rows and therefore all channel scales.
+                if scales.numel() != param.numel():
+                    raise ValueError(
+                        "MiniMax H3 row-parallel per-channel scale size mismatch: "
+                        f"checkpoint={scales.numel()}, parameter={param.numel()}"
+                    )
+                param.data.copy_(scales)
+            return
         shard_size = self.input_size_per_partition
         start_idx = self._tp_rank * shard_size
         param.data.copy_(loaded_weight.narrow(1, start_idx, shard_size))
@@ -665,7 +782,14 @@ class MiniMaxH3Qwen3VLVisionModel(nn.Module):
 
 
 class MiniMaxH3Qwen3VLTextAttention(nn.Module):
-    def __init__(self, group: Any, config: Any, dtype: torch.dtype) -> None:
+    def __init__(
+        self,
+        group: Any,
+        config: Any,
+        dtype: torch.dtype,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ) -> None:
         super().__init__()
         self.group = group
         self.config = config
@@ -683,6 +807,8 @@ class MiniMaxH3Qwen3VLTextAttention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             head_dim=self.head_dim,
             dtype=dtype,
+            quant_config=quant_config,
+            prefix=f"{prefix}.qkv_proj",
         )
         self.o_proj = MiniMaxH3Qwen3VLRowParallelLinear(
             group,
@@ -690,6 +816,8 @@ class MiniMaxH3Qwen3VLTextAttention(nn.Module):
             output_size=self.hidden_size,
             dtype=dtype,
             input_is_parallel=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.o_proj",
         )
         self.q_norm = MiniMaxH3Qwen3VLRMSNorm(self.head_dim, eps=config.rms_norm_eps, dtype=dtype)
         self.k_norm = MiniMaxH3Qwen3VLRMSNorm(self.head_dim, eps=config.rms_norm_eps, dtype=dtype)
@@ -703,14 +831,21 @@ class MiniMaxH3Qwen3VLTextAttention(nn.Module):
         hidden_shape = (*input_shape, -1, self.head_dim)
         q_local = self.qkv_proj.local_num_heads * self.head_dim
         kv_local = self.qkv_proj.local_num_kv_heads * self.head_dim
-        q_weight = self.qkv_proj.weight[0:q_local]
-        k_weight = self.qkv_proj.weight[q_local : q_local + kv_local]
-        v_weight = self.qkv_proj.weight[q_local + kv_local : q_local + 2 * kv_local]
-        # Three separate GEMMs keep the numerics identical to the reference
-        # path (packed QKV changes cuBLAS tiling and shifts bf16 rounding).
-        query_states = self.q_norm(F.linear(hidden_states, q_weight).view(hidden_shape)).transpose(1, 2)
-        key_states = self.k_norm(F.linear(hidden_states, k_weight).view(hidden_shape)).transpose(1, 2)
-        value_states = F.linear(hidden_states, v_weight).view(hidden_shape).transpose(1, 2)
+        if self.qkv_proj.uses_quantized_kernel:
+            qkv = self.qkv_proj(hidden_states)
+            query_states, key_states, value_states = qkv.split((q_local, kv_local, kv_local), dim=-1)
+            query_states = self.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
+            key_states = self.k_norm(key_states.view(hidden_shape)).transpose(1, 2)
+            value_states = value_states.view(hidden_shape).transpose(1, 2)
+        else:
+            q_weight = self.qkv_proj.weight[0:q_local]
+            k_weight = self.qkv_proj.weight[q_local : q_local + kv_local]
+            v_weight = self.qkv_proj.weight[q_local + kv_local : q_local + 2 * kv_local]
+            # Three separate GEMMs keep the BF16 path numerically identical to
+            # the reference. ModelOpt FP8 uses one fused kernel above.
+            query_states = self.q_norm(F.linear(hidden_states, q_weight).view(hidden_shape)).transpose(1, 2)
+            key_states = self.k_norm(F.linear(hidden_states, k_weight).view(hidden_shape)).transpose(1, 2)
+            value_states = F.linear(hidden_states, v_weight).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
         query_states, key_states = _apply_rotary_pos_emb(query_states, key_states, cos, sin)
@@ -734,7 +869,14 @@ class MiniMaxH3Qwen3VLTextAttention(nn.Module):
 
 
 class MiniMaxH3Qwen3VLTextMLP(nn.Module):
-    def __init__(self, group: Any, config: Any, dtype: torch.dtype) -> None:
+    def __init__(
+        self,
+        group: Any,
+        config: Any,
+        dtype: torch.dtype,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
@@ -743,6 +885,8 @@ class MiniMaxH3Qwen3VLTextMLP(nn.Module):
             input_size=self.hidden_size,
             intermediate_size=self.intermediate_size,
             dtype=dtype,
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate_up_proj",
         )
         self.down_proj = MiniMaxH3Qwen3VLRowParallelLinear(
             group,
@@ -750,25 +894,55 @@ class MiniMaxH3Qwen3VLTextMLP(nn.Module):
             output_size=self.hidden_size,
             dtype=dtype,
             input_is_parallel=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.down_proj",
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         ip_local = self.gate_up_proj.intermediate_size_per_partition
-        gate = F.linear(x, self.gate_up_proj.weight[0:ip_local])
-        up = F.linear(x, self.gate_up_proj.weight[ip_local : 2 * ip_local])
+        if self.gate_up_proj.uses_quantized_kernel:
+            gate, up = self.gate_up_proj(x).split(ip_local, dim=-1)
+        else:
+            gate = F.linear(x, self.gate_up_proj.weight[0:ip_local])
+            up = F.linear(x, self.gate_up_proj.weight[ip_local : 2 * ip_local])
         x = F.silu(gate) * up
         return self.down_proj(x)
 
 
 class MiniMaxH3Qwen3VLTextDecoderLayer(nn.Module):
-    def __init__(self, group: Any, config: Any, dtype: torch.dtype) -> None:
+    def __init__(
+        self,
+        group: Any,
+        config: Any,
+        dtype: torch.dtype,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = MiniMaxH3Qwen3VLTextAttention(group, config, dtype)
-        self.mlp = MiniMaxH3Qwen3VLTextMLP(group, config, dtype)
-        self.input_layernorm = MiniMaxH3Qwen3VLRMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype)
+        self.self_attn = MiniMaxH3Qwen3VLTextAttention(
+            group,
+            config,
+            dtype,
+            quant_config,
+            f"{prefix}.self_attn",
+        )
+        self.mlp = MiniMaxH3Qwen3VLTextMLP(
+            group,
+            config,
+            dtype,
+            quant_config,
+            f"{prefix}.mlp",
+        )
+        self.input_layernorm = MiniMaxH3Qwen3VLRMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=dtype,
+        )
         self.post_attention_layernorm = MiniMaxH3Qwen3VLRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps, dtype=dtype
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=dtype,
         )
 
     def forward(
@@ -791,7 +965,14 @@ class MiniMaxH3Qwen3VLTextDecoderLayer(nn.Module):
 class MiniMaxH3Qwen3VLTextModel(nn.Module):
     """TP-sharded Qwen3-VL text model returning unnormalized layer-50 states."""
 
-    def __init__(self, group: Any, config: Any, selected_layer: int, dtype: torch.dtype) -> None:
+    def __init__(
+        self,
+        group: Any,
+        config: Any,
+        selected_layer: int,
+        dtype: torch.dtype,
+        quant_config: QuantizationConfig | None,
+    ) -> None:
         super().__init__()
         self.group = group
         self.config = config
@@ -804,7 +985,16 @@ class MiniMaxH3Qwen3VLTextModel(nn.Module):
         )
         self.rotary_emb = MiniMaxH3Qwen3VLTextRotaryEmbedding(config)
         self.layers = nn.ModuleList(
-            [MiniMaxH3Qwen3VLTextDecoderLayer(group, config, dtype) for _ in range(self.num_layers)]
+            [
+                MiniMaxH3Qwen3VLTextDecoderLayer(
+                    group,
+                    config,
+                    dtype,
+                    quant_config,
+                    f"text_model.layers.{layer_idx}",
+                )
+                for layer_idx in range(self.num_layers)
+            ]
         )
 
     def _deepstack_process(
@@ -964,6 +1154,21 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         from transformers import Qwen3VLConfig
 
         config = Qwen3VLConfig.from_pretrained(model_path, trust_remote_code=False)
+        with open(f"{model_path}/config.json", encoding="utf-8") as handle:
+            raw_config = json.load(handle)
+        disk_quant_config = raw_config.get("quantization_config")
+        self.quant_config = build_quant_config(disk_quant_config) if disk_quant_config is not None else None
+        if self.quant_config is not None:
+            if self.quant_config.get_name() != "modelopt":
+                raise ValueError(
+                    "MiniMax H3 text encoder currently supports only ModelOpt FP8 "
+                    f"pre-quantized checkpoints, got {self.quant_config.get_name()!r}"
+                )
+            self.quant_config.packed_modules_mapping = {
+                "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+                "gate_up_proj": ["gate_proj", "up_proj"],
+            }
+            self.quant_config.apply_vllm_mapper(MINIMAX_H3_TEXT_ENCODER_QUANT_MAPPER)
         self.image_token_id = int(config.image_token_id)
         self.video_token_id = int(config.video_token_id)
         self._tp_size = int(encoder_group.world_size) if encoder_group is not None else 1
@@ -975,13 +1180,15 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
             config.text_config,
             MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER,
             dtype,
+            self.quant_config,
         )
-        self.text_model.to(dtype=dtype)
         self._load_weights(model_path)
         logger.info(
-            "MiniMax H3 Qwen3-VL encoder: %d retained decoder layers, text_encoder_tp_size=%d, vision replicated",
+            "MiniMax H3 Qwen3-VL encoder: %d retained decoder layers, "
+            "text_encoder_tp_size=%d, quantization=%s, vision replicated",
             MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER,
             self._tp_size,
+            self.quant_config.get_name() if self.quant_config is not None else "bf16",
         )
 
     @property
@@ -993,7 +1200,7 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         return self._tp_size
 
     def _map_weight_name(self, name: str) -> tuple[str, str | int | None] | None:
-        if name == "lm_head.weight" or name == "model.language_model.norm.weight":
+        if name.startswith("lm_head.") or name == "model.language_model.norm.weight":
             return None
         if name.startswith("model.visual."):
             return ("vision." + name[len("model.visual.") :], None)
@@ -1004,30 +1211,19 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
             match = re.match(r"layers\.(\d+)\.", rest)
             if match is not None and int(match.group(1)) >= MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER:
                 return None
-            if ".self_attn.q_proj.weight" in rest:
+            qkv_match = re.search(r"\.self_attn\.(q|k|v)_proj\.(weight|weight_scale|input_scale)$", rest)
+            if qkv_match is not None:
+                shard_id, suffix = qkv_match.groups()
                 return (
-                    "text_model." + rest.replace(".self_attn.q_proj.weight", ".self_attn.qkv_proj.weight"),
-                    "q",
+                    "text_model." + rest[: qkv_match.start()] + f".self_attn.qkv_proj.{suffix}",
+                    shard_id,
                 )
-            if ".self_attn.k_proj.weight" in rest:
+            mlp_match = re.search(r"\.mlp\.(gate|up)_proj\.(weight|weight_scale|input_scale)$", rest)
+            if mlp_match is not None:
+                shard_name, suffix = mlp_match.groups()
                 return (
-                    "text_model." + rest.replace(".self_attn.k_proj.weight", ".self_attn.qkv_proj.weight"),
-                    "k",
-                )
-            if ".self_attn.v_proj.weight" in rest:
-                return (
-                    "text_model." + rest.replace(".self_attn.v_proj.weight", ".self_attn.qkv_proj.weight"),
-                    "v",
-                )
-            if ".mlp.gate_proj.weight" in rest:
-                return (
-                    "text_model." + rest.replace(".mlp.gate_proj.weight", ".mlp.gate_up_proj.weight"),
-                    0,
-                )
-            if ".mlp.up_proj.weight" in rest:
-                return (
-                    "text_model." + rest.replace(".mlp.up_proj.weight", ".mlp.gate_up_proj.weight"),
-                    1,
+                    "text_model." + rest[: mlp_match.start()] + f".mlp.gate_up_proj.{suffix}",
+                    0 if shard_name == "gate" else 1,
                 )
             return ("text_model." + rest, None)
         return None

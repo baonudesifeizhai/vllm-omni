@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import tempfile
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import contextmanager
@@ -20,6 +21,7 @@ import torch.nn as nn
 from PIL import Image
 from transformers import Qwen2TokenizerFast, Qwen3VLProcessor
 from vllm.logger import init_logger
+from vllm.model_executor.models.utils import WeightsMapper
 
 from vllm_omni.diffusion import envs
 from vllm_omni.diffusion.cache.cachedit import (
@@ -552,6 +554,120 @@ class MiniMaxH3Pipeline(
     # Only distilled releases pin a schedule, so the default keeps the legacy
     # uniform path available to partially constructed pipelines.
     _base_schedule_by_partition: ClassVar[Mapping[str, DMD2SigmaSchedule | None]] = {}
+    _INTERNAL_TRANSFORMER_ROOTS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "audio_patch_proj",
+            "blocks",
+            "condition_proj",
+            "final_layer",
+            "rope",
+            "time_embedder",
+            "token_refiner",
+            "video_patch_proj",
+        }
+    )
+    _DIFFUSERS_TRANSFORMER_ROOTS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "audio_proj_in",
+            "audio_proj_out",
+            "context_embedder",
+            "norm_out",
+            "proj_in",
+            "proj_out",
+            "time_embedder",
+            "token_refiner",
+            "transformer_blocks",
+        }
+    )
+
+    # ModelOpt stores the AutoQuant ignore list with Diffusers module names.
+    # Map it before vLLM chooses quantization methods for the fused H3 model.
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_substr={
+            ".attn.to_out.0": ".attn.out_proj",
+            ".attn.to_out": ".attn.out_proj",
+            ".ff.net.0.proj": ".mlp.fc1",
+            ".ff.net.0": ".mlp.fc1",
+            ".ff.net.2": ".mlp.fc2",
+            ".ff": ".mlp",
+        },
+        orig_to_new_prefix={
+            "audio_proj_in": "audio_patch_proj",
+            "audio_proj_out": "final_layer.audio_out",
+            "context_embedder": "condition_proj",
+            "norm_out.linear": "final_layer.adaln_proj.linear",
+            "norm_out.norm": "final_layer.norm",
+            "proj_in": "video_patch_proj",
+            "proj_out": "final_layer.video_out",
+            "time_embedder.linear_1": "time_embedder.proj_in",
+            "time_embedder.linear_2": "time_embedder.proj_out",
+            "token_refiner.refiner_blocks": "token_refiner.blocks",
+            "transformer_blocks": "blocks",
+        },
+    )
+    packed_modules_mapping: ClassVar[dict[str, list[str]]] = {
+        "qkv_proj": ["to_q", "to_k", "to_v"],
+    }
+
+    @staticmethod
+    def remap_checkpoint_key(key: str) -> str | tuple[str, str] | None:
+        """Map Diffusers ModelOpt H3 tensors to the custom fused H3 model."""
+        prefix = "transformer."
+        if not key.startswith(prefix):
+            return None
+        source = key[len(prefix) :]
+        root = source.partition(".")[0]
+        overlapping_diffusers_layout = source.startswith(("time_embedder.linear_", "token_refiner.refiner_blocks."))
+        if root in MiniMaxH3Pipeline._INTERNAL_TRANSFORMER_ROOTS and not overlapping_diffusers_layout:
+            target = prefix + source
+            return target, target
+        if root not in MiniMaxH3Pipeline._DIFFUSERS_TRANSFORMER_ROOTS:
+            return None
+
+        target = source
+        target = target.replace("token_refiner.refiner_blocks.", "token_refiner.blocks.", 1)
+        target = target.replace("time_embedder.linear_1.", "time_embedder.proj_in.")
+        target = target.replace("time_embedder.linear_2.", "time_embedder.proj_out.")
+        root_aliases = {
+            "transformer_blocks.": "blocks.",
+            "audio_proj_in.": "audio_patch_proj.",
+            "proj_in.": "video_patch_proj.",
+            "context_embedder.": "condition_proj.",
+            "norm_out.norm.": "final_layer.norm.",
+            "norm_out.linear.": "final_layer.adaln_proj.linear.",
+            "audio_proj_out.": "final_layer.audio_out.",
+            "proj_out.": "final_layer.video_out.",
+        }
+        for source_prefix, target_prefix in root_aliases.items():
+            if target.startswith(source_prefix):
+                target = target_prefix + target[len(source_prefix) :]
+                break
+        target = target.replace(".attn.norm_q.", ".attn.q_norm.")
+        target = target.replace(".attn.norm_k.", ".attn.k_norm.")
+        target = target.replace(".attn.to_out.0.", ".attn.out_proj.")
+        target = target.replace(".ff.net.2.", ".mlp.fc2.")
+
+        qkv_match = re.search(r"\.attn\.to_([qkv])\.(weight|weight_scale|input_scale)$", target)
+        if qkv_match:
+            shard_id, suffix = qkv_match.groups()
+            base = target[: qkv_match.start()]
+            parameter_name = f"{prefix}{base}.attn.qkv_proj.{suffix}"
+            output_name = f"{prefix}{base}.attn.qkv_proj.to_{shard_id}.{suffix}"
+            return parameter_name, output_name
+
+        if ".ff.net.0.proj." in target:
+            target = target.replace(".ff.net.0.proj.", ".mlp.fc1.")
+            parameter_name = prefix + target
+            if target.endswith(".mlp.fc1.weight"):
+                output_name = parameter_name.removesuffix(".weight") + ".diffusers_weight"
+                return parameter_name, output_name
+            if target.endswith(".mlp.fc1.weight_scale"):
+                output_name = parameter_name.removesuffix(".weight_scale") + ".diffusers_weight_scale"
+                return parameter_name, output_name
+            return parameter_name, parameter_name
+
+        parameter_name = prefix + target
+        return parameter_name, parameter_name
 
     def adopt_cache_dit_backend(self, backend: CacheDiTBackend) -> None:
         """Adopt runner-installed generic Cache-DiT for request transitions."""
@@ -648,6 +764,9 @@ class MiniMaxH3Pipeline(
             od_config.quantization_config,
             "transformer",
         )
+        if transformer_quant_config is not None:
+            transformer_quant_config.apply_vllm_mapper(self.hf_to_vllm_mapper)
+            transformer_quant_config.packed_modules_mapping = self.packed_modules_mapping
         self.transformer = MiniMaxH3DiTModel(
             od_config,
             quant_config=transformer_quant_config,
