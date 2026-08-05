@@ -122,12 +122,9 @@ class ModelOptFp8CheckpointAdapter:
 
         if callable(self._checkpoint_key_mapper):
             remapped = self._checkpoint_key_mapper(name)
-            if isinstance(remapped, tuple):
-                candidate, output_name = remapped
-                if candidate in self._loadable_tensors:
-                    return candidate, output_name
-            elif remapped in self._loadable_tensors:
-                return remapped, remapped
+            candidate, output_name = remapped if isinstance(remapped, tuple) else (remapped, remapped)
+            if candidate in self._loadable_tensors:
+                return candidate, output_name
 
         for candidate in self._weights_mapper.apply_list([name]):
             if candidate != name and candidate in self._loadable_tensors:
