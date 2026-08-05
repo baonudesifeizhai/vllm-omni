@@ -943,6 +943,9 @@ class MiniMaxH3Pipeline(
             od_config.quantization_config,
             "transformer",
         )
+        if transformer_quant_config is not None:
+            transformer_quant_config.apply_vllm_mapper(self.hf_to_vllm_mapper)
+            transformer_quant_config.packed_modules_mapping = self.packed_modules_mapping
         self.transformer = MiniMaxH3DiTModel(
             od_config,
             quant_config=transformer_quant_config,

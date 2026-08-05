@@ -131,7 +131,15 @@ class MiniMaxH3DiTArchConfig:
             "time_embed_hidden_dim": "time_embed_hidden_size",
             "rope_freq_dim": "rope_inv_freq_len",
         }
-        config = {aliases.get(name, name): value for name, value in config.items()}
+        config = dict(config)
+        for source, target in aliases.items():
+            if target not in config and source in config:
+                config[target] = config[source]
+        config.setdefault("adaln_out_features", 18 * int(config.get("hidden_size", cls.hidden_size)))
+        config.setdefault(
+            "final_adaln_out_features",
+            2 * int(config.get("hidden_size", cls.hidden_size)),
+        )
         fields = cls.__dataclass_fields__
         values = {name: config[name] for name in fields if name in config}
         if "patch_size" in values:
@@ -305,9 +313,13 @@ class MiniMaxH3Rope(nn.Module):
 
     def __init__(self, inv_freq_len: int) -> None:
         super().__init__()
+        # Diffusers checkpoints derive and omit this buffer, while the native
+        # H3 checkpoint serializes it. Initialize it so both layouts are safe.
+        exponents = torch.arange(inv_freq_len, dtype=_FP32_DTYPE) / inv_freq_len
+        inv_freq = 1.0 / (10000.0**exponents)
         self.register_buffer(
             "inv_freq",
-            torch.empty(inv_freq_len, dtype=_FP32_DTYPE),
+            inv_freq,
             persistent=True,
         )
 
@@ -1335,6 +1347,7 @@ class MiniMaxH3DiTModel(nn.Module):
         qkv_parts: dict[str, set[str]] = {}
         source_names: set[str] = set()
         for name, loaded_weight in weights:
+            source_name = name
             layout = "plain"
             if diffusers_weights:
                 if name in source_names:
@@ -1342,22 +1355,40 @@ class MiniMaxH3DiTModel(nn.Module):
                 source_names.add(name)
                 module, _, kind = name.rpartition(".")
                 target = _resolve_native_target(module)
-                if target is None or kind not in {"weight", "bias"}:
-                    raise ValueError(f"unsupported Diffusers H3 weight: {name}")
-                name, layout = f"{target[0]}.{kind}", target[1]
-            param = params.get(name)
+                if target is not None and kind in {"weight", "bias", "weight_scale", "input_scale"}:
+                    name, layout = f"{target[0]}.{kind}", target[1]
+
+            target_name = name
+            qkv_shard_id = layout if layout in {"q", "k", "v"} else None
+            diffusers_fc1 = layout == "swap_halves"
+            for shard_id in ("q", "k", "v"):
+                marker = f".attn.qkv_proj.to_{shard_id}."
+                if marker in target_name:
+                    target_name = target_name.replace(marker, ".attn.qkv_proj.")
+                    qkv_shard_id = shard_id
+                    break
+            if target_name.endswith(".mlp.fc1.diffusers_weight"):
+                target_name = target_name.removesuffix(".diffusers_weight") + ".weight"
+                diffusers_fc1 = True
+            elif target_name.endswith(".mlp.fc1.diffusers_weight_scale"):
+                target_name = target_name.removesuffix(".diffusers_weight_scale") + ".weight_scale"
+                diffusers_fc1 = True
+
+            if diffusers_weights and target is None and target_name == name:
+                raise ValueError(f"unsupported Diffusers H3 weight: {source_name}")
+            param = params.get(target_name)
             if param is None:
                 if diffusers_weights:
-                    raise ValueError(f"Diffusers H3 weight has no model parameter: {name}")
-                logger.warning("Skipping MiniMax H3 weight not present in model: %s", name)
+                    raise ValueError(f"Diffusers H3 weight has no model parameter: {source_name}")
+                logger.warning("Skipping MiniMax H3 weight not present in model: %s", source_name)
                 continue
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            if layout in {"q", "k", "v"}:
+            if qkv_shard_id is not None:
                 # vLLM can load each projection directly into its packed QKV
                 # parameter, including TP slicing and online quantization.
-                weight_loader(param, loaded_weight, layout)
-                qkv_parts.setdefault(name, set()).add(layout)
-            elif name.endswith(".attn.qkv_proj.weight"):
+                weight_loader(param, loaded_weight, qkv_shard_id)
+                qkv_parts.setdefault(target_name, set()).add(qkv_shard_id)
+            elif target_name.endswith(".attn.qkv_proj.weight"):
                 # Transform checkpoint layout before entering vLLM's loader so
                 # online FP8 can keep ``online_process_loader`` outermost.
                 loaded_weight = _reorder_grouped_qkv_to_qkv(
@@ -1367,19 +1398,52 @@ class MiniMaxH3DiTModel(nn.Module):
                     head_dim=self.arch.attention_head_dim,
                 )
                 weight_loader(param, loaded_weight)
-            elif name.endswith(".mlp.fc1.weight"):
+            elif target_name.endswith((".attn.qkv_proj.weight_scale", ".attn.qkv_proj.input_scale")):
+                # ModelOpt exports one shared scalar after strict QKV amax
+                # fusion, while vLLM represents a fused QKV layer as three
+                # logical scale shards until post-load processing.
+                shards = ("q", "k", "v")
+                scales = loaded_weight.reshape(-1)
+                if scales.numel() not in (1, len(shards)):
+                    raise ValueError(
+                        f"MiniMax H3 fused QKV scale must contain 1 or 3 values, got {tuple(loaded_weight.shape)}"
+                    )
+                for index, shard_id in enumerate(shards):
+                    weight_loader(param, scales[0 if scales.numel() == 1 else index], shard_id)
+            elif target_name.endswith(".mlp.fc1.weight"):
                 if loaded_weight.shape[0] % 2:
                     raise ValueError(
                         "MiniMax H3 fc1 checkpoint rows must split evenly into "
                         f"gate/up matrices, got {tuple(loaded_weight.shape)}"
-                    )
+                )
                 first, second = loaded_weight.chunk(2, dim=0)
-                gate, up = (second, first) if layout == "swap_halves" else (first, second)
+                gate, up = (second, first) if diffusers_fc1 else (first, second)
                 weight_loader(param, gate, 0)
                 weight_loader(param, up, 1)
+            elif target_name.endswith((".mlp.fc1.weight_scale", ".mlp.fc1.input_scale")):
+                # Static FP8 has one shared scalar (or one scalar per logical
+                # shard). Dynamic per-channel/per-token FP8 instead exports a
+                # weight scale for every fc1 output row. Split those channel
+                # scales exactly like the fused weight and preserve Diffusers'
+                # [up, gate] -> internal [gate, up] swap.
+                scales = loaded_weight.reshape(-1)
+                if scales.numel() in (1, 2):
+                    gate_scale = scales[0]
+                    up_scale = scales[0 if scales.numel() == 1 else 1]
+                elif target_name.endswith(".mlp.fc1.weight_scale") and scales.numel() % 2 == 0:
+                    first, second = scales.chunk(2)
+                    gate_scale, up_scale = (second, first) if diffusers_fc1 else (first, second)
+                else:
+                    raise ValueError(
+                        "MiniMax H3 fused fc1 scale must contain one/two "
+                        "static values or an even per-channel weight-scale "
+                        f"vector, got {tuple(loaded_weight.shape)}"
+                    )
+                weight_loader(param, gate_scale, 0)
+                weight_loader(param, up_scale, 1)
             else:
                 weight_loader(param, loaded_weight)
-            loaded.add(name)
+            loaded.add(target_name)
         if diffusers_weights:
             for name, parts in qkv_parts.items():
                 if parts != {"q", "k", "v"}:
