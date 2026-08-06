@@ -40,12 +40,16 @@ import torch.nn.functional as F
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.models.utils import WeightsMapper
 
-from vllm_omni.diffusion.model_loader.checkpoint_adapters import ModelOptFp8CheckpointConfig
 from vllm_omni.quantization import build_quant_config
 
 MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER = 50
 MINIMAX_H3_QWEN3VL_HIDDEN_DIM = 5120
+
+MINIMAX_H3_TEXT_ENCODER_QUANT_MAPPER = WeightsMapper(
+    orig_to_new_prefix={"model.language_model": "text_model"},
+)
 
 logger = init_logger(__name__)
 
@@ -1102,13 +1106,7 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
                 "qkv_proj": ["q_proj", "k_proj", "v_proj"],
                 "gate_up_proj": ["gate_proj", "up_proj"],
             }
-            self.quant_config = ModelOptFp8CheckpointConfig.from_checkpoint(
-                self.quant_config,
-                model_path,
-                self._map_weight_name,
-                allow_unmapped=True,
-                target_module_prefixes=("text_model.layers.",),
-            )
+            self.quant_config.apply_vllm_mapper(MINIMAX_H3_TEXT_ENCODER_QUANT_MAPPER)
         self.image_token_id = int(config.image_token_id)
         self.video_token_id = int(config.video_token_id)
         self._tp_size = int(encoder_group.world_size) if encoder_group is not None else 1
@@ -1122,8 +1120,6 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
             dtype,
             self.quant_config,
         )
-        if isinstance(self.quant_config, ModelOptFp8CheckpointConfig):
-            self.quant_config.validate(self)
         self._load_weights(model_path)
         logger.info(
             "MiniMax H3 Qwen3-VL encoder: %d retained decoder layers, "
