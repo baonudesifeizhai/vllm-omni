@@ -245,6 +245,42 @@ def _resolve_minimax_h3_model_root(
         )
     )
 
+_MINIMAX_H3_TRANSFORMER_MAPPER = WeightsMapper(
+    orig_to_new_substr={
+        ".attn.norm_q": ".attn.q_norm",
+        ".attn.norm_k": ".attn.k_norm",
+        ".attn.to_out.0": ".attn.out_proj",
+        ".attn.to_out": ".attn.out_proj",
+        ".ff.net.0.proj": ".mlp.fc1",
+        ".ff.net.0": ".mlp.fc1",
+        ".ff.net.2": ".mlp.fc2",
+        ".ff": ".mlp",
+    },
+    orig_to_new_prefix={
+        "audio_proj_in": "audio_patch_proj",
+        "audio_proj_out": "final_layer.audio_out",
+        "context_embedder": "condition_proj",
+        "norm_out.linear": "final_layer.adaln_proj.linear",
+        "norm_out.norm": "final_layer.norm",
+        "proj_in": "video_patch_proj",
+        "proj_out": "final_layer.video_out",
+        "time_embedder.linear_1": "time_embedder.proj_in",
+        "time_embedder.linear_2": "time_embedder.proj_out",
+        "token_refiner.refiner_blocks": "token_refiner.blocks",
+        "transformer_blocks": "blocks",
+    },
+)
+
+# Whole-submodule ModelOpt exclusions target every quantizable child. These
+# aliases are quantization-only because the corresponding checkpoint trees are
+# not structurally identical to the fused H3 module tree.
+_MINIMAX_H3_QUANT_MAPPER = _MINIMAX_H3_TRANSFORMER_MAPPER | WeightsMapper(
+    orig_to_new_prefix={
+        "norm_out": "final_layer.adaln_proj.linear",
+        "token_refiner": "token_refiner.blocks",
+    }
+)
+
 
 _MINIMAX_H3_DENOISE_INPUT_KEYS = (
     "task",
