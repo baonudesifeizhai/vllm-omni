@@ -9,11 +9,11 @@ makes the large Qwen3-VL text model TP-shardable across ``text_encoder_tp_size``
 ranks, which removes the rank-0 memory hotspot that dominates no-offload peak
 memory (the retained 50-layer encoder is ~51.5 GB in BF16).
 
-The computation contract is unchanged from the HF reference path:
+The computation contract matches the HF reference path:
 
-- plain BF16 weights, only the first ``MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER``
-  decoder layers are kept (the checkpoint consumes the unnormalized hidden
-  state after decoder layer 49);
+- BF16 and serialized ModelOpt FP8/BF16 mixed checkpoints are supported; only
+  the first ``MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER`` decoder layers are kept
+  (the checkpoint consumes the unnormalized hidden state after layer 49);
 - cuDNN SDP is enabled during encode;
 - the multimodal backbone runs with an all-ones attention mask and
   ``mm_token_type_ids`` derived from the image/video token ids;
@@ -50,10 +50,6 @@ from vllm_omni.diffusion.offloader.module_residency import (
 
 MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER = 50
 MINIMAX_H3_QWEN3VL_HIDDEN_DIM = 5120
-
-MINIMAX_H3_TEXT_ENCODER_QUANT_MAPPER = WeightsMapper(
-    orig_to_new_prefix={"model.language_model": "text_model"},
-)
 
 logger = init_logger(__name__)
 
@@ -150,8 +146,6 @@ class MiniMaxH3Qwen3VLMergedColumnParallelLinear(LinearBase):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
-        self.group = group
-        self.intermediate_size = intermediate_size
         tp_rank, tp_size = _tp_range(group)
         assert intermediate_size % tp_size == 0, (
             f"intermediate_size {intermediate_size} must be divisible by text_encoder_tp_size {tp_size}"
@@ -180,7 +174,6 @@ class MiniMaxH3Qwen3VLMergedColumnParallelLinear(LinearBase):
             weight_loader=self.weight_loader,
         )
         self._tp_rank = tp_rank
-        self._tp_size = tp_size
         super().__init__(
             input_size=input_size,
             output_size=2 * intermediate_size,
@@ -248,10 +241,6 @@ class MiniMaxH3Qwen3VLQKVParallelLinear(LinearBase):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
-        self.group = group
-        self.hidden_size = hidden_size
-        self.num_heads = num_heads
-        self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         tp_rank, tp_size = _tp_range(group)
         assert num_heads % tp_size == 0, (
@@ -285,7 +274,6 @@ class MiniMaxH3Qwen3VLQKVParallelLinear(LinearBase):
             weight_loader=self.weight_loader,
         )
         self._tp_rank = tp_rank
-        self._tp_size = tp_size
         super().__init__(
             input_size=hidden_size,
             output_size=(num_heads + 2 * num_kv_heads) * head_dim,
@@ -384,7 +372,6 @@ class MiniMaxH3Qwen3VLRowParallelLinear(LinearBase):
         input_size: int,
         output_size: int,
         dtype: torch.dtype,
-        input_is_parallel: bool = True,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
@@ -434,12 +421,7 @@ class MiniMaxH3Qwen3VLRowParallelLinear(LinearBase):
         )
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
-        if self.input_is_parallel:
-            input_parallel = input_
-        else:
-            split_input = input_.split(self.input_size_per_partition, dim=-1)
-            input_parallel = split_input[self._tp_rank].contiguous()
-        output_parallel = self.quant_method.apply(self, input_parallel)
+        output_parallel = self.quant_method.apply(self, input_)
         if self._tp_size > 1:
             # Reduce in fp32: the reference path accumulates the full (K=8192)
             # dot product inside a single cuBLAS GEMM before rounding to bf16.
@@ -903,7 +885,6 @@ class MiniMaxH3Qwen3VLTextAttention(nn.Module):
             input_size=self.num_heads * self.head_dim,
             output_size=self.hidden_size,
             dtype=dtype,
-            input_is_parallel=True,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
@@ -971,7 +952,6 @@ class MiniMaxH3Qwen3VLTextMLP(nn.Module):
             input_size=self.intermediate_size,
             output_size=self.hidden_size,
             dtype=dtype,
-            input_is_parallel=True,
             quant_config=quant_config,
             prefix=f"{prefix}.down_proj",
         )
@@ -1243,7 +1223,13 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
                 "qkv_proj": ["q_proj", "k_proj", "v_proj"],
                 "gate_up_proj": ["gate_proj", "up_proj"],
             }
-            self.quant_config.apply_vllm_mapper(MINIMAX_H3_TEXT_ENCODER_QUANT_MAPPER)
+            self.quant_config = ModelOptFp8CheckpointConfig.from_checkpoint(
+                self.quant_config,
+                model_path,
+                self._map_weight_name,
+                allow_unmapped=True,
+                target_module_prefixes=("text_model.layers.",),
+            )
         self.image_token_id = int(config.image_token_id)
         self.video_token_id = int(config.video_token_id)
         self._tp_size = int(encoder_group.world_size) if encoder_group is not None else 1
@@ -1274,7 +1260,8 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
     def tp_size(self) -> int:
         return self._tp_size
 
-    def _map_weight_name(self, name: str) -> tuple[str, str | int | None] | None:
+    @staticmethod
+    def _map_weight_name(name: str) -> tuple[str, str | int | None] | None:
         if name.startswith("lm_head.") or name == "model.language_model.norm.weight":
             return None
         if name.startswith("model.visual."):
