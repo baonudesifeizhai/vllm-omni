@@ -35,6 +35,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import DenoiseProgressMixin
+from vllm_omni.diffusion.model_loader.checkpoint_adapters import ModelOptFp8CheckpointConfig
 from vllm_omni.diffusion.model_loader.diffusers_loader import (
     DiffusersPipelineLoader,
 )
@@ -171,16 +172,14 @@ def _resolve_minimax_h3_model_root(
         )
     )
 
+
 _MINIMAX_H3_TRANSFORMER_MAPPER = WeightsMapper(
     orig_to_new_substr={
         ".attn.norm_q": ".attn.q_norm",
         ".attn.norm_k": ".attn.k_norm",
         ".attn.to_out.0": ".attn.out_proj",
-        ".attn.to_out": ".attn.out_proj",
         ".ff.net.0.proj": ".mlp.fc1",
-        ".ff.net.0": ".mlp.fc1",
         ".ff.net.2": ".mlp.fc2",
-        ".ff": ".mlp",
     },
     orig_to_new_prefix={
         "audio_proj_in": "audio_patch_proj",
@@ -195,16 +194,6 @@ _MINIMAX_H3_TRANSFORMER_MAPPER = WeightsMapper(
         "token_refiner.refiner_blocks": "token_refiner.blocks",
         "transformer_blocks": "blocks",
     },
-)
-
-# Whole-submodule ModelOpt exclusions target every quantizable child. These
-# aliases are quantization-only because the corresponding checkpoint trees are
-# not structurally identical to the fused H3 module tree.
-_MINIMAX_H3_QUANT_MAPPER = _MINIMAX_H3_TRANSFORMER_MAPPER | WeightsMapper(
-    orig_to_new_prefix={
-        "norm_out": "final_layer.adaln_proj.linear",
-        "token_refiner": "token_refiner.blocks",
-    }
 )
 
 
@@ -616,10 +605,8 @@ class MiniMaxH3Pipeline(
         }
     )
 
-    hf_to_vllm_mapper = _MINIMAX_H3_QUANT_MAPPER
-    packed_modules_mapping: ClassVar[dict[str, list[str]]] = {
-        "qkv_proj": ["to_q", "to_k", "to_v"],
-    }
+    hf_to_vllm_mapper = _MINIMAX_H3_TRANSFORMER_MAPPER
+    packed_modules_mapping: ClassVar[dict[str, list[str]]] = MiniMaxH3DiTModel.packed_modules_mapping
 
     @staticmethod
     def remap_checkpoint_key(key: str) -> str | tuple[str, str] | None:
@@ -756,12 +743,26 @@ class MiniMaxH3Pipeline(
             "transformer",
         )
         if transformer_quant_config is not None:
-            transformer_quant_config.apply_vllm_mapper(self.hf_to_vllm_mapper)
             transformer_quant_config.packed_modules_mapping = self.packed_modules_mapping
+            is_modelopt_fp8_checkpoint = transformer_quant_config.get_name() == "modelopt" and bool(
+                getattr(transformer_quant_config, "is_checkpoint_fp8_serialized", False)
+            )
+            if is_modelopt_fp8_checkpoint:
+                transformer_quant_config = ModelOptFp8CheckpointConfig.from_checkpoint(
+                    transformer_quant_config,
+                    Path(model_path) / "transformer",
+                    self.remap_checkpoint_key,
+                    source_prefix="transformer.",
+                    target_prefix="transformer.",
+                )
+            else:
+                transformer_quant_config.apply_vllm_mapper(self.hf_to_vllm_mapper)
         self.transformer = MiniMaxH3DiTModel(
             od_config,
             quant_config=transformer_quant_config,
         )
+        if isinstance(transformer_quant_config, ModelOptFp8CheckpointConfig):
+            transformer_quant_config.validate(self.transformer)
         if ref2va_model_path is not None:
             self.transformers_ref = MiniMaxH3DiTModel(
                 od_config,

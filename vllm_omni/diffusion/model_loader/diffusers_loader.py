@@ -550,19 +550,37 @@ class DiffusersPipelineLoader:
         # that have loaded weights tracking currently.
         if loaded_weights is not None:
             weights_not_loaded = weights_to_load - loaded_weights
-            # NOTE: if the model is quantized, ignore not_loaded check for scale
-            # weights. ModelOpt FP8 carries a per-tensor `weight_scale` and a
-            # static activation `input_scale`, which the quant method may
-            # fold/track differently than plain parameters.
+            # Some quant methods fold or track scales outside plain parameters.
+            # Serialized ModelOpt FP8 scales are checkpoint state and remain
+            # mandatory; optional scales from other methods retain the warning.
             weights_scale_not_loaded = {
                 name for name in weights_not_loaded if name.endswith(("weight_scale", "input_scale"))
             }
             weights_not_loaded = weights_not_loaded - weights_scale_not_loaded
             if weights_not_loaded:
                 self._check_unloaded_weights(weights_not_loaded)
-            if weights_scale_not_loaded:
+            required_modelopt_scales: set[str] = set()
+            for source in self._get_weight_sources(model):
+                quant_config = self._get_source_quant_config(source)
+                is_serialized_modelopt = (
+                    quant_config is not None
+                    and hasattr(quant_config, "get_name")
+                    and str(quant_config.get_name()).startswith("modelopt")
+                    and bool(getattr(quant_config, "is_checkpoint_fp8_serialized", False))
+                )
+                if is_serialized_modelopt:
+                    required_modelopt_scales.update(
+                        name for name in weights_scale_not_loaded if not source.prefix or name.startswith(source.prefix)
+                    )
+            if required_modelopt_scales:
+                raise ValueError(
+                    "Serialized ModelOpt FP8 checkpoint is missing required runtime scales: "
+                    f"{sorted(required_modelopt_scales)}"
+                )
+            optional_scales = weights_scale_not_loaded - required_modelopt_scales
+            if optional_scales:
                 logger.warning(
-                    f"Following weight_scale weights were not initialized from checkpoint: {weights_scale_not_loaded}"
+                    f"Following weight_scale weights were not initialized from checkpoint: {optional_scales}"
                 )
 
     @staticmethod
