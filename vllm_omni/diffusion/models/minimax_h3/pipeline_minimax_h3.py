@@ -165,6 +165,42 @@ def _resolve_minimax_h3_model_root(
         )
     )
 
+_MINIMAX_H3_TRANSFORMER_MAPPER = WeightsMapper(
+    orig_to_new_substr={
+        ".attn.norm_q": ".attn.q_norm",
+        ".attn.norm_k": ".attn.k_norm",
+        ".attn.to_out.0": ".attn.out_proj",
+        ".attn.to_out": ".attn.out_proj",
+        ".ff.net.0.proj": ".mlp.fc1",
+        ".ff.net.0": ".mlp.fc1",
+        ".ff.net.2": ".mlp.fc2",
+        ".ff": ".mlp",
+    },
+    orig_to_new_prefix={
+        "audio_proj_in": "audio_patch_proj",
+        "audio_proj_out": "final_layer.audio_out",
+        "context_embedder": "condition_proj",
+        "norm_out.linear": "final_layer.adaln_proj.linear",
+        "norm_out.norm": "final_layer.norm",
+        "proj_in": "video_patch_proj",
+        "proj_out": "final_layer.video_out",
+        "time_embedder.linear_1": "time_embedder.proj_in",
+        "time_embedder.linear_2": "time_embedder.proj_out",
+        "token_refiner.refiner_blocks": "token_refiner.blocks",
+        "transformer_blocks": "blocks",
+    },
+)
+
+# Whole-submodule ModelOpt exclusions target every quantizable child. These
+# aliases are quantization-only because the corresponding checkpoint trees are
+# not structurally identical to the fused H3 module tree.
+_MINIMAX_H3_QUANT_MAPPER = _MINIMAX_H3_TRANSFORMER_MAPPER | WeightsMapper(
+    orig_to_new_prefix={
+        "norm_out": "final_layer.adaln_proj.linear",
+        "token_refiner": "token_refiner.blocks",
+    }
+)
+
 
 def _resolve_component_quant_config(quant_config, component: str):
     if hasattr(quant_config, "resolve"):
@@ -565,31 +601,7 @@ class MiniMaxH3Pipeline(
         }
     )
 
-    # ModelOpt stores the AutoQuant ignore list with Diffusers module names.
-    # Map it before vLLM chooses quantization methods for the fused H3 model.
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={
-            ".attn.to_out.0": ".attn.out_proj",
-            ".attn.to_out": ".attn.out_proj",
-            ".ff.net.0.proj": ".mlp.fc1",
-            ".ff.net.0": ".mlp.fc1",
-            ".ff.net.2": ".mlp.fc2",
-            ".ff": ".mlp",
-        },
-        orig_to_new_prefix={
-            "audio_proj_in": "audio_patch_proj",
-            "audio_proj_out": "final_layer.audio_out",
-            "context_embedder": "condition_proj",
-            "norm_out.linear": "final_layer.adaln_proj.linear",
-            "norm_out.norm": "final_layer.norm",
-            "proj_in": "video_patch_proj",
-            "proj_out": "final_layer.video_out",
-            "time_embedder.linear_1": "time_embedder.proj_in",
-            "time_embedder.linear_2": "time_embedder.proj_out",
-            "token_refiner.refiner_blocks": "token_refiner.blocks",
-            "transformer_blocks": "blocks",
-        },
-    )
+    hf_to_vllm_mapper = _MINIMAX_H3_QUANT_MAPPER
     packed_modules_mapping: ClassVar[dict[str, list[str]]] = {
         "qkv_proj": ["to_q", "to_k", "to_v"],
     }
@@ -609,28 +621,8 @@ class MiniMaxH3Pipeline(
         if root not in MiniMaxH3Pipeline._DIFFUSERS_TRANSFORMER_ROOTS:
             return None
 
-        target = source
-        target = target.replace("token_refiner.refiner_blocks.", "token_refiner.blocks.", 1)
-        target = target.replace("time_embedder.linear_1.", "time_embedder.proj_in.")
-        target = target.replace("time_embedder.linear_2.", "time_embedder.proj_out.")
-        root_aliases = {
-            "transformer_blocks.": "blocks.",
-            "audio_proj_in.": "audio_patch_proj.",
-            "proj_in.": "video_patch_proj.",
-            "context_embedder.": "condition_proj.",
-            "norm_out.norm.": "final_layer.norm.",
-            "norm_out.linear.": "final_layer.adaln_proj.linear.",
-            "audio_proj_out.": "final_layer.audio_out.",
-            "proj_out.": "final_layer.video_out.",
-        }
-        for source_prefix, target_prefix in root_aliases.items():
-            if target.startswith(source_prefix):
-                target = target_prefix + target[len(source_prefix) :]
-                break
-        target = target.replace(".attn.norm_q.", ".attn.q_norm.")
-        target = target.replace(".attn.norm_k.", ".attn.k_norm.")
-        target = target.replace(".attn.to_out.0.", ".attn.out_proj.")
-        target = target.replace(".ff.net.2.", ".mlp.fc2.")
+        diffusers_fc1 = ".ff.net.0.proj." in source
+        target = _MINIMAX_H3_TRANSFORMER_MAPPER.apply_list([source])[0]
 
         qkv_match = re.search(r"\.attn\.to_([qkv])\.(weight|weight_scale|input_scale)$", target)
         if qkv_match:
@@ -640,8 +632,7 @@ class MiniMaxH3Pipeline(
             output_name = f"{prefix}{base}.attn.qkv_proj.to_{shard_id}.{suffix}"
             return parameter_name, output_name
 
-        if ".ff.net.0.proj." in target:
-            target = target.replace(".ff.net.0.proj.", ".mlp.fc1.")
+        if diffusers_fc1:
             parameter_name = prefix + target
             if target.endswith(".mlp.fc1.weight"):
                 output_name = parameter_name.removesuffix(".weight") + ".diffusers_weight"
