@@ -1,11 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Generator, Iterable
+import copy
+import json
+from collections import defaultdict
+from collections.abc import Callable, Generator, Iterable
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
 
 import torch
+from safetensors import safe_open
 from torch import nn
 from vllm.logger import init_logger
+from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.models.utils import WeightsMapper
 from vllm.model_executor.utils import get_packed_modules_mapping
 
@@ -32,6 +39,221 @@ FP8_DTYPES = tuple(
     )
     if dtype is not None
 )
+SAFETENSORS_INDEX_FILES = (
+    "diffusion_pytorch_model.safetensors.index.json",
+    "model.safetensors.index.json",
+)
+_CheckpointKeyMapper = Callable[[str], str | tuple[str, object] | None]
+
+
+@dataclass(frozen=True)
+class _ModelOptFp8QuantizationPlan:
+    """Exact runtime precision decisions derived from checkpoint tensors."""
+
+    quantized_modules: frozenset[str]
+    unquantized_modules: frozenset[str]
+    source_linear_count: int
+
+    @property
+    def modules(self) -> frozenset[str]:
+        return self.quantized_modules | self.unquantized_modules
+
+
+def _modelopt_safetensors_files(checkpoint_dir: Path) -> list[Path]:
+    indexes = [checkpoint_dir / name for name in SAFETENSORS_INDEX_FILES if (checkpoint_dir / name).is_file()]
+    if len(indexes) > 1:
+        raise ValueError(f"Multiple safetensors indexes found in {checkpoint_dir}: {indexes}")
+    if indexes:
+        with indexes[0].open(encoding="utf-8") as handle:
+            weight_map = json.load(handle).get("weight_map")
+        if not isinstance(weight_map, dict) or not weight_map:
+            raise ValueError(f"Invalid or empty weight_map in {indexes[0]}")
+        files = [checkpoint_dir / name for name in sorted(set(weight_map.values()))]
+    else:
+        files = sorted(checkpoint_dir.glob("*.safetensors"))
+    missing = [path for path in files if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(f"Safetensors shards referenced by {checkpoint_dir} are missing: {missing}")
+    if not files:
+        raise FileNotFoundError(f"No safetensors checkpoint found in {checkpoint_dir}")
+    return files
+
+
+def _map_checkpoint_target(
+    key: str,
+    key_mapper: _CheckpointKeyMapper,
+    *,
+    source_prefix: str,
+    target_prefix: str,
+    allow_unmapped: bool = False,
+) -> str | None:
+    remapped = key_mapper(source_prefix + key)
+    target = remapped[0] if isinstance(remapped, tuple) else remapped
+    if target is None:
+        if allow_unmapped:
+            return None
+        raise ValueError(f"No canonical runtime mapping for checkpoint tensor {key!r}")
+    if target_prefix:
+        if not target.startswith(target_prefix):
+            raise ValueError(f"Mapped tensor {key!r} to {target!r}, outside target prefix {target_prefix!r}")
+        target = target[len(target_prefix) :]
+    return target
+
+
+def _build_modelopt_fp8_quantization_plan(
+    checkpoint_dir: str | Path,
+    key_mapper: _CheckpointKeyMapper,
+    *,
+    source_prefix: str = "",
+    target_prefix: str = "",
+    allow_unmapped: bool = False,
+    target_module_prefixes: tuple[str, ...] = (),
+) -> _ModelOptFp8QuantizationPlan:
+    """Derive exact BF16/FP8 runtime groups from safetensors headers.
+
+    Multiple source projections may map to one packed runtime module. Every
+    member must use the same precision, otherwise the checkpoint is rejected.
+    """
+
+    checkpoint_dir = Path(checkpoint_dir)
+    tensor_metadata: dict[str, tuple[str, tuple[int, ...]]] = {}
+    for filename in _modelopt_safetensors_files(checkpoint_dir):
+        with safe_open(filename, framework="pt", device="cpu") as handle:
+            for key in handle.keys():
+                if key in tensor_metadata:
+                    raise ValueError(f"Duplicate safetensors key {key!r} in {checkpoint_dir}")
+                tensor_slice = handle.get_slice(key)
+                tensor_metadata[key] = (str(tensor_slice.get_dtype()), tuple(tensor_slice.get_shape()))
+
+    target_sources: dict[str, list[tuple[str, bool]]] = defaultdict(list)
+    for key, (dtype, shape) in tensor_metadata.items():
+        if not key.endswith(".weight") or len(shape) != 2:
+            continue
+
+        is_fp8 = dtype.startswith("F8_")
+        if not is_fp8 and dtype not in {"BF16", "F16", "F32"}:
+            raise ValueError(f"Unsupported ModelOpt linear dtype {dtype} for {key!r}")
+        scale_key = key.removesuffix(".weight") + ".weight_scale"
+        has_scale = scale_key in tensor_metadata
+        if is_fp8 != has_scale:
+            expected = "present" if is_fp8 else "absent"
+            raise ValueError(f"ModelOpt weight_scale must be {expected} for {key!r}, got {has_scale=}")
+
+        target_weight = _map_checkpoint_target(
+            key,
+            key_mapper,
+            source_prefix=source_prefix,
+            target_prefix=target_prefix,
+            allow_unmapped=allow_unmapped,
+        )
+        if target_weight is None:
+            continue
+        if not target_weight.endswith(".weight"):
+            raise ValueError(f"Linear weight {key!r} mapped to non-weight target {target_weight!r}")
+        target_module = target_weight.removesuffix(".weight")
+        if target_module_prefixes and not target_module.startswith(target_module_prefixes):
+            continue
+
+        if is_fp8:
+            target_scale = _map_checkpoint_target(
+                scale_key,
+                key_mapper,
+                source_prefix=source_prefix,
+                target_prefix=target_prefix,
+            )
+            if target_scale != target_module + ".weight_scale":
+                raise ValueError(
+                    f"Weight and scale for {key!r} map to different runtime modules: "
+                    f"{target_weight!r} vs {target_scale!r}"
+                )
+        target_sources[target_module].append((key, is_fp8))
+
+    conflicts = {
+        target: sources for target, sources in target_sources.items() if len({is_fp8 for _, is_fp8 in sources}) != 1
+    }
+    if conflicts:
+        raise ValueError(f"Packed runtime modules contain mixed BF16/FP8 source projections: {conflicts}")
+
+    quantized = frozenset(target for target, sources in target_sources.items() if sources[0][1])
+    unquantized = frozenset(target_sources) - quantized
+    plan = _ModelOptFp8QuantizationPlan(
+        quantized_modules=quantized,
+        unquantized_modules=unquantized,
+        source_linear_count=sum(len(sources) for sources in target_sources.values()),
+    )
+    logger.info(
+        "Derived ModelOpt FP8 checkpoint plan from %s: %d source linears -> "
+        "%d runtime groups (%d FP8, %d full precision)",
+        checkpoint_dir,
+        plan.source_linear_count,
+        len(plan.modules),
+        len(plan.quantized_modules),
+        len(plan.unquantized_modules),
+    )
+    return plan
+
+
+def _validate_modelopt_fp8_quantization_plan(
+    model: nn.Module,
+    plan: _ModelOptFp8QuantizationPlan,
+) -> None:
+    """Verify that runtime LinearBase construction exactly matches the plan."""
+
+    runtime_linears = {name: module for name, module in model.named_modules() if isinstance(module, LinearBase)}
+    runtime_names = frozenset(runtime_linears)
+    missing_runtime = plan.modules - runtime_names
+    unplanned_runtime = runtime_names - plan.modules
+    if missing_runtime or unplanned_runtime:
+        raise ValueError(
+            "ModelOpt checkpoint/runtime linear mapping is incomplete: "
+            f"missing_runtime={sorted(missing_runtime)}, unplanned_runtime={sorted(unplanned_runtime)}"
+        )
+
+    mismatched: list[str] = []
+    for name, module in runtime_linears.items():
+        is_unquantized = isinstance(getattr(module, "quant_method", None), UnquantizedLinearMethod)
+        if is_unquantized != (name in plan.unquantized_modules):
+            mismatched.append(name)
+    if mismatched:
+        raise ValueError(f"Runtime linear precision does not match the ModelOpt checkpoint plan: {mismatched}")
+
+
+class ModelOptFp8CheckpointConfig:
+    """Use exact BF16/FP8 decisions derived from checkpoint tensors."""
+
+    def __init__(self, quant_config: Any, plan: _ModelOptFp8QuantizationPlan):
+        self._quant_config = copy.copy(quant_config)
+        self._quant_config.exclude_modules = []
+        self._plan = plan
+
+    @classmethod
+    def from_checkpoint(
+        cls,
+        quant_config: Any,
+        checkpoint_dir: str | Path,
+        key_mapper: _CheckpointKeyMapper,
+        **plan_kwargs: Any,
+    ) -> "ModelOptFp8CheckpointConfig":
+        plan = _build_modelopt_fp8_quantization_plan(
+            checkpoint_dir,
+            key_mapper,
+            **plan_kwargs,
+        )
+        return cls(quant_config, plan)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._quant_config, name)
+
+    def get_quant_method(self, layer: nn.Module, prefix: str) -> Any:
+        if isinstance(layer, LinearBase):
+            if prefix in self._plan.unquantized_modules:
+                return UnquantizedLinearMethod()
+            if prefix not in self._plan.quantized_modules:
+                raise ValueError(f"No checkpoint precision decision for runtime linear {prefix!r}")
+        return self._quant_config.get_quant_method(layer, prefix)
+
+    def validate(self, model: nn.Module) -> None:
+        _validate_modelopt_fp8_quantization_plan(model, self._plan)
 
 
 @dataclass
@@ -210,6 +432,20 @@ class ModelOptFp8CheckpointAdapter:
             return None
         return target_dtype
 
+    def _check_full_precision_source_target(
+        self,
+        name: str,
+        tensor: torch.Tensor,
+        target_name: str | None,
+    ) -> None:
+        if target_name is None or not name.endswith(".weight") or self._is_fp8_tensor(tensor):
+            return
+        if self._loadable_tensors[target_name].dtype in FP8_DTYPES:
+            raise ValueError(
+                f"Full-precision ModelOpt checkpoint weight {name!r} maps to FP8 runtime parameter "
+                f"{target_name!r}; the checkpoint precision plan was not applied"
+            )
+
     def _maybe_dequantize_or_defer_weight(
         self,
         name: str,
@@ -260,6 +496,7 @@ class ModelOptFp8CheckpointAdapter:
                 yield from self._handle_scale_tensor(name, output_name, tensor, target_name, state)
                 continue
 
+            self._check_full_precision_source_target(name, tensor, target_name)
             target_dtype = self._target_dtype_for_dequantization(tensor, target_name)
             if target_dtype is not None:
                 tensor = self._maybe_dequantize_or_defer_weight(name, output_name, tensor, target_dtype, state)

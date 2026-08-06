@@ -4,6 +4,7 @@ from torch import nn
 
 from .modelopt import (
     ModelOptFp8CheckpointAdapter,
+    ModelOptFp8CheckpointConfig,
     ModelOptMixedPrecisionCheckpointAdapter,
     ModelOptNvFp4CheckpointAdapter,
 )
@@ -26,6 +27,7 @@ def get_checkpoint_adapter(
 
 __all__ = [
     "ModelOptFp8CheckpointAdapter",
+    "ModelOptFp8CheckpointConfig",
     "ModelOptMixedPrecisionCheckpointAdapter",
     "ModelOptNvFp4CheckpointAdapter",
     "get_checkpoint_adapter",
