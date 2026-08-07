@@ -141,6 +141,7 @@ class MiniMaxH3Qwen3VLMergedColumnParallelLinear(LinearBase):
         )
         self.intermediate_size_per_partition = intermediate_size // tp_size
         self._tp_rank = tp_rank
+        self._tp_size = tp_size
         super().__init__(
             input_size=input_size,
             output_size=2 * intermediate_size,
@@ -173,18 +174,28 @@ class MiniMaxH3Qwen3VLMergedColumnParallelLinear(LinearBase):
     def weight_loader(
         self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: int | None = None
     ) -> None:
-        shard_id = 0 if loaded_shard_id is None else loaded_shard_id
+        if loaded_shard_id not in (0, 1):
+            raise ValueError(f"gate/up packed tensor requires shard id 0 or 1, got {loaded_shard_id!r}")
+        shard_id = loaded_shard_id
         shard_size = self.intermediate_size_per_partition
         start_idx = self._tp_rank * shard_size
         if param.ndim == 1:
             scales = loaded_weight.reshape(-1)
             if param.numel() == 2:
                 # Static per-tensor ModelOpt FP8: one scale per logical shard.
+                if scales.numel() != 1:
+                    raise ValueError(f"gate/up static scale must be scalar, got {tuple(loaded_weight.shape)}")
                 param.data[shard_id].copy_(scales[0])
             else:
                 # Dynamic per-token activation / per-output-channel weight:
                 # keep the gate/up output-channel scales aligned with the TP
                 # shard selected for the corresponding weight rows.
+                expected_scales = shard_size * self._tp_size
+                if scales.numel() != expected_scales:
+                    raise ValueError(
+                        f"gate/up per-channel scale must contain {expected_scales} values, "
+                        f"got {tuple(loaded_weight.shape)}"
+                    )
                 target = param.data[shard_id * shard_size : (shard_id + 1) * shard_size]
                 target.copy_(scales.narrow(0, start_idx, shard_size))
             return
@@ -1135,9 +1146,9 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         disk_quant_config = raw_config.get("quantization_config")
         self.quant_config = build_quant_config(disk_quant_config) if disk_quant_config is not None else None
         if self.quant_config is not None:
-            if self.quant_config.get_name() != "modelopt":
+            if self.quant_config.get_name() not in {"modelopt", "modelopt_mixed"}:
                 raise ValueError(
-                    "MiniMax H3 text encoder currently supports only ModelOpt FP8 "
+                    "MiniMax H3 text encoder currently supports only ModelOpt FP8 or mixed-precision "
                     f"pre-quantized checkpoints, got {self.quant_config.get_name()!r}"
                 )
             self.quant_config.packed_modules_mapping = {

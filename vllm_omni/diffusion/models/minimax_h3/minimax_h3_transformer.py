@@ -1091,9 +1091,11 @@ class MiniMaxH3DiTModel(nn.Module):
                 # scales exactly like the fused weight and preserve Diffusers'
                 # [up, gate] -> internal [gate, up] swap.
                 scales = loaded_weight.reshape(-1)
-                if scales.numel() in (1, 2):
-                    gate_scale = scales[0]
-                    up_scale = scales[0 if scales.numel() == 1 else 1]
+                if scales.numel() == 1:
+                    gate_scale = up_scale = scales[0]
+                elif scales.numel() == 2:
+                    first, second = scales
+                    gate_scale, up_scale = (second, first) if diffusers_fc1 else (first, second)
                 elif target_name.endswith(".mlp.fc1.weight_scale") and scales.numel() % 2 == 0:
                     first, second = scales.chunk(2)
                     gate_scale, up_scale = (second, first) if diffusers_fc1 else (first, second)
