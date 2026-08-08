@@ -69,6 +69,31 @@ def _tp_range(group: Any) -> tuple[int, int]:
     return group.rank_in_group, group.world_size
 
 
+def _create_linear_weights(
+    layer: LinearBase,
+    *,
+    input_size_per_partition: int,
+    output_partition_sizes: list[int],
+    input_size: int,
+    output_size: int,
+    dtype: torch.dtype,
+) -> None:
+    if isinstance(layer.quant_method, UnquantizedLinearMethod):
+        layer.weight = nn.Parameter(torch.empty(sum(output_partition_sizes), input_size_per_partition, dtype=dtype))
+        layer.weight.weight_loader = layer.weight_loader  # type: ignore[attr-defined]
+        return
+    layer.quant_method.create_weights(
+        layer,
+        input_size_per_partition=input_size_per_partition,
+        output_partition_sizes=output_partition_sizes,
+        input_size=input_size,
+        output_size=output_size,
+        params_dtype=dtype,
+        weight_loader=layer.weight_loader,
+    )
+    layer.update_param_tp_status()
+
+
 # ---------------------------------------------------------------------------
 # Tensor-parallel primitives bound to the encoder process group.
 #
@@ -151,7 +176,7 @@ class MiniMaxH3Qwen3VLMergedColumnParallelLinear(LinearBase):
             return_bias=False,
             disable_tp=True,
         )
-        self.quant_method.create_weights(
+        _create_linear_weights(
             self,
             input_size_per_partition=input_size,
             output_partition_sizes=[
@@ -160,8 +185,7 @@ class MiniMaxH3Qwen3VLMergedColumnParallelLinear(LinearBase):
             ],
             input_size=input_size,
             output_size=2 * intermediate_size,
-            params_dtype=dtype,
-            weight_loader=self.weight_loader,
+            dtype=dtype,
         )
 
     @property
@@ -169,6 +193,8 @@ class MiniMaxH3Qwen3VLMergedColumnParallelLinear(LinearBase):
         return not isinstance(self.quant_method, UnquantizedLinearMethod)
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
+        if not self.uses_quantized_kernel:
+            return F.linear(input_, self.weight)
         return self.quant_method.apply(self, input_)
 
     def weight_loader(
@@ -241,14 +267,13 @@ class MiniMaxH3Qwen3VLQKVParallelLinear(LinearBase):
             return_bias=False,
             disable_tp=True,
         )
-        self.quant_method.create_weights(
+        _create_linear_weights(
             self,
             input_size_per_partition=hidden_size,
             output_partition_sizes=[q_local, kv_local, kv_local],
             input_size=hidden_size,
             output_size=(num_heads + 2 * num_kv_heads) * head_dim,
-            params_dtype=dtype,
-            weight_loader=self.weight_loader,
+            dtype=dtype,
         )
 
     @property
@@ -256,6 +281,8 @@ class MiniMaxH3Qwen3VLQKVParallelLinear(LinearBase):
         return not isinstance(self.quant_method, UnquantizedLinearMethod)
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
+        if not self.uses_quantized_kernel:
+            return F.linear(input_, self.weight)
         return self.quant_method.apply(self, input_)
 
     def weight_loader(
@@ -348,18 +375,20 @@ class MiniMaxH3Qwen3VLRowParallelLinear(LinearBase):
             return_bias=False,
             disable_tp=True,
         )
-        self.quant_method.create_weights(
+        _create_linear_weights(
             self,
             input_size_per_partition=self.input_size_per_partition,
             output_partition_sizes=[output_size],
             input_size=input_size,
             output_size=output_size,
-            params_dtype=dtype,
-            weight_loader=self.weight_loader,
+            dtype=dtype,
         )
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
-        output_parallel = self.quant_method.apply(self, input_)
+        if isinstance(self.quant_method, UnquantizedLinearMethod):
+            output_parallel = F.linear(input_, self.weight)
+        else:
+            output_parallel = self.quant_method.apply(self, input_)
         if self._tp_size > 1:
             # Reduce in fp32: the reference path accumulates the full (K=8192)
             # dot product inside a single cuBLAS GEMM before rounding to bf16.
