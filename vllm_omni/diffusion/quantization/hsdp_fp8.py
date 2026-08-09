@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""HSDP/FSDP2 compatibility for online FP8 quantization.
+"""HSDP/FSDP2 compatibility for CUTLASS FP8 quantization.
 
-vllm's ``Fp8LinearMethod.process_weights_after_loading`` ends with
+vLLM's online and serialized ModelOpt FP8 linear methods end with
 ``layer.weight = qweight.t()`` so that the Cutlass FP8 GEMM kernel sees its
 B operand as column-major ``[K, N]`` (the TN layout required by Hopper FP8
 ``wgmma`` instructions). The resulting tensor is a non-contiguous transpose
@@ -33,8 +33,18 @@ import types
 from torch import nn
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
+from vllm.model_executor.layers.quantization.modelopt import (
+    ModelOptFp8LinearMethod,
+    ModelOptFp8PcPtLinearMethod,
+)
 
 logger = init_logger(__name__)
+
+_TRANSPOSED_FP8_METHODS = (
+    Fp8LinearMethod,
+    ModelOptFp8LinearMethod,
+    ModelOptFp8PcPtLinearMethod,
+)
 
 
 def _build_transposed_get_layer_params(original_bound_method):
@@ -53,11 +63,11 @@ def _build_transposed_get_layer_params(original_bound_method):
 
 
 def prepare_fp8_layers_for_fsdp(model: nn.Module) -> int:
-    """Make online-FP8 linear layers in ``model`` FSDP2-compatible.
+    """Make CUTLASS FP8 linear layers in ``model`` FSDP2-compatible.
 
-    For every layer whose ``quant_method`` is an :class:`Fp8LinearMethod`
-    and whose weight is currently a non-contiguous transpose view, this
-    function:
+    This covers both online :class:`Fp8LinearMethod` layers and serialized
+    ModelOpt FP8 layers. For every supported layer whose weight is currently
+    a non-contiguous transpose view, this function:
 
     1. Replaces ``layer.weight`` with the underlying ``(out, in)`` row-major
        contiguous storage so FSDP2 ``fully_shard`` accepts it.
@@ -66,8 +76,8 @@ def prepare_fp8_layers_for_fsdp(model: nn.Module) -> int:
        downstream ``apply_scaled_mm`` continue to see a column-major
        ``(in, out)`` B with zero copies.
 
-    Layers whose weight is already contiguous (e.g. Marlin FP8, offline-
-    quantized checkpoints) or that use a different quant method are skipped.
+    Layers whose weight is already contiguous (e.g. Marlin or block-wise FP8)
+    or that use a different quant method are skipped.
 
     Returns:
         Number of layers rewritten.
@@ -76,7 +86,7 @@ def prepare_fp8_layers_for_fsdp(model: nn.Module) -> int:
     patched_kernel_ids: set[int] = set()
     for module in model.modules():
         qm = getattr(module, "quant_method", None)
-        if not isinstance(qm, Fp8LinearMethod):
+        if not isinstance(qm, _TRANSPOSED_FP8_METHODS):
             continue
 
         weight = getattr(module, "weight", None)
