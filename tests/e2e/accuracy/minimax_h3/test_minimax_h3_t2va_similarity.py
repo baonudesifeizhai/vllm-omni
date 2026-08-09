@@ -57,6 +57,16 @@ SSIM_THRESHOLD = 0.82
 PSNR_THRESHOLD = 20.0
 MODELOPT_FP8_SSIM_THRESHOLD = 0.72
 MODELOPT_FP8_PSNR_THRESHOLD = 20.0
+MODELOPT_FP8_PROMPT = (
+    "In a snowy blue-purple forest, a small white spirit carefully walks past "
+    "a sleeping giant; footsteps crunch in the snow while the creature breathes softly."
+)
+MODELOPT_FP8_WIDTH = 672
+MODELOPT_FP8_HEIGHT = 384
+MODELOPT_FP8_NUM_FRAMES = 107
+MODELOPT_FP8_NUM_INFERENCE_STEPS = 10
+MODELOPT_FP8_DURATION_SECONDS = 4.0
+MODELOPT_FP8_SEED = 1101
 REQUEST_TIMEOUT_SECONDS = 60 * 60
 
 
@@ -116,8 +126,8 @@ def _modelopt_fp8_model_name(output_dir: Path) -> str:
     return str(fl2va_path)
 
 
-def _server_args() -> list[str]:
-    return [
+def _server_args(*, use_hsdp: bool = True) -> list[str]:
+    args = [
         "--trust-remote-code",
         "--num-gpus",
         "4",
@@ -125,9 +135,6 @@ def _server_args() -> list[str]:
         "4",
         "--ring",
         "1",
-        "--use-hsdp",
-        "--hsdp-shard-size",
-        "4",
         "--text-encoder-tp-size",
         "4",
         "--vae-patch-parallel-size",
@@ -142,6 +149,9 @@ def _server_args() -> list[str]:
         "--init-timeout",
         "1800",
     ]
+    if use_hsdp:
+        args.extend(["--use-hsdp", "--hsdp-shard-size", "4"])
+    return args
 
 
 def _download_reference_video(output_dir: Path) -> Path:
@@ -187,36 +197,36 @@ def _probe_audio(path: Path) -> dict[str, str | int]:
     }
 
 
-def _run_t2va_accuracy(
+def _generate_t2va(
     *,
     model: str,
-    output_dir: Path,
-    label: str,
-    ssim_threshold: float,
-    psnr_threshold: float,
+    output_path: Path,
+    prompt: str,
+    width: int,
+    height: int,
+    num_inference_steps: int,
+    duration_seconds: float,
+    seed: int,
     server_args: list[str],
 ) -> None:
-    reference_path = _download_reference_video(output_dir)
-    generated_path = output_dir / "vllm_omni.mp4"
-
     server_env = {
         "FLASHINFER_DISABLE_VERSION_CHECK": "1",
         "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
         "VLLM_OMNI_VIDEO_SYNC_TIMEOUT": str(REQUEST_TIMEOUT_SECONDS),
-        "VLLM_OMNI_STORAGE_PATH": str(output_dir / "storage"),
+        "VLLM_OMNI_STORAGE_PATH": str(output_path.parent / f"{output_path.stem}_storage"),
     }
     request_data = {
-        "prompt": PROMPT,
-        "width": str(WIDTH),
-        "height": str(HEIGHT),
+        "prompt": prompt,
+        "width": str(width),
+        "height": str(height),
         "fps": str(FPS),
-        "num_inference_steps": str(NUM_INFERENCE_STEPS),
+        "num_inference_steps": str(num_inference_steps),
         "flow_shift": str(FLOW_SHIFT),
-        "seed": str(SEED),
+        "seed": str(seed),
         "extra_params": json.dumps(
             {
                 "task": "t2va",
-                "duration": DURATION_SECONDS,
+                "duration": duration_seconds,
                 "aspect_ratio": "16:9",
                 "audio_flow_shift": AUDIO_FLOW_SHIFT,
             }
@@ -237,7 +247,31 @@ def _run_t2va_accuracy(
 
     response.raise_for_status()
     assert response.headers["content-type"].startswith("video/mp4")
-    generated_path.write_bytes(response.content)
+    output_path.write_bytes(response.content)
+
+
+def _run_t2va_accuracy(
+    *,
+    model: str,
+    output_dir: Path,
+    label: str,
+    ssim_threshold: float,
+    psnr_threshold: float,
+    server_args: list[str],
+) -> None:
+    reference_path = _download_reference_video(output_dir)
+    generated_path = output_dir / "vllm_omni.mp4"
+    _generate_t2va(
+        model=model,
+        output_path=generated_path,
+        prompt=PROMPT,
+        width=WIDTH,
+        height=HEIGHT,
+        num_inference_steps=NUM_INFERENCE_STEPS,
+        duration_seconds=DURATION_SECONDS,
+        seed=SEED,
+        server_args=server_args,
+    )
 
     reference_metadata = probe_video(reference_path)
     generated_metadata = probe_video(generated_path)
@@ -284,7 +318,7 @@ def test_minimax_h3_t2va_matches_official_reference(
 
 
 @hardware_test(res={"cuda": "H100"}, num_cards=4)
-def test_minimax_h3_modelopt_fp8_t2va_matches_official_reference(
+def test_minimax_h3_modelopt_fp8_t2va_matches_bf16(
     accuracy_artifact_root: Path,
 ) -> None:
     if not torch.cuda.is_available():
@@ -293,11 +327,48 @@ def test_minimax_h3_modelopt_fp8_t2va_matches_official_reference(
     probe_binary("ffmpeg")
     probe_binary("ffprobe")
     output_dir = reset_artifact_dir(accuracy_artifact_root / "minimax_h3_modelopt_fp8_t2va")
-    _run_t2va_accuracy(
+    bf16_path = output_dir / "bf16.mp4"
+    fp8_path = output_dir / "modelopt_fp8.mp4"
+    server_args = [*_server_args(use_hsdp=False), "--enforce-eager"]
+
+    _generate_t2va(
+        model=_model_name(),
+        output_path=bf16_path,
+        prompt=MODELOPT_FP8_PROMPT,
+        width=MODELOPT_FP8_WIDTH,
+        height=MODELOPT_FP8_HEIGHT,
+        num_inference_steps=MODELOPT_FP8_NUM_INFERENCE_STEPS,
+        duration_seconds=MODELOPT_FP8_DURATION_SECONDS,
+        seed=MODELOPT_FP8_SEED,
+        server_args=server_args,
+    )
+    _generate_t2va(
         model=_modelopt_fp8_model_name(output_dir),
-        output_dir=output_dir,
-        label="minimax_h3_modelopt_fp8_t2va_official_reference",
+        output_path=fp8_path,
+        prompt=MODELOPT_FP8_PROMPT,
+        width=MODELOPT_FP8_WIDTH,
+        height=MODELOPT_FP8_HEIGHT,
+        num_inference_steps=MODELOPT_FP8_NUM_INFERENCE_STEPS,
+        duration_seconds=MODELOPT_FP8_DURATION_SECONDS,
+        seed=MODELOPT_FP8_SEED,
+        server_args=[*server_args, "--force-cutlass-fp8"],
+    )
+
+    bf16_metadata = probe_video(bf16_path)
+    fp8_metadata = probe_video(fp8_path)
+    assert bf16_metadata == fp8_metadata
+    assert_video_metadata(
+        fp8_metadata,
+        width=MODELOPT_FP8_WIDTH,
+        height=MODELOPT_FP8_HEIGHT,
+        fps=FPS,
+        frame_count=MODELOPT_FP8_NUM_FRAMES,
+    )
+    assert _probe_audio(bf16_path) == _probe_audio(fp8_path)
+    assert_video_similarity_metrics(
+        label="minimax_h3_modelopt_fp8_t2va_bf16",
+        online_path=fp8_path,
+        offline_path=bf16_path,
         ssim_threshold=MODELOPT_FP8_SSIM_THRESHOLD,
         psnr_threshold=MODELOPT_FP8_PSNR_THRESHOLD,
-        server_args=[*_server_args(), "--enforce-eager", "--force-cutlass-fp8"],
     )
