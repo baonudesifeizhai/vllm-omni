@@ -31,7 +31,7 @@ MODEL_REPO_ID = "MiniMaxAI/MiniMax-H3"
 MODEL_REVISION = "main"
 MODEL_ENV_VAR = "VLLM_TEST_MINIMAX_H3_FL2VA_MODEL"
 MODELOPT_MODEL_REPO_ID = "feizhai123/MiniMax-H3-ModelOpt-Mixed9-Dynamic-FP8"
-MODELOPT_MODEL_REVISION = "80a8efc5bb9473f12ec1f0e5a1b20be5c7765fe7"
+MODELOPT_MODEL_REVISION = "98f87ad983dbcd6a956b6623308626b2245b5098"
 MODELOPT_MODEL_ENV_VAR = "VLLM_TEST_MINIMAX_H3_MODELOPT_FP8_MODEL"
 # Keep the official asset link visible in the test report. Hugging Face's
 # ``blob`` URL is an HTML page, so resolve it to the raw asset for download.
@@ -92,26 +92,19 @@ def _modelopt_fp8_model_name() -> str:
             snapshot_download(
                 repo_id=MODELOPT_MODEL_REPO_ID,
                 revision=MODELOPT_MODEL_REVISION,
-                allow_patterns=[
-                    "audio_vae/**",
-                    "model_index.json",
-                    "processor/**",
-                    "text_encoder/**",
-                    "tokenizer/**",
-                    "transformer/**",
-                    "video_vae/**",
-                ],
+                allow_patterns=["FL2VA/**"],
             )
         )
+    model_path = model_root if model_root.name == "FL2VA" else model_root / "FL2VA"
 
     for component in ("transformer", "text_encoder"):
-        config = json.loads((model_root / component / "config.json").read_text(encoding="utf-8"))
+        config = json.loads((model_path / component / "config.json").read_text(encoding="utf-8"))
         quant_config = config.get("quantization_config") or {}
         if quant_config.get("quant_method") != "modelopt" or not str(quant_config.get("quant_algo", "")).startswith(
             "FP8"
         ):
             raise ValueError(f"MiniMax H3 {component} is not a serialized ModelOpt FP8 checkpoint")
-    return str(model_root)
+    return str(model_path)
 
 
 def _server_args(*, use_hsdp: bool = True) -> list[str]:
