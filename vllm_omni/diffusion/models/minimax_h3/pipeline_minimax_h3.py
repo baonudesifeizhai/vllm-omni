@@ -845,7 +845,17 @@ class MiniMaxH3Pipeline(
             self.partition,
             load_text_encoder=self.load_text_encoder,
         )
-        model_path = model_root / ("Ref2VA" if self.partition == "ref2va" else "FL2VA")
+        standalone_partition = _minimax_h3_standalone_partition(model_root)
+        if standalone_partition is not None:
+            if self.partition not in {"combined", standalone_partition}:
+                raise ValueError(
+                    f"MiniMax-H3 checkpoint contains only {standalone_partition}, "
+                    f"but task_type selected {self.partition}"
+                )
+            self.partition = standalone_partition
+            model_path = model_root
+        else:
+            model_path = model_root / ("Ref2VA" if self.partition == "ref2va" else "FL2VA")
         model_index = json.loads((model_path / "model_index.json").read_text(encoding="utf-8"))
         release = model_index.get("_minimax_h3") or {}
         partition = str(release.get("partition", "")).lower()

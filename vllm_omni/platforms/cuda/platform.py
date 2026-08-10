@@ -47,24 +47,6 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
         if "Turing" in gpu_name or "Tesla" in gpu_name or "T4" in gpu_name:
             return False
 
-        capability = cls.get_device_capability()
-        if capability is not None and capability.major >= 10:
-            # The vLLM FA2/FA3 fallback kernels are built for Ampere/Hopper.
-            # Importability alone is insufficient on Blackwell: those kernels
-            # abort at launch with ``no kernel image is available``. Only the
-            # CuTe FA4 implementation is valid here.
-            try:
-                from flash_attn.cute import flash_attn_varlen_func  # noqa: F401
-
-                return True
-            except Exception as exc:
-                logger.warning(
-                    "CuTe FlashAttention-4 is unavailable on Blackwell (%s); "
-                    "falling back to a compatible diffusion attention backend.",
-                    exc,
-                )
-                return False
-
         if not is_flash_attn_installed():
             return False
 
