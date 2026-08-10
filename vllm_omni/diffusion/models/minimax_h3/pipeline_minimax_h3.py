@@ -587,32 +587,6 @@ class MiniMaxH3Pipeline(
     # Only distilled releases pin a schedule, so the default keeps the legacy
     # uniform path available to partially constructed pipelines.
     _base_schedule_by_partition: ClassVar[Mapping[str, DMD2SigmaSchedule | None]] = {}
-    _INTERNAL_TRANSFORMER_ROOTS: ClassVar[frozenset[str]] = frozenset(
-        {
-            "audio_patch_proj",
-            "blocks",
-            "condition_proj",
-            "final_layer",
-            "rope",
-            "time_embedder",
-            "token_refiner",
-            "video_patch_proj",
-        }
-    )
-    _DIFFUSERS_TRANSFORMER_ROOTS: ClassVar[frozenset[str]] = frozenset(
-        {
-            "audio_proj_in",
-            "audio_proj_out",
-            "context_embedder",
-            "norm_out",
-            "proj_in",
-            "proj_out",
-            "time_embedder",
-            "token_refiner",
-            "transformer_blocks",
-        }
-    )
-
     hf_to_vllm_mapper = _MINIMAX_H3_QUANT_IGNORE_MAPPER
     packed_modules_mapping: ClassVar[dict[str, list[str]]] = {
         "qkv_proj": ["to_q", "to_k", "to_v"],
@@ -621,7 +595,7 @@ class MiniMaxH3Pipeline(
 
     @staticmethod
     def remap_checkpoint_key(key: str) -> str | tuple[str, str] | None:
-        """Map Diffusers ModelOpt H3 tensors to the custom fused H3 model."""
+        """Return a Diffusers-to-runtime candidate for the ModelOpt adapter."""
         if key.startswith("transformer."):
             prefix = "transformer."
         elif key.startswith("transformers_ref."):
@@ -629,14 +603,6 @@ class MiniMaxH3Pipeline(
         else:
             return None
         source = key[len(prefix) :]
-        root = source.partition(".")[0]
-        overlapping_diffusers_layout = source.startswith(("time_embedder.linear_", "token_refiner.refiner_blocks."))
-        if root in MiniMaxH3Pipeline._INTERNAL_TRANSFORMER_ROOTS and not overlapping_diffusers_layout:
-            target = prefix + source
-            return target, target
-        if root not in MiniMaxH3Pipeline._DIFFUSERS_TRANSFORMER_ROOTS:
-            return None
-
         diffusers_fc1 = ".ff.net.0.proj." in source
         target = _MINIMAX_H3_TRANSFORMER_MAPPER.apply_list([source])[0]
 
