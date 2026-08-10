@@ -770,6 +770,7 @@ vllm serve "${MODEL}" \
   --host 0.0.0.0 \
   --port "${PORT}" \
   --trust-remote-code \
+  --task-type t2va \
   --num-gpus 1 \
   --enforce-eager \
   --force-cutlass-fp8 \
