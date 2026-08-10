@@ -975,9 +975,16 @@ class MiniMaxH3Pipeline(
             od_config.quantization_config,
             "transformer",
         )
+        ref_transformer_quant_config = _resolve_component_quant_config(
+            od_config.quantization_config,
+            "transformers_ref",
+        )
         if transformer_quant_config is not None:
             transformer_quant_config.apply_vllm_mapper(self.hf_to_vllm_mapper)
             transformer_quant_config.packed_modules_mapping = self.packed_modules_mapping
+        if ref_transformer_quant_config is not None and ref_transformer_quant_config is not transformer_quant_config:
+            ref_transformer_quant_config.apply_vllm_mapper(self.hf_to_vllm_mapper)
+            ref_transformer_quant_config.packed_modules_mapping = self.packed_modules_mapping
         self.transformer = MiniMaxH3DiTModel(
             od_config,
             quant_config=transformer_quant_config,
@@ -991,7 +998,7 @@ class MiniMaxH3Pipeline(
         if ref2va_model_path is not None:
             self.transformers_ref = MiniMaxH3DiTModel(
                 od_config,
-                quant_config=transformer_quant_config,
+                quant_config=ref_transformer_quant_config,
                 diffusers_weights=modular,
             )
 
