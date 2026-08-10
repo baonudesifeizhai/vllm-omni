@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""HSDP/FSDP2 compatibility for CUTLASS FP8 quantization.
+"""HSDP/FSDP2 compatibility for online FP8 quantization.
 
-vLLM's online and serialized ModelOpt FP8 linear methods end with
+vllm's ``Fp8LinearMethod.process_weights_after_loading`` ends with
 ``layer.weight = qweight.t()`` so that the Cutlass FP8 GEMM kernel sees its
 B operand as column-major ``[K, N]`` (the TN layout required by Hopper FP8
 ``wgmma`` instructions). The resulting tensor is a non-contiguous transpose
@@ -61,7 +61,7 @@ def _build_transposed_get_layer_params(original_bound_method):
 
 
 def prepare_fp8_layers_for_fsdp(model: nn.Module) -> int:
-    """Make CUTLASS FP8 linear layers in ``model`` FSDP2-compatible.
+    """Make online-FP8 linear layers in ``model`` FSDP2-compatible.
 
     For every layer whose quantization method stores FP8 weights as a
     non-contiguous transpose view, this function:
@@ -73,8 +73,8 @@ def prepare_fp8_layers_for_fsdp(model: nn.Module) -> int:
        downstream ``apply_scaled_mm`` continue to see a column-major
        ``(in, out)`` B with zero copies.
 
-    Layers whose weight is already contiguous (e.g. Marlin or block-wise FP8)
-    or that use a different quant method are skipped.
+    Layers whose weight is already contiguous (e.g. Marlin FP8, offline-
+    quantized checkpoints) or that use a different quant method are skipped.
 
     Returns:
         Number of layers rewritten.
