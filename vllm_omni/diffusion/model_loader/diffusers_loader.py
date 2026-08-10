@@ -708,10 +708,12 @@ class DiffusersPipelineLoader:
         # declare its own conditions.
         outer_dit_names, outer_dits = discovered_modules.outermost_dits()
 
-        # CUTLASS FP8 methods, including serialized ModelOpt FP8, leave layer
-        # weights as non-contiguous transpose views (qweight.t()) so the kernel
-        # gets a column-major B. FSDP2 fully_shard rejects those parameters.
-        # Keep row-major storage for FSDP and apply the .t() at GEMM time.
+        # Online FP8 quantization (Fp8OnlineLinearMethod) leaves layer weights
+        # as non-contiguous transpose views (qweight.t()) so the Cutlass kernel
+        # gets a column-major B. FSDP2 fully_shard rejects non-contiguous params.
+        # Rewrite affected layers in-place to row-major contiguous storage and
+        # shift the .t() to GEMM-call time. Layers using other quant methods or
+        # already-contiguous weights are left untouched.
         if self.quant_config is not None:
             from vllm_omni.diffusion.quantization.hsdp_fp8 import (
                 prepare_fp8_layers_for_fsdp,

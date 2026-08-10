@@ -83,7 +83,7 @@ def _model_name() -> str:
     return str(Path(snapshot_root) / "FL2VA")
 
 
-def _modelopt_fp8_model_name(output_dir: Path) -> str:
+def _modelopt_fp8_model_name() -> str:
     configured = os.environ.get(MODELOPT_MODEL_ENV_VAR)
     if configured:
         model_root = Path(configured)
@@ -104,26 +104,14 @@ def _modelopt_fp8_model_name(output_dir: Path) -> str:
             )
         )
 
-    fl2va_path = model_root
-    if model_root.name != "FL2VA":
-        if not (model_root / "model_index.json").is_file():
-            raise FileNotFoundError(f"MiniMax H3 ModelOpt FL2VA model_index.json not found under {model_root}")
-
-        # This repository stores FL2VA at its root. Expose it through the
-        # standard partition directory expected by the modular H3 pipeline.
-        model_view = output_dir / "model_view"
-        model_view.mkdir()
-        fl2va_path = model_view / "FL2VA"
-        fl2va_path.symlink_to(model_root.resolve(), target_is_directory=True)
-
     for component in ("transformer", "text_encoder"):
-        config = json.loads((fl2va_path / component / "config.json").read_text(encoding="utf-8"))
+        config = json.loads((model_root / component / "config.json").read_text(encoding="utf-8"))
         quant_config = config.get("quantization_config") or {}
         if quant_config.get("quant_method") != "modelopt" or not str(quant_config.get("quant_algo", "")).startswith(
             "FP8"
         ):
             raise ValueError(f"MiniMax H3 {component} is not a serialized ModelOpt FP8 checkpoint")
-    return str(fl2va_path)
+    return str(model_root)
 
 
 def _server_args(*, use_hsdp: bool = True) -> list[str]:
@@ -343,7 +331,7 @@ def test_minimax_h3_modelopt_fp8_t2va_matches_bf16(
         server_args=server_args,
     )
     _generate_t2va(
-        model=_modelopt_fp8_model_name(output_dir),
+        model=_modelopt_fp8_model_name(),
         output_path=fp8_path,
         prompt=MODELOPT_FP8_PROMPT,
         width=MODELOPT_FP8_WIDTH,

@@ -128,6 +128,24 @@ MINIMAX_H3_TASK_DOWNLOAD_PATTERNS = {
     "fl2va": ["FL2VA/**"],
     "ref2va": ["Ref2VA/**"],
 }
+MINIMAX_H3_STANDALONE_DOWNLOAD_PATTERNS = [
+    "audio_vae/**",
+    "model_index.json",
+    "processor/**",
+    "text_encoder/**",
+    "tokenizer/**",
+    "transformer/**",
+    "video_vae/**",
+]
+
+
+def _minimax_h3_standalone_partition(path: Path) -> str | None:
+    index_path = path / "model_index.json"
+    if not index_path.is_file():
+        return None
+    model_index = json.loads(index_path.read_text(encoding="utf-8"))
+    partition = str((model_index.get("_minimax_h3") or {}).get("partition", "")).lower()
+    return partition if partition in {"fl2va", "ref2va"} else None
 
 
 def _minimax_h3_partition_for_task(
@@ -158,6 +176,38 @@ def _resolve_minimax_h3_model_root(
         if path.name in {"FL2VA", "Ref2VA"} and (path / "model_index.json").is_file():
             return path.parent
         return path
+
+    # Quantized or repackaged checkpoints may publish one H3 partition at the
+    # repository root instead of using the official FL2VA/Ref2VA directory.
+    try:
+        probe_root = Path(
+            download_weights_from_hf_specific(
+                model_name_or_path=model,
+                cache_dir=None,
+                allow_patterns=["model_index.json"],
+                revision=revision,
+                require_all=True,
+            )
+        )
+        standalone_partition = _minimax_h3_standalone_partition(probe_root)
+    except Exception:
+        standalone_partition = None
+
+    if standalone_partition is not None:
+        if partition not in {"combined", standalone_partition}:
+            raise ValueError(
+                f"MiniMax-H3 checkpoint contains only {standalone_partition}, but task_type selected {partition}"
+            )
+        return Path(
+            download_weights_from_hf_specific(
+                model_name_or_path=model,
+                cache_dir=None,
+                allow_patterns=MINIMAX_H3_STANDALONE_DOWNLOAD_PATTERNS,
+                revision=revision,
+                require_all=True,
+            )
+        )
+
     allow_patterns = (
         MINIMAX_H3_DOWNLOAD_PATTERNS if partition == "combined" else MINIMAX_H3_TASK_DOWNLOAD_PATTERNS[partition]
     )
@@ -691,7 +741,17 @@ class MiniMaxH3Pipeline(
             od_config.revision,
             self.partition,
         )
-        model_path = model_root / ("Ref2VA" if self.partition == "ref2va" else "FL2VA")
+        standalone_partition = _minimax_h3_standalone_partition(model_root)
+        if standalone_partition is not None:
+            if self.partition not in {"combined", standalone_partition}:
+                raise ValueError(
+                    f"MiniMax-H3 checkpoint contains only {standalone_partition}, "
+                    f"but task_type selected {self.partition}"
+                )
+            self.partition = standalone_partition
+            model_path = model_root
+        else:
+            model_path = model_root / ("Ref2VA" if self.partition == "ref2va" else "FL2VA")
         model_index = json.loads((model_path / "model_index.json").read_text(encoding="utf-8"))
         release = model_index.get("_minimax_h3") or {}
         partition = str(release.get("partition", "")).lower()
