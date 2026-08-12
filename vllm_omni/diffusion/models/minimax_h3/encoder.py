@@ -382,17 +382,14 @@ class MiniMaxH3Qwen3VLRowParallelLinear(LinearBase):
         del loaded_shard_id
         if param.ndim == 1:
             scales = loaded_weight.reshape(-1)
-            if param.numel() == 1:
-                param.data[0].copy_(scales[0])
-            else:
-                # Row-parallel sharding splits input columns only; every rank
-                # retains all output rows and therefore all channel scales.
-                if scales.numel() != param.numel():
-                    raise ValueError(
-                        "MiniMax H3 row-parallel per-channel scale size mismatch: "
-                        f"checkpoint={scales.numel()}, parameter={param.numel()}"
-                    )
-                param.data.copy_(scales)
+            if scales.numel() != param.numel():
+                raise ValueError(
+                    "MiniMax H3 row-parallel scale size mismatch: "
+                    f"checkpoint={scales.numel()}, parameter={param.numel()}"
+                )
+            # Row parallelism only shards the weight's input columns. Static
+            # and per-output-channel scales are therefore replicated unchanged.
+            param.data.copy_(scales)
             return
         shard_size = self.input_size_per_partition
         start_idx = self._tp_rank * shard_size
