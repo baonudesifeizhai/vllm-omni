@@ -205,6 +205,28 @@ _MINIMAX_H3_QUANT_IGNORE_MAPPER = _MINIMAX_H3_TRANSFORMER_MAPPER | WeightsMapper
 )
 
 
+def _remap_minimax_h3_checkpoint_key(key: str) -> str | tuple[str, str] | None:
+    """Map a Diffusers H3 key while preserving packed-loader routing."""
+    component, separator, source = key.partition(".")
+    if not separator or component not in {"transformer", "transformers_ref"}:
+        return None
+
+    target = _MINIMAX_H3_TRANSFORMER_MAPPER.apply_list([source])[0]
+    output = target
+
+    qkv_match = re.search(r"\.attn\.to_([qkv])\.(weight|weight_scale|input_scale)$", target)
+    if qkv_match:
+        shard_id, suffix = qkv_match.groups()
+        stem = f"{target[: qkv_match.start()]}.attn.qkv_proj"
+        target, output = f"{stem}.{suffix}", f"{stem}.to_{shard_id}.{suffix}"
+    elif ".ff.net.0.proj." in source and target.endswith((".weight", ".weight_scale")):
+        stem, _, suffix = target.rpartition(".")
+        output = f"{stem}.diffusers_{suffix}"
+
+    target, output = f"{component}.{target}", f"{component}.{output}"
+    return target if target == output else (target, output)
+
+
 def _read_base_schedule(release: Mapping[str, Any]) -> DMD2SigmaSchedule | None:
     """Read a partition's distilled schedule. An absent key means legacy uniform."""
     return DMD2SigmaSchedule.from_metadata(release)
@@ -592,40 +614,7 @@ class MiniMaxH3Pipeline(
         "qkv_proj": ["to_q", "to_k", "to_v"],
         "fc1": ["gate_proj", "up_proj"],
     }
-
-    @staticmethod
-    def remap_checkpoint_key(key: str) -> str | tuple[str, str] | None:
-        """Return a Diffusers-to-runtime candidate for the ModelOpt adapter."""
-        if key.startswith("transformer."):
-            prefix = "transformer."
-        elif key.startswith("transformers_ref."):
-            prefix = "transformers_ref."
-        else:
-            return None
-        source = key[len(prefix) :]
-        diffusers_fc1 = ".ff.net.0.proj." in source
-        target = _MINIMAX_H3_TRANSFORMER_MAPPER.apply_list([source])[0]
-
-        qkv_match = re.search(r"\.attn\.to_([qkv])\.(weight|weight_scale|input_scale)$", target)
-        if qkv_match:
-            shard_id, suffix = qkv_match.groups()
-            base = target[: qkv_match.start()]
-            parameter_name = f"{prefix}{base}.attn.qkv_proj.{suffix}"
-            output_name = f"{prefix}{base}.attn.qkv_proj.to_{shard_id}.{suffix}"
-            return parameter_name, output_name
-
-        if diffusers_fc1:
-            parameter_name = prefix + target
-            if target.endswith(".mlp.fc1.weight"):
-                output_name = parameter_name.removesuffix(".weight") + ".diffusers_weight"
-                return parameter_name, output_name
-            if target.endswith(".mlp.fc1.weight_scale"):
-                output_name = parameter_name.removesuffix(".weight_scale") + ".diffusers_weight_scale"
-                return parameter_name, output_name
-            return parameter_name, parameter_name
-
-        parameter_name = prefix + target
-        return parameter_name, parameter_name
+    remap_checkpoint_key = staticmethod(_remap_minimax_h3_checkpoint_key)
 
     def adopt_cache_dit_backend(self, backend: CacheDiTBackend) -> None:
         """Adopt runner-installed generic Cache-DiT for request transitions."""

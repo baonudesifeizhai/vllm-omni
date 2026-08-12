@@ -42,9 +42,8 @@ from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMetho
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.models.utils import WeightsMapper
 
-from vllm_omni.quantization import build_quant_config
-
 from vllm_omni.diffusion.layers.norm import RMSNorm as DiffusionRMSNorm
+from vllm_omni.quantization import build_quant_config
 
 MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER = 50
 MINIMAX_H3_QWEN3VL_HIDDEN_DIM = 5120
@@ -381,15 +380,12 @@ class MiniMaxH3Qwen3VLRowParallelLinear(LinearBase):
     ) -> None:
         del loaded_shard_id
         if param.ndim == 1:
-            scales = loaded_weight.reshape(-1)
-            if scales.numel() != param.numel():
+            if loaded_weight.numel() != param.numel():
                 raise ValueError(
                     "MiniMax H3 row-parallel scale size mismatch: "
-                    f"checkpoint={scales.numel()}, parameter={param.numel()}"
+                    f"checkpoint={loaded_weight.numel()}, parameter={param.numel()}"
                 )
-            # Row parallelism only shards the weight's input columns. Static
-            # and per-output-channel scales are therefore replicated unchanged.
-            param.data.copy_(scales)
+            param.data.copy_(loaded_weight.reshape_as(param))
             return
         shard_size = self.input_size_per_partition
         start_idx = self._tp_rank * shard_size
