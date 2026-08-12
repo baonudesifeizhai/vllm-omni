@@ -9,6 +9,7 @@ layout.
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -1031,19 +1032,15 @@ class MiniMaxH3DiTModel(nn.Module):
         for name, loaded_weight in weights:
             target_name = name
             qkv_shard_id = None
-            diffusers_fc1 = False
-            for shard_id in ("q", "k", "v"):
-                marker = f".attn.qkv_proj.to_{shard_id}."
-                if marker in target_name:
-                    target_name = target_name.replace(marker, ".attn.qkv_proj.")
-                    qkv_shard_id = shard_id
-                    break
-            if target_name.endswith(".mlp.fc1.diffusers_weight"):
-                target_name = target_name.removesuffix(".diffusers_weight") + ".weight"
-                diffusers_fc1 = True
-            elif target_name.endswith(".mlp.fc1.diffusers_weight_scale"):
-                target_name = target_name.removesuffix(".diffusers_weight_scale") + ".weight_scale"
-                diffusers_fc1 = True
+            qkv_match = re.search(r"\.attn\.qkv_proj\.to_([qkv])\.(weight|weight_scale|input_scale)$", name)
+            if qkv_match is not None:
+                qkv_shard_id, suffix = qkv_match.groups()
+                target_name = name[: qkv_match.start()] + f".attn.qkv_proj.{suffix}"
+
+            fc1_match = re.search(r"\.mlp\.fc1\.diffusers_(weight(?:_scale)?)$", name)
+            diffusers_fc1 = fc1_match is not None
+            if fc1_match is not None:
+                target_name = name[: fc1_match.start()] + f".mlp.fc1.{fc1_match.group(1)}"
 
             param = params.get(target_name)
             if param is None:
@@ -1072,41 +1069,26 @@ class MiniMaxH3DiTModel(nn.Module):
                     raise ValueError(
                         f"MiniMax H3 fused QKV scale must contain 1 or 3 values, got {tuple(loaded_weight.shape)}"
                     )
-                for index, shard_id in enumerate(shards):
-                    weight_loader(param, scales[0 if scales.numel() == 1 else index], shard_id)
-            elif target_name.endswith(".mlp.fc1.weight"):
-                if loaded_weight.shape[0] % 2:
+                shard_scales = scales.expand(len(shards)) if scales.numel() == 1 else scales
+                for shard_id, scale in zip(shards, shard_scales, strict=True):
+                    weight_loader(param, scale, shard_id)
+            elif target_name.endswith((".mlp.fc1.weight", ".mlp.fc1.weight_scale", ".mlp.fc1.input_scale")):
+                is_weight = target_name.endswith(".weight")
+                is_input_scale = target_name.endswith(".input_scale")
+                values = loaded_weight if is_weight else loaded_weight.reshape(-1)
+                static_scale = not is_weight and values.numel() in (1, 2)
+                split_size = 2 if static_scale and values.numel() == 1 else values.shape[0]
+                can_split = split_size > 0 and split_size % 2 == 0 and (not is_input_scale or static_scale)
+                if not can_split:
+                    tensor_kind = target_name.rpartition(".")[2]
                     raise ValueError(
-                        "MiniMax H3 fc1 checkpoint rows must split evenly into "
-                        f"gate/up matrices, got {tuple(loaded_weight.shape)}"
+                        f"MiniMax H3 fused fc1 {tensor_kind} cannot split into gate/up shards: "
+                        f"{tuple(loaded_weight.shape)}"
                     )
-                first, second = loaded_weight.chunk(2, dim=0)
+                first, second = (values[0], values[-1]) if static_scale else values.chunk(2, dim=0)
                 gate, up = (second, first) if diffusers_fc1 else (first, second)
                 weight_loader(param, gate, 0)
                 weight_loader(param, up, 1)
-            elif target_name.endswith((".mlp.fc1.weight_scale", ".mlp.fc1.input_scale")):
-                # Static FP8 has one shared scalar (or one scalar per logical
-                # shard). Dynamic per-channel/per-token FP8 instead exports a
-                # weight scale for every fc1 output row. Split those channel
-                # scales exactly like the fused weight and preserve Diffusers'
-                # [up, gate] -> internal [gate, up] swap.
-                scales = loaded_weight.reshape(-1)
-                if scales.numel() == 1:
-                    gate_scale = up_scale = scales[0]
-                elif scales.numel() == 2:
-                    first, second = scales
-                    gate_scale, up_scale = (second, first) if diffusers_fc1 else (first, second)
-                elif target_name.endswith(".mlp.fc1.weight_scale") and scales.numel() % 2 == 0:
-                    first, second = scales.chunk(2)
-                    gate_scale, up_scale = (second, first) if diffusers_fc1 else (first, second)
-                else:
-                    raise ValueError(
-                        "MiniMax H3 fused fc1 scale must contain one/two "
-                        "static values or an even per-channel weight-scale "
-                        f"vector, got {tuple(loaded_weight.shape)}"
-                    )
-                weight_loader(param, gate_scale, 0)
-                weight_loader(param, up_scale, 1)
             else:
                 weight_loader(param, loaded_weight)
             loaded.add(target_name)
