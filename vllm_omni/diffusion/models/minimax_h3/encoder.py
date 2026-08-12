@@ -200,35 +200,18 @@ class MiniMaxH3Qwen3VLMergedColumnParallelLinear(LinearBase):
     def weight_loader(
         self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: int | None = None
     ) -> None:
-        if loaded_shard_id not in (0, 1):
+        if loaded_shard_id is None or loaded_shard_id not in (0, 1):
             raise ValueError(f"gate/up packed tensor requires shard id 0 or 1, got {loaded_shard_id!r}")
-        shard_id = loaded_shard_id
         shard_size = self.intermediate_size_per_partition
-        start_idx = self._tp_rank * shard_size
-        if param.ndim == 1:
-            scales = loaded_weight.reshape(-1)
-            if param.numel() == 2:
-                # Static per-tensor ModelOpt FP8: one scale per logical shard.
-                if scales.numel() != 1:
-                    raise ValueError(f"gate/up static scale must be scalar, got {tuple(loaded_weight.shape)}")
-                param.data[shard_id].copy_(scales[0])
-            else:
-                # Dynamic per-token activation / per-output-channel weight:
-                # keep the gate/up output-channel scales aligned with the TP
-                # shard selected for the corresponding weight rows.
-                expected_scales = shard_size * self._tp_size
-                if scales.numel() != expected_scales:
-                    raise ValueError(
-                        f"gate/up per-channel scale must contain {expected_scales} values, "
-                        f"got {tuple(loaded_weight.shape)}"
-                    )
-                target = param.data[shard_id * shard_size : (shard_id + 1) * shard_size]
-                target.copy_(scales.narrow(0, start_idx, shard_size))
-            return
-        if shard_id == 1:  # up_proj
-            param.data[shard_size : 2 * shard_size].copy_(loaded_weight.narrow(0, start_idx, shard_size))
-        else:  # gate_proj
-            param.data[0:shard_size].copy_(loaded_weight.narrow(0, start_idx, shard_size))
+        source = loaded_weight.flatten() if param.ndim == 1 else loaded_weight
+        static_scale = param.ndim == 1 and param.numel() == 2
+        copy_size = 1 if static_scale else shard_size
+        source_offset = 0 if static_scale else self._tp_rank * shard_size
+        target_offset = loaded_shard_id * copy_size
+        expected_size = 1 if static_scale else shard_size * self._tp_size
+        if source.shape[0] != expected_size:
+            raise ValueError(f"gate/up shard must have dim-0 size {expected_size}, got {tuple(loaded_weight.shape)}")
+        param.data.narrow(0, target_offset, copy_size).copy_(source.narrow(0, source_offset, copy_size))
 
 
 class MiniMaxH3Qwen3VLQKVParallelLinear(LinearBase):
@@ -258,6 +241,7 @@ class MiniMaxH3Qwen3VLQKVParallelLinear(LinearBase):
         q_local = self.local_num_heads * head_dim
         kv_local = self.local_num_kv_heads * head_dim
         self._tp_rank = tp_rank
+        self._tp_size = tp_size
         super().__init__(
             input_size=hidden_size,
             output_size=(num_heads + 2 * num_kv_heads) * head_dim,
@@ -291,31 +275,23 @@ class MiniMaxH3Qwen3VLQKVParallelLinear(LinearBase):
         head_dim = self.head_dim
         q_local = self.local_num_heads * head_dim
         kv_local = self.local_num_kv_heads * head_dim
-        if param.ndim == 1:
-            scale_index = {"q": 0, "k": 1, "v": 2}.get(loaded_shard_id)
-            if scale_index is None:
-                raise ValueError(f"unexpected QKV scale shard id {loaded_shard_id!r}")
-            scales = loaded_weight.reshape(-1)
-            if param.numel() == 3:
-                # Static per-tensor ModelOpt FP8: one scale per Q/K/V shard.
-                param.data[scale_index].copy_(scales[0])
-            else:
-                local_size = q_local if loaded_shard_id == "q" else kv_local
-                start_idx = self._tp_rank * local_size
-                target_start = {"q": 0, "k": q_local, "v": q_local + kv_local}[loaded_shard_id]
-                param.data[target_start : target_start + local_size].copy_(scales.narrow(0, start_idx, local_size))
-            return
-        if loaded_shard_id == "q":
-            start_idx = self._tp_rank * q_local
-            param.data[0:q_local].copy_(loaded_weight.narrow(0, start_idx, q_local))
-        elif loaded_shard_id == "k":
-            start_idx = self._tp_rank * kv_local
-            param.data[q_local : q_local + kv_local].copy_(loaded_weight.narrow(0, start_idx, kv_local))
-        elif loaded_shard_id == "v":
-            start_idx = self._tp_rank * kv_local
-            param.data[q_local + kv_local : q_local + 2 * kv_local].copy_(loaded_weight.narrow(0, start_idx, kv_local))
-        else:
+        shards = {
+            "q": (0, 0, q_local),
+            "k": (1, q_local, kv_local),
+            "v": (2, q_local + kv_local, kv_local),
+        }
+        if loaded_shard_id is None or loaded_shard_id not in shards:
             raise ValueError(f"unexpected QKV shard id {loaded_shard_id!r}")
+        shard_index, target_offset, shard_size = shards[loaded_shard_id]
+        source = loaded_weight.flatten() if param.ndim == 1 else loaded_weight
+        static_scale = param.ndim == 1 and param.numel() == len(shards)
+        copy_size = 1 if static_scale else shard_size
+        source_offset = 0 if static_scale else self._tp_rank * shard_size
+        target_offset = shard_index if static_scale else target_offset
+        expected_size = 1 if static_scale else shard_size * self._tp_size
+        if source.shape[0] != expected_size:
+            raise ValueError(f"QKV shard must have dim-0 size {expected_size}, got {tuple(loaded_weight.shape)}")
+        param.data.narrow(0, target_offset, copy_size).copy_(source.narrow(0, source_offset, copy_size))
 
 
 # A fused weight is filled from several checkpoint tensors, so a partial load leaves
