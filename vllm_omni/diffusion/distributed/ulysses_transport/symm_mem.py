@@ -17,6 +17,7 @@ from __future__ import annotations
 import threading
 import warnings
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal
 
 import torch
@@ -27,13 +28,36 @@ from vllm_omni.platforms import current_omni_platform
 
 UlyssesBufferSlot = Literal["q", "k", "v", "o"]
 
-try:
-    from vllm_omni import _symm_mem_ulysses_C  # noqa: F401
-except ImportError as exc:
-    raise RuntimeError(
-        "Fast Ulysses requires the vLLM-Omni CUDA extension. Rebuild the "
-        "package with `pip install -e . --no-build-isolation`."
-    ) from exc
+_BUILD_LOCK = threading.Lock()
+_KERNEL_LOADED = False
+
+
+@torch.compiler.disable
+def _ensure_kernel_loaded() -> None:
+    """JIT-build and load the Fast-Ulysses operators once per process."""
+    global _KERNEL_LOADED
+    if _KERNEL_LOADED:
+        return
+
+    with _BUILD_LOCK:
+        if _KERNEL_LOADED:
+            return
+
+        source = Path(__file__).with_name("csrc") / "symm_mem_ce.cu"
+        if not source.is_file():
+            raise RuntimeError(f"Fast Ulysses CUDA source is missing from the installed vLLM-Omni package: {source}")
+
+        from torch.utils.cpp_extension import load
+
+        load(
+            name="vllm_omni_symm_mem_ulysses",
+            sources=[str(source)],
+            extra_cflags=["-O3"],
+            extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr"],
+            is_python_module=False,
+            verbose=False,
+        )
+        _KERNEL_LOADED = True
 
 
 @dataclass
@@ -67,6 +91,8 @@ class SymmetricMemoryUlyssesTransport:
             )
         if not torch.cuda.is_available():
             raise RuntimeError("The symm_mem Ulysses transport requires CUDA.")
+
+        _ensure_kernel_loaded()
 
         self._process_group = process_group
         self._group_name = process_group.group_name

@@ -1,6 +1,5 @@
 [build-system]
 requires = [
-    "ninja",
     "setuptools>=77.0.3,<81.0.0",
     "wheel",
     "setuptools-scm>=8.0",
