@@ -17,16 +17,15 @@ from __future__ import annotations
 import threading
 import warnings
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 
-from vllm_omni.diffusion.distributed.ulysses_transport.base import (
-    UlyssesBufferSlot,
-    UlyssesTransport,
-)
 from vllm_omni.platforms import current_omni_platform
+
+UlyssesBufferSlot = Literal["q", "k", "v", "o"]
 
 try:
     from vllm_omni import _symm_mem_ulysses_C  # noqa: F401
@@ -44,7 +43,7 @@ class _SymmetricWindow:
     capacity: int
 
 
-class SymmetricMemoryUlyssesTransport(UlyssesTransport):
+class SymmetricMemoryUlyssesTransport:
     """Uniform single-node Ulysses all-to-all over symmetric memory.
 
     Windows are high-water-mark allocations keyed by Q/K/V/O role and dtype.
@@ -95,10 +94,6 @@ class SymmetricMemoryUlyssesTransport(UlyssesTransport):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", FutureWarning)
             symm_mem.enable_symm_mem_for_group(self._group_name)
-
-    @property
-    def backend(self) -> str:
-        return "symm_mem"
 
     def _window(
         self,
