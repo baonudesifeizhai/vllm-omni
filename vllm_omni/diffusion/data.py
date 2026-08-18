@@ -223,6 +223,9 @@ class DiffusionParallelConfig:
       sequence shapes across the ring group.
     """
 
+    fast_ulysses: bool = False
+    """Enable the optional SymmMem Copy-Engine Ulysses fast path."""
+
     cfg_parallel_size: int = 1
     """Number of ranks used to execute guidance passes in parallel."""
 
@@ -303,6 +306,8 @@ class DiffusionParallelConfig:
         assert self.ulysses_mode in {"strict", "advanced_uaa"}, (
             f"ulysses_mode must be one of {{'strict','advanced_uaa'}}, but got {self.ulysses_mode!r}."
         )
+        if self.fast_ulysses:
+            assert self.ulysses_degree > 1, "fast_ulysses requires ulysses_degree > 1."
 
         # Validate HSDP configuration
         if self.use_hsdp:

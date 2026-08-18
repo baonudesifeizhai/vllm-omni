@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 from setuptools import setup
 from setuptools_scm import get_version
@@ -239,12 +240,49 @@ def get_install_requires() -> list[str]:
     return requirements
 
 
+def get_native_extensions() -> tuple[list[Any], dict[str, Any]]:
+    """Build CUDA-only vLLM-Omni operators at install time."""
+    requested_device = os.getenv("VLLM_OMNI_TARGET_DEVICE")
+    if requested_device is not None and requested_device.lower() != "cuda":
+        return [], {}
+
+    try:
+        import torch
+        from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+    except ImportError:
+        print(
+            "PyTorch is unavailable in the isolated build environment; "
+            "skipping the optional SymmMem CUDA extension. Use "
+            "`pip install -e . --no-build-isolation` to build Fast Ulysses."
+        )
+        return [], {}
+
+    if torch.version.cuda is None:
+        return [], {}
+
+    source = "vllm_omni/diffusion/distributed/ulysses_transport/csrc/symm_mem_ce.cu"
+    extensions = [
+        CUDAExtension(
+            name="vllm_omni._symm_mem_ulysses_C",
+            sources=[str(source)],
+            extra_compile_args={
+                "cxx": ["-O3"],
+                "nvcc": ["-O3", "--expt-relaxed-constexpr"],
+            },
+        )
+    ]
+    return extensions, {"build_ext": BuildExtension}
+
+
 if __name__ == "__main__":
     # Get platform-specific dependencies
     install_requires = get_install_requires()
+    ext_modules, cmdclass = get_native_extensions()
 
     # Setup configuration
     setup(
         version=get_vllm_omni_version(),
         install_requires=install_requires,
+        ext_modules=ext_modules,
+        cmdclass=cmdclass,
     )

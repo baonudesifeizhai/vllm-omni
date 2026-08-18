@@ -355,6 +355,11 @@ def parse_args() -> argparse.Namespace:
         help="Number of GPUs used for ulysses sequence parallelism.",
     )
     parser.add_argument(
+        "--fast-ulysses",
+        action="store_true",
+        help="Enable the SymmMem Copy-Engine Ulysses transport. Requires --ulysses-degree > 1.",
+    )
+    parser.add_argument(
         "--ring-degree",
         type=int,
         default=1,
@@ -490,6 +495,7 @@ def main():
         vae_use_tiling=args.vae_use_tiling,
         enable_cpu_offload=args.enable_cpu_offload,
         ulysses_degree=args.ulysses_degree,
+        fast_ulysses=args.fast_ulysses,
         ring_degree=args.ring_degree,
         cfg_parallel_size=args.cfg_parallel_size,
         tensor_parallel_size=args.tensor_parallel_size,
