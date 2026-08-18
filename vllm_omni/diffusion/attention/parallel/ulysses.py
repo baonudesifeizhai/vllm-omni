@@ -11,8 +11,11 @@ import torch.nn.functional as F
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.parallel.base import ParallelAttentionContext
-from vllm_omni.diffusion.distributed.comm import SeqAllToAll4D
 from vllm_omni.diffusion.distributed.group_coordinator import SequenceParallelGroupCoordinator
+from vllm_omni.diffusion.distributed.ulysses_transport import (
+    UlyssesTransport,
+    build_ulysses_transport,
+)
 from vllm_omni.diffusion.forward_context import get_ulysses_mode
 
 
@@ -181,12 +184,42 @@ class UlyssesParallelAttention:
         scatter_idx: int,
         gather_idx: int,
         use_sync: bool,
+        fast_ulysses: bool = False,
     ) -> None:
         self._sp_group = sp_group
         self._ulysses_pg = sp_group.ulysses_group
         self._scatter_idx = scatter_idx
         self._gather_idx = gather_idx
         self._use_sync = use_sync
+        self._fast_ulysses = fast_ulysses
+        self._transport: UlyssesTransport | None = None
+        # Resolve the optional communicator during model construction, outside
+        # the first regional torch.compile trace. Symmetric windows themselves
+        # remain shape-lazy and grow collectively on first use.
+        if fast_ulysses:
+            self._get_transport()
+
+    def _get_transport(self) -> UlyssesTransport:
+        if self._transport is not None:
+            return self._transport
+        if hasattr(self._sp_group, "get_ulysses_transport"):
+            self._transport = self._sp_group.get_ulysses_transport(
+                fast_ulysses=self._fast_ulysses,
+                scatter_idx=self._scatter_idx,
+                gather_idx=self._gather_idx,
+                use_sync=self._use_sync,
+            )
+        else:
+            # Lightweight test/dry-run group objects may not use the concrete
+            # coordinator. Production always takes the shared path above.
+            self._transport = build_ulysses_transport(
+                self._fast_ulysses,
+                self._ulysses_pg,
+                scatter_idx=self._scatter_idx,
+                gather_idx=self._gather_idx,
+                use_sync=self._use_sync,
+            )
+        return self._transport
 
     @property
     def enabled(self) -> bool:
@@ -338,7 +371,8 @@ class UlyssesParallelAttention:
             # Strict mode: fail fast with actionable errors for head divisibility.
             for name, t in (("query", query), ("key", key), ("value", value)):
                 head_cnt = int(t.shape[2])
-                if head_cnt % ulysses_world_size != 0:
+                is_fast_kv_replication = self._fast_ulysses and name != "query" and ulysses_world_size % head_cnt == 0
+                if head_cnt % ulysses_world_size != 0 and not is_fast_kv_replication:
                     supported = _positive_divisors(head_cnt)
                     raise ValueError(
                         "Ulysses-SP strict mode requires head_cnt divisible by ulysses_degree. "
@@ -346,10 +380,10 @@ class UlyssesParallelAttention:
                         f"Try ulysses_degree in {supported}, or set ulysses_mode='advanced_uaa'."
                     )
 
-            # (bs, seq_len/P, head_cnt, head_size) -> (bs, seq_len, head_cnt/P, head_size)
-            query = SeqAllToAll4D.apply(self._ulysses_pg, query, self._scatter_idx, self._gather_idx, self._use_sync)
-            key = SeqAllToAll4D.apply(self._ulysses_pg, key, self._scatter_idx, self._gather_idx, self._use_sync)
-            value = SeqAllToAll4D.apply(self._ulysses_pg, value, self._scatter_idx, self._gather_idx, self._use_sync)
+            # (B, S/P, H, D) -> (B, S, H/P, D)
+            transport = self._get_transport()
+            query = transport.scatter_heads(query, slot="q")
+            key, value = transport.scatter_kv(key, value)
             seq_lens = []
             local_seq_len = 0
             orig_head_cnt = 0
@@ -444,7 +478,6 @@ class UlyssesParallelAttention:
 
             # 1. Process Image part: Standard Ulysses Reverse (AllToAll)
             # (bs, seq_len, head_cnt/P, head_size) -> (bs, seq_len/P, head_cnt, head_size)
-            # SeqAllToAll4D handles: Scatter gather_idx, Gather scatter_idx.
             # Forward: Scatter 2 (H), Gather 1 (S).
             # Reverse: Scatter 1 (S), Gather 2 (H).
             if ctx.use_uaa:
@@ -457,9 +490,7 @@ class UlyssesParallelAttention:
                     use_sync=ctx.use_sync,
                 )
             else:
-                output_img = SeqAllToAll4D.apply(
-                    ctx.ulysses_pg, output_img, ctx.gather_idx, ctx.scatter_idx, ctx.use_sync
-                )
+                output_img = self._get_transport().gather_heads(output_img)
 
             # 2. Process Joint part: AllGather on Heads
             # Input: (B, JointLen, H/P, D). Output: (B, JointLen, H, D).
@@ -488,4 +519,4 @@ class UlyssesParallelAttention:
                 orig_head_cnt=ctx.orig_head_cnt,
                 use_sync=ctx.use_sync,
             )
-        return SeqAllToAll4D.apply(ctx.ulysses_pg, attn_output, ctx.gather_idx, ctx.scatter_idx, ctx.use_sync)
+        return self._get_transport().gather_heads(attn_output)

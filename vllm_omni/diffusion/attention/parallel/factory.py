@@ -77,12 +77,14 @@ def build_parallel_attention_strategy(
 
     # Ulysses (or Hybrid Ulysses+Ring)
     if ulysses_degree > 1:
-        logger.debug(f"Using UlyssesParallelAttention (ulysses_degree={ulysses_degree})")
+        fast_ulysses = bool(getattr(p, "fast_ulysses", False))
+        logger.debug(f"Using UlyssesParallelAttention (ulysses_degree={ulysses_degree}, fast_ulysses={fast_ulysses})")
         return UlyssesParallelAttention(
             sp_group=sp_group,
             scatter_idx=scatter_idx,
             gather_idx=gather_idx,
             use_sync=use_sync,
+            fast_ulysses=fast_ulysses,
         )
 
     # Pure Ring Attention

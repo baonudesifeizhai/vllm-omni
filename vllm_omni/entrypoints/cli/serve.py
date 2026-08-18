@@ -538,6 +538,11 @@ class OmniServeCommand(CLISubcommand):
             "'advanced_uaa' enables the experimental UAA path for uneven sequence/head shapes.",
         )
         omni_config_group.add_argument(
+            "--fast-ulysses",
+            action="store_true",
+            help="Enable the optional SymmMem Copy-Engine Ulysses fast path. Requires --ulysses-degree greater than 1.",
+        )
+        omni_config_group.add_argument(
             "--ring",
             "--ring-degree",
             dest="ring_degree",

@@ -1031,3 +1031,33 @@ class SequenceParallelGroupCoordinator(GroupCoordinator):
         self.ring_rank = torch.distributed.get_rank(self.ring_group)
         self.allgather_world_size = torch.distributed.get_world_size(self.allgather_group)
         self.allgather_rank = torch.distributed.get_rank(self.allgather_group)
+        # Like vLLM's TP group/device communicator, Ulysses transports belong
+        # to the process-group coordinator rather than individual attention
+        # layers.  This keeps one shared set of SymmMem Q/K/V/O windows per SP
+        # group and avoids allocating them once per transformer block.
+        self._ulysses_transports: dict[tuple[bool, int, int, bool], Any] = {}
+
+    def get_ulysses_transport(
+        self,
+        *,
+        fast_ulysses: bool,
+        scatter_idx: int,
+        gather_idx: int,
+        use_sync: bool,
+    ):
+        key = (fast_ulysses, scatter_idx, gather_idx, use_sync)
+        transport = self._ulysses_transports.get(key)
+        if transport is None:
+            from vllm_omni.diffusion.distributed.ulysses_transport import (
+                build_ulysses_transport,
+            )
+
+            transport = build_ulysses_transport(
+                fast_ulysses,
+                self.ulysses_group,
+                scatter_idx=scatter_idx,
+                gather_idx=gather_idx,
+                use_sync=use_sync,
+            )
+            self._ulysses_transports[key] = transport
+        return transport

@@ -1,5 +1,6 @@
 [build-system]
 requires = [
+    "ninja",
     "setuptools>=77.0.3,<81.0.0",
     "wheel",
     "setuptools-scm>=8.0",
@@ -162,7 +163,11 @@ where = ["."]
 include = ["vllm_omni*"]
 
 [tool.setuptools.package-data]
-"vllm_omni" = ["_version.py", "py.typed"]
+"vllm_omni" = [
+    "_version.py",
+    "py.typed",
+    "diffusion/distributed/ulysses_transport/csrc/*.cu",
+]
 
 [tool.setuptools_scm]
 # no extra settings needed, presence enables setuptools-scm
