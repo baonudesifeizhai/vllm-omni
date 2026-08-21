@@ -15,8 +15,9 @@ specified in the [Host Weight Runtime module design](../module/host_weight_runti
 ## Status
 
 The first implementation provides contracts and a CPU local-filesystem store.
-It does not enable cached loading for a model by itself. A consumer must still
-provide an exact identity, a representation producer, and a model restorer.
+The initial diffusion consumer contract additionally defines an exact
+final-layout BF16 artifact for MiniMax H3. It remains library-only: no loader or
+DLO path selects, publishes, restores, or transports that artifact yet.
 
 V1 includes:
 
@@ -30,8 +31,9 @@ V1 includes:
 
 V1 does not include:
 
-- a public CLI or default-on model integration;
-- a generic BF16, FP8, quantized, or model-specific producer;
+- a public CLI, loader activation, or default-on model integration;
+- lease handoff to DLO or another transport consumer;
+- FP8, quantized, merged-adaptation, or additional model producers;
 - CUDA registration, pinned staging, H2D scheduling, or GPU kernels;
 - a remote artifact provider or cross-node coordination;
 - automatic eviction; or
@@ -215,6 +217,40 @@ its matching restorer.
 Dynamic LoRA overlays are not part of a reusable base-weight artifact. A
 statically merged adapter is cacheable only as a separate identity containing
 the adapter fingerprint and merge semantics.
+
+### Initial diffusion final-layout BF16 contract
+
+The first representation-specific contract covers complete final-layout DiT
+parameters and persistent buffers for MiniMax H3. It preserves BF16 parameters
+plus model-declared FP32 parameters and buffers. Text encoders, VAEs,
+non-persistent derived state, and other pipeline components remain outside the
+artifact.
+
+The contract is intentionally separate from loader activation:
+
+- `FinalLayoutBF16Request` contains canonical loader semantics, TP coordinate,
+  and conservative SP semantics. It has no DP coordinate, device identity,
+  DLO transfer mode, registration policy, or store path.
+- `PreparedWeightSource` snapshots immutable revisions or exact local file
+  content before ordinary materialization. Source replacement before or during
+  production fails publication.
+- the tensor ownership digest records exact runtime names, kinds, shapes,
+  dtypes, and strides from a CPU or meta model skeleton;
+- `FinalLayoutBF16Producer` accepts only the matching identity context and a
+  finalized CPU model. It is `POST_LOAD_ONLY` and `SINGLE_PROCESS` per exact TP
+  coordinate;
+- `FinalLayoutBF16Restorer` accepts only an exact lease identity, validates
+  complete coverage without mutation, and returns a one-shot commit plan; and
+- MiniMax H3 explicitly declares that constructor state plus those tensors is a
+  complete restore contract and revalidates its mixed-precision invariants
+  after commit.
+
+This stage makes no startup, sharing, or DLO performance claim. A following
+consumer PR owns disabled/preferred/required precedence, mixed-component loader
+transactions, warm-hit restoration, and transactional lease handoff. A TP2
+prewarm deployment will require a matching TP2 producer cohort to populate both
+TP-coordinate identities even though the store coordinates each artifact
+independently.
 
 ## Host sharing and GPU transport
 

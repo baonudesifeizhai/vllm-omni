@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MiniMax H3 packed-token audio/video DiT for vLLM-Omni.
 
 vLLM tensor parallel linears and the unified attention layer provide TP and
@@ -889,6 +890,12 @@ class MiniMaxH3SPGather(nn.Module):
 
 
 class MiniMaxH3DiTModel(nn.Module):
+    # Loading is tensor-complete: constructor state plus final-layout
+    # parameters and persistent buffers is sufficient to reconstruct a ready
+    # inference model. The model-specific validator below checks the preserved
+    # FP32 portion after a lease-backed restore commits.
+    host_weight_restore_contract = "vllm-omni.diffusion.final-layout-bf16-v1"
+
     _cache_dit_adapter_config = CacheDiTAdapterConfig(
         block_forward_patterns={"blocks": ForwardPattern.Pattern_3},
         # H3 is CFG-distilled and performs one transformer forward per step.
@@ -1063,6 +1070,10 @@ class MiniMaxH3DiTModel(nn.Module):
         for name, buffer in self.named_buffers():
             if name in MINIMAX_H3_FP32_BUFFER_NAMES and buffer.dtype != _FP32_DTYPE:
                 raise ValueError(f"{name} must stay fp32 after load, got {buffer.dtype}.")
+
+    def validate_restored_host_weights(self) -> None:
+        """Validate mixed-precision invariants after lease-backed restore."""
+        self.post_load_weights()
 
     def load_weights(
         self,
