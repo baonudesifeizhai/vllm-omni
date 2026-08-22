@@ -1,21 +1,37 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Diffusion adapters for runtime-ready host weight artifacts."""
+"""Typed diffusion adapters for runtime-ready final-layout artifacts."""
 
-from .identity_adapter import (
-    FinalLayoutBF16IdentityContext,
-    FinalLayoutBF16Request,
-    PreparedWeightSource,
-    build_final_layout_bf16_identity,
+from .contracts import (
+    FinalLayoutArtifactSpec,
+    FinalLayoutLoaderIdentity,
+    FinalLayoutParallelIdentity,
+    FinalLayoutRequest,
+    ImplementationIdentity,
 )
-from .producers import FinalLayoutBF16Producer
-from .restorer import FinalLayoutBF16Restorer
+from .identity_adapter import (
+    FinalLayoutIdentityContext,
+    build_final_layout_identity,
+)
+from .producers import (
+    FINAL_LAYOUT_BF16_POLICY,
+    FINAL_LAYOUT_BF16_SPEC,
+    FinalLayoutBF16Producer,
+)
+from .restorer import FinalLayoutTensorRestorer
+from .source_identity import PreparedWeightSource
 
 __all__ = [
-    "FinalLayoutBF16IdentityContext",
+    "FINAL_LAYOUT_BF16_POLICY",
+    "FINAL_LAYOUT_BF16_SPEC",
+    "FinalLayoutArtifactSpec",
     "FinalLayoutBF16Producer",
-    "FinalLayoutBF16Request",
-    "FinalLayoutBF16Restorer",
+    "FinalLayoutIdentityContext",
+    "FinalLayoutLoaderIdentity",
+    "FinalLayoutParallelIdentity",
+    "FinalLayoutRequest",
+    "FinalLayoutTensorRestorer",
+    "ImplementationIdentity",
     "PreparedWeightSource",
-    "build_final_layout_bf16_identity",
+    "build_final_layout_identity",
 ]

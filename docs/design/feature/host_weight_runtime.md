@@ -15,9 +15,11 @@ specified in the [Host Weight Runtime module design](../module/host_weight_runti
 ## Status
 
 The first implementation provides contracts and a CPU local-filesystem store.
-The initial diffusion consumer contract additionally defines an exact
-final-layout BF16 artifact for MiniMax H3. It remains library-only: no loader or
-DLO path selects, publishes, restores, or transports that artifact yet.
+The initial diffusion consumer contract additionally defines typed,
+representation-independent final-layout identity/restoration mechanics plus a
+concrete BF16-with-preserved-FP32 policy for MiniMax H3. It remains
+library-only: no loader or DLO path selects, publishes, restores, or transports
+that artifact yet.
 
 V1 includes:
 
@@ -218,32 +220,45 @@ Dynamic LoRA overlays are not part of a reusable base-weight artifact. A
 statically merged adapter is cacheable only as a separate identity containing
 the adapter fingerprint and merge semantics.
 
-### Initial diffusion final-layout BF16 contract
+### Initial diffusion final-layout contract
 
-The first representation-specific contract covers complete final-layout DiT
-parameters and persistent buffers for MiniMax H3. It preserves BF16 parameters
-plus model-declared FP32 parameters and buffers. Text encoders, VAEs,
-non-persistent derived state, and other pipeline components remain outside the
-artifact.
+The shared diffusion contract covers complete final-layout DiT parameters and
+persistent buffers. Text encoders, VAEs, non-persistent derived state, and other
+pipeline components remain outside the artifact. One explicit representation
+policy selects allowed dtypes, tensor roles, physical layout identity, producer
+ABI, manifest schema, and restoration schema.
 
 The contract is intentionally separate from loader activation:
 
-- `FinalLayoutBF16Request` contains canonical loader semantics, TP coordinate,
-  and conservative SP semantics. It has no DP coordinate, device identity,
-  DLO transfer mode, registration policy, or store path.
+- `FinalLayoutRequest` contains typed loader identity/configuration fingerprints,
+  TP coordinate, and conservative SP semantics. It has no open metadata bag,
+  DP coordinate, SP rank, device identity, DLO transfer mode, registration
+  policy, or store path.
+- `FinalLayoutArtifactSpec` binds one `WeightRepresentation` and runtime-layout
+  name to explicit producer/restorer schemas and a canonical, versioned
+  implementation ABI descriptor. Compatibility never depends on reflective
+  source inspection.
 - `PreparedWeightSource` snapshots immutable revisions or exact local file
-  content before ordinary materialization. Source replacement before or during
-  production fails publication.
+  content plus a typed checkpoint-adapter identity before ordinary
+  materialization. Source replacement before or during production fails
+  publication.
 - the tensor ownership digest records exact runtime names, kinds, shapes,
-  dtypes, and strides from a CPU or meta model skeleton;
+  semantic roles, dtypes, and strides from a CPU or meta model skeleton;
+- `FinalLayoutTensorRestorer` accepts only an exact lease identity, validates
+  complete policy-defined coverage without mutation, and returns a one-shot
+  commit plan;
+- each model declares one dtype-neutral `FinalLayoutModelContract` with an
+  explicit implementation version and a post-commit validator; and
 - `FinalLayoutBF16Producer` accepts only the matching identity context and a
   finalized CPU model. It is `POST_LOAD_ONLY` and `SINGLE_PROCESS` per exact TP
-  coordinate;
-- `FinalLayoutBF16Restorer` accepts only an exact lease identity, validates
-  complete coverage without mutation, and returns a one-shot commit plan; and
-- MiniMax H3 explicitly declares that constructor state plus those tensors is a
-  complete restore contract and revalidates its mixed-precision invariants
-  after commit.
+  coordinate. Its BF16 policy preserves model-declared FP32 parameters and
+  buffers and revalidates MiniMax H3 mixed-precision invariants.
+
+Other representations reuse source identity, typed parallel identity, tensor
+ownership, and exact restoration only when their policy proves those semantics.
+For example, runtime FP8 needs a separate policy/producer for generated scales,
+quantization metadata, and Cutlass physical layouts; it is not enabled by
+changing a dtype string on the BF16 producer.
 
 This stage makes no startup, sharing, or DLO performance claim. A following
 consumer PR owns disabled/preferred/required precedence, mixed-component loader

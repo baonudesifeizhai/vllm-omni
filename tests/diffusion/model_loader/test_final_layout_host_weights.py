@@ -6,41 +6,63 @@ from __future__ import annotations
 
 import dataclasses
 import gc
+from collections.abc import Sequence
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 from torch import nn
 
 from vllm_omni.diffusion.model_loader.host_weights import (
-    FinalLayoutBF16IdentityContext,
+    FINAL_LAYOUT_BF16_POLICY,
+    FINAL_LAYOUT_BF16_SPEC,
     FinalLayoutBF16Producer,
-    FinalLayoutBF16Request,
-    FinalLayoutBF16Restorer,
+    FinalLayoutIdentityContext,
+    FinalLayoutLoaderIdentity,
+    FinalLayoutParallelIdentity,
+    FinalLayoutRequest,
+    FinalLayoutTensorRestorer,
+    ImplementationIdentity,
     PreparedWeightSource,
-    build_final_layout_bf16_identity,
+    build_final_layout_identity,
+)
+from vllm_omni.diffusion.model_loader.host_weights.contracts import (
+    FINAL_LAYOUT_TENSOR_RESTORER_SCHEMA,
+    FinalLayoutArtifactSpec,
+    FinalLayoutContractError,
+    FinalLayoutTensorPolicy,
+    implementation_abi_fingerprint,
 )
 from vllm_omni.diffusion.model_loader.host_weights.tensor_layout import (
-    FINAL_LAYOUT_BF16_MODEL_CONTRACT,
-    FinalLayoutContractError,
+    RuntimeTensorTarget,
     collect_final_layout_targets,
+)
+from vllm_omni.diffusion.models.host_weight_contract import (
+    FINAL_LAYOUT_TENSOR_MODEL_CONTRACT_SCHEMA,
+    FinalLayoutModelContract,
 )
 from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3DiTModel
 from vllm_omni.host_weight_runtime import (
     AdaptationIdentity,
     CanonicalJson,
     CoordinationScope,
+    FailureCode,
     HostWeightRuntime,
     HostWeightRuntimeConfig,
     LookupPhase,
     PostLoadPublicationOutcome,
+    ProducerIdentity,
     ProductionPolicy,
     ProductionSourceMode,
     ResolutionOutcome,
+    ResolutionStage,
     RuntimeMode,
     StorageDomainPolicy,
     StorageScope,
+    TensorKind,
     WaitPolicy,
+    WeightRepresentation,
 )
 from vllm_omni.host_weight_runtime.filesystem import FilesystemHostWeightStore, detect_storage_class
 
@@ -48,7 +70,10 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _TinyDiT(nn.Module):
-    host_weight_restore_contract = FINAL_LAYOUT_BF16_MODEL_CONTRACT
+    host_weight_restore_contract = FinalLayoutModelContract(
+        implementation_id="test-tiny-dit",
+        version="1",
+    )
 
     def __init__(self, *, device: torch.device | str = "cpu") -> None:
         super().__init__()
@@ -84,8 +109,215 @@ class _AlternateTinyPipeline(_TinyPipeline):
     pass
 
 
-class _TestLoader:
-    pass
+class _Float32DiT(nn.Module):
+    host_weight_restore_contract = FinalLayoutModelContract(
+        implementation_id="test-float32-dit",
+        version="1",
+    )
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.proj = nn.Linear(2, 2, dtype=torch.float32)
+
+    def validate_restored_host_weights(self) -> None:
+        assert self.proj.weight.dtype is torch.float32
+
+
+class _Float32Pipeline(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.transformer = _Float32DiT()
+
+
+_SYNTHETIC_FP32_ABI = CanonicalJson.from_value(
+    {
+        "artifact_identity": "diffusion-final-layout-identity-v1",
+        "model_contract": FINAL_LAYOUT_TENSOR_MODEL_CONTRACT_SCHEMA,
+        "producer": "test-fp32-producer-v1",
+        "representation_policy": "test-all-fp32-v1",
+        "restorer": "exact-final-layout-tensor-rebind-v1",
+        "source_identity": "prepared-diffusion-weight-source-v1",
+        "tensor_contract": "complete-strided-tensor-ownership-v1",
+    }
+)
+_SYNTHETIC_FP32_SPEC = FinalLayoutArtifactSpec(
+    representation=WeightRepresentation(
+        name="test-final-layout-fp32",
+        dtype=str(torch.float32),
+        metadata=CanonicalJson.from_value({"policy": "all-fp32"}),
+    ),
+    producer=ProducerIdentity(
+        producer_id="test.final-layout-fp32",
+        version="1",
+        implementation_fingerprint=implementation_abi_fingerprint(_SYNTHETIC_FP32_ABI),
+        manifest_schema="test-final-layout-fp32-manifest-v1",
+        restorer_schema=FINAL_LAYOUT_TENSOR_RESTORER_SCHEMA,
+    ),
+    implementation_abi=_SYNTHETIC_FP32_ABI,
+)
+
+
+class _SyntheticFP32Policy:
+    @property
+    def spec(self) -> FinalLayoutArtifactSpec:
+        return _SYNTHETIC_FP32_SPEC
+
+    def validate_request(self, request: FinalLayoutRequest) -> None:
+        if request.load_format != "default":
+            raise ValueError("synthetic policy requires default loading")
+
+    def tensor_role(self, name: str, tensor: torch.Tensor, kind: TensorKind) -> str:
+        del name, tensor
+        return "weight" if kind is TensorKind.PARAMETER else "persistent_buffer"
+
+    def validate_target(self, target: RuntimeTensorTarget) -> None:
+        if target.tensor.dtype is not torch.float32:
+            raise ValueError("synthetic policy requires FP32 tensors")
+
+    def validate_collection(self, targets: Sequence[RuntimeTensorTarget]) -> None:
+        if not targets:
+            raise ValueError("synthetic policy requires tensors")
+
+    def build_format_metadata(
+        self,
+        *,
+        component_names: tuple[str, ...],
+        tensor_contract_digest: str,
+        tensor_count: int,
+    ) -> CanonicalJson:
+        return CanonicalJson.from_value(
+            {
+                "component_names": list(component_names),
+                "format": "test-final-layout-fp32",
+                "tensor_contract_sha256": tensor_contract_digest,
+                "tensor_count": tensor_count,
+            }
+        )
+
+    def validate_format_metadata(
+        self,
+        metadata: CanonicalJson,
+        *,
+        component_names: tuple[str, ...],
+        tensor_contract_digest: str,
+        tensor_count: int,
+    ) -> None:
+        assert metadata == self.build_format_metadata(
+            component_names=component_names,
+            tensor_contract_digest=tensor_contract_digest,
+            tensor_count=tensor_count,
+        )
+
+
+_SYNTHETIC_FP32_POLICY = _SyntheticFP32Policy()
+
+
+class _PolicyWithSpec:
+    def __init__(self, base: FinalLayoutTensorPolicy, spec: FinalLayoutArtifactSpec) -> None:
+        self._base = base
+        self._spec = spec
+
+    @property
+    def spec(self) -> FinalLayoutArtifactSpec:
+        return self._spec
+
+    def validate_request(self, request: FinalLayoutRequest) -> None:
+        self._base.validate_request(request)
+
+    def tensor_role(self, name: str, tensor: torch.Tensor, kind: TensorKind) -> str:
+        return self._base.tensor_role(name, tensor, kind)
+
+    def validate_target(self, target: RuntimeTensorTarget) -> None:
+        self._base.validate_target(target)
+
+    def validate_collection(self, targets: Sequence[RuntimeTensorTarget]) -> None:
+        self._base.validate_collection(targets)
+
+    def build_format_metadata(
+        self,
+        *,
+        component_names: tuple[str, ...],
+        tensor_contract_digest: str,
+        tensor_count: int,
+    ) -> CanonicalJson:
+        return self._base.build_format_metadata(
+            component_names=component_names,
+            tensor_contract_digest=tensor_contract_digest,
+            tensor_count=tensor_count,
+        )
+
+    def validate_format_metadata(
+        self,
+        metadata: CanonicalJson,
+        *,
+        component_names: tuple[str, ...],
+        tensor_contract_digest: str,
+        tensor_count: int,
+    ) -> None:
+        self._base.validate_format_metadata(
+            metadata,
+            component_names=component_names,
+            tensor_contract_digest=tensor_contract_digest,
+            tensor_count=tensor_count,
+        )
+
+
+class _FakeH3Linear(nn.Module):
+    def __init__(
+        self,
+        *args: object,
+        bias: bool = False,
+        params_dtype: torch.dtype | None = None,
+        total_num_heads: int | None = None,
+        total_num_kv_heads: int | None = None,
+        **kwargs: object,
+    ) -> None:
+        del args, kwargs
+        super().__init__()
+        dtype = params_dtype or torch.get_default_dtype()
+        self.weight = nn.Parameter(torch.empty(1, dtype=dtype))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(1, dtype=dtype))
+        else:
+            self.register_parameter("bias", None)
+        self.num_heads = total_num_heads
+        self.num_kv_heads = total_num_kv_heads
+
+
+class _FakeH3Attention(nn.Module):
+    def __init__(self, **kwargs: object) -> None:
+        del kwargs
+        super().__init__()
+
+
+class _H3Pipeline(nn.Module):
+    def __init__(self, transformer: nn.Module) -> None:
+        super().__init__()
+        self.transformer = transformer
+
+
+def _small_h3_config() -> SimpleNamespace:
+    return SimpleNamespace(
+        tf_model_config={
+            "num_layers": 1,
+            "token_refiner_num_layers": 1,
+            "hidden_size": 8,
+            "num_attention_heads": 2,
+            "attention_head_dim": 4,
+            "ffn_hidden_size": 16,
+            "latents_dim": 2,
+            "audio_latents_dim": 2,
+            "patch_size": (1, 2, 2),
+            "text_dim": 6,
+            "timestep_input_dim": 4,
+            "time_embed_hidden_size": 8,
+            "time_embed_dim": 4,
+            "adaln_out_features": 18 * 8,
+            "final_adaln_out_features": 2 * 8,
+            "rope_inv_freq_len": 2,
+        },
+        parallel_config=SimpleNamespace(ulysses_degree=1),
+    )
 
 
 def _prepared_source(
@@ -116,26 +348,36 @@ def _prepared_source(
     )
 
 
-def _request(**changes: object) -> FinalLayoutBF16Request:
-    request = FinalLayoutBF16Request(
+def _request(**changes: object) -> FinalLayoutRequest:
+    request = FinalLayoutRequest(
         model_id="test-org/tiny-diffusion",
-        loader_metadata=CanonicalJson.from_value({"attention": "eager"}),
+        loader=FinalLayoutLoaderIdentity(
+            implementation=ImplementationIdentity(
+                implementation_id="test-diffusion-loader",
+                version="1",
+                fingerprint="test-loader-implementation-v1",
+            ),
+            model_config_fingerprint="test-model-config-v1",
+            weight_transform_fingerprint="test-weight-transform-v1",
+        ),
     )
     return dataclasses.replace(request, **changes)
 
 
 def _identity(
-    model: _TinyPipeline,
+    model: nn.Module,
     source: PreparedWeightSource,
     *,
-    request: FinalLayoutBF16Request | None = None,
-) -> FinalLayoutBF16IdentityContext:
-    return build_final_layout_bf16_identity(
+    request: FinalLayoutRequest | None = None,
+    policy: FinalLayoutTensorPolicy = FINAL_LAYOUT_BF16_POLICY,
+) -> FinalLayoutIdentityContext:
+    transformer = model.get_submodule("transformer")
+    return build_final_layout_identity(
         model,
-        dit_modules=(("transformer", model.transformer),),
-        loader_type=_TestLoader,
+        dit_modules=(("transformer", transformer),),
         prepared_sources=(source,),
         request=request or _request(),
+        policy=policy,
     )
 
 
@@ -198,12 +440,36 @@ def test_preload_identity_is_stable_for_cpu_and_meta_skeletons(tmp_path: Path) -
     assert "transformer.derived" not in cpu.tensor_names
     assert all("text_encoder" not in name and "vae" not in name for name in cpu.tensor_names)
 
-    request_fields = {field.name for field in dataclasses.fields(FinalLayoutBF16Request)}
+    request_fields = {field.name for field in dataclasses.fields(FinalLayoutRequest)}
     assert not any("data_parallel" in name for name in request_fields)
+    assert not any("metadata" in name for name in request_fields)
     identity_bytes = cpu.identity.canonical_bytes
     assert b"data_parallel" not in identity_bytes
-    assert b"allgather" not in identity_bytes
+    assert b"dlo_use_allgather" not in identity_bytes
     assert b"registration" not in identity_bytes
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        dataclasses.replace(_request(), loader_metadata=CanonicalJson.empty())
+
+
+def test_generic_identity_and_tensor_discovery_accept_a_second_policy(tmp_path: Path) -> None:
+    model = _Float32Pipeline()
+    source = _prepared_source(tmp_path, directory="fp32-source")
+
+    context = _identity(model, source, policy=_SYNTHETIC_FP32_POLICY)
+    targets = collect_final_layout_targets(
+        model,
+        (("transformer", model.transformer),),
+        policy=_SYNTHETIC_FP32_POLICY,
+        require_materialized=True,
+    )
+
+    assert context.spec is _SYNTHETIC_FP32_SPEC
+    assert context.identity.representation.name == "test-final-layout-fp32"
+    assert context.identity.representation.dtype == str(torch.float32)
+    assert all(target.tensor.dtype is torch.float32 for target in targets)
+    assert context.identity.producer.implementation_fingerprint != (
+        FINAL_LAYOUT_BF16_SPEC.producer.implementation_fingerprint
+    )
 
 
 def test_identity_uses_resolved_revision_and_exact_semantics(tmp_path: Path) -> None:
@@ -217,19 +483,43 @@ def test_identity_uses_resolved_revision_and_exact_semantics(tmp_path: Path) -> 
 
     base = _request()
     variants = (
-        dataclasses.replace(base, loader_metadata=CanonicalJson.from_value({"attention": "cudnn"})),
-        dataclasses.replace(base, tensor_parallel_size=2, tensor_parallel_rank=0),
-        dataclasses.replace(base, tensor_parallel_size=2, tensor_parallel_rank=1),
         dataclasses.replace(
             base,
-            sequence_parallel_size=2,
-            sequence_parallel_backend="ulysses",
-            sequence_parallel_metadata=CanonicalJson.from_value({"ulysses_degree": 2, "mode": "strict"}),
+            loader=dataclasses.replace(base.loader, model_config_fingerprint="test-model-config-v2"),
         ),
-        dataclasses.replace(base, layout_metadata=CanonicalJson.from_value({"packing": "v2"})),
+        dataclasses.replace(
+            base,
+            loader=dataclasses.replace(
+                base.loader,
+                implementation=dataclasses.replace(base.loader.implementation, version="2"),
+            ),
+        ),
+        dataclasses.replace(
+            base,
+            parallel=FinalLayoutParallelIdentity(tensor_parallel_size=2, tensor_parallel_rank=0),
+        ),
+        dataclasses.replace(
+            base,
+            parallel=FinalLayoutParallelIdentity(tensor_parallel_size=2, tensor_parallel_rank=1),
+        ),
+        dataclasses.replace(
+            base,
+            parallel=FinalLayoutParallelIdentity(
+                sequence_parallel_size=2,
+                ulysses_degree=2,
+                ulysses_mode="strict",
+            ),
+        ),
     )
     base_identity = _identity(model, source, request=base).identity
     assert all(_identity(model, source, request=variant).identity != base_identity for variant in variants)
+
+    model_v2 = _TinyPipeline()
+    model_v2.transformer.host_weight_restore_contract = dataclasses.replace(
+        model_v2.transformer.host_weight_restore_contract,
+        version="2",
+    )
+    assert _identity(model_v2, source).identity != base_identity
 
     changed_source = _prepared_source(
         tmp_path,
@@ -237,39 +527,88 @@ def test_identity_uses_resolved_revision_and_exact_semantics(tmp_path: Path) -> 
         content=b"different-canonical-source",
     )
     assert _identity(model, changed_source).identity != base_identity
-
-    changed_abi = dataclasses.replace(
-        base_identity,
-        producer=dataclasses.replace(base_identity.producer, restorer_schema="future-restorer-v2"),
+    source_with_adapter = dataclasses.replace(
+        source,
+        checkpoint_adapter=ImplementationIdentity(
+            implementation_id="test-checkpoint-adapter",
+            version="1",
+            fingerprint="test-checkpoint-adapter-v1",
+        ),
     )
-    assert changed_abi.key != base_identity.key
+    assert _identity(model, source_with_adapter).identity != base_identity
+
+    abi_v2 = CanonicalJson.from_value(
+        {
+            "artifact_identity": "diffusion-final-layout-identity-v1",
+            "model_contract": FINAL_LAYOUT_TENSOR_MODEL_CONTRACT_SCHEMA,
+            "producer": "finalized-bf16-tensor-writer-v1",
+            "representation_policy": "bf16-with-preserved-fp32-v1",
+            "restorer": "exact-final-layout-tensor-rebind-v2",
+            "source_identity": "prepared-diffusion-weight-source-v1",
+            "tensor_contract": "complete-strided-tensor-ownership-v1",
+        }
+    )
+    with pytest.raises(ValueError, match="fingerprint differs"):
+        dataclasses.replace(FINAL_LAYOUT_BF16_SPEC, implementation_abi=abi_v2)
+    spec_v2 = dataclasses.replace(
+        FINAL_LAYOUT_BF16_SPEC,
+        producer=dataclasses.replace(
+            FINAL_LAYOUT_BF16_SPEC.producer,
+            version="2",
+            implementation_fingerprint=implementation_abi_fingerprint(abi_v2),
+        ),
+        implementation_abi=abi_v2,
+    )
+    identity_v2 = _identity(
+        model,
+        source,
+        policy=_PolicyWithSpec(FINAL_LAYOUT_BF16_POLICY, spec_v2),
+    ).identity
+    assert identity_v2.representation == base_identity.representation
+    assert identity_v2.key != base_identity.key
 
 
 @pytest.mark.parametrize(
-    ("changes", "message"),
+    ("semantic_request", "message"),
     [
-        ({"runtime_dtype": torch.float16}, "require torch.bfloat16"),
-        ({"load_format": "diffusers"}, "load_format='default'"),
-        ({"pipeline_parallel_size": 2}, "pipeline-parallel"),
-        ({"cfg_parallel_size": 2}, "CFG-parallel"),
-        ({"use_hsdp": True}, "HSDP"),
-        ({"enable_expert_parallel": True}, "expert-parallel"),
-        ({"quantization": "fp8"}, "quantized layouts"),
+        (_request(load_format="diffusers"), "load_format='default'"),
         (
-            {"adaptation": AdaptationIdentity(kind="merged-lora", fingerprint="adapter-sha256")},
+            _request(parallel=FinalLayoutParallelIdentity(pipeline_parallel_size=2)),
+            "pipeline-parallel",
+        ),
+        (
+            _request(parallel=FinalLayoutParallelIdentity(cfg_parallel_size=2)),
+            "CFG-parallel",
+        ),
+        (_request(parallel=FinalLayoutParallelIdentity(use_hsdp=True)), "HSDP"),
+        (
+            _request(parallel=FinalLayoutParallelIdentity(enable_expert_parallel=True)),
+            "expert-parallel",
+        ),
+        (
+            _request(adaptation=AdaptationIdentity(kind="merged-lora", fingerprint="adapter-sha256")),
             "LoRA",
         ),
-        ({"sequence_parallel_size": 2}, "describe SP semantics"),
     ],
 )
-def test_request_fails_closed_for_unsupported_semantics(changes: dict[str, object], message: str) -> None:
+def test_bf16_policy_fails_closed_for_unsupported_semantics(
+    tmp_path: Path,
+    semantic_request: FinalLayoutRequest,
+    message: str,
+) -> None:
+    model = _TinyPipeline()
     with pytest.raises(ValueError, match=message):
-        _request(**changes)
+        _identity(model, _prepared_source(tmp_path), request=semantic_request)
 
 
 def test_tensor_ownership_is_complete_mixed_precision_and_alias_free(tmp_path: Path) -> None:
     model = _TinyPipeline()
-    records = collect_final_layout_targets(model, _dit_modules(model), require_materialized=True)
+    records = collect_final_layout_targets(
+        model,
+        _dit_modules(model),
+        policy=FINAL_LAYOUT_BF16_POLICY,
+        require_materialized=True,
+    )
     by_name = {record.name: record for record in records}
 
     assert set(by_name) == {
@@ -339,7 +678,7 @@ def test_publication_is_warm_only_and_restore_is_transactional(
     before_plan = _pointer_snapshot(warm_model)
     text_weight = warm_model.text_encoder.weight
     vae_gain = warm_model.vae.gain
-    plan = FinalLayoutBF16Restorer(warm_context).plan_restore(warm_model, hit.lease)
+    plan = FinalLayoutTensorRestorer(warm_context).plan_restore(warm_model, hit.lease)
     assert _pointer_snapshot(warm_model) == before_plan
     assert warm_model.transformer.restore_validations == 0
 
@@ -416,6 +755,9 @@ def test_source_replacement_prevents_publication(tmp_path: Path) -> None:
 
     assert publication.outcome is PostLoadPublicationOutcome.FAILED
     assert publication.failure is not None
+    assert publication.failure.stage is ResolutionStage.CANONICAL_LOADING
+    assert publication.failure.code is FailureCode.CANONICAL_SOURCE_FAILED
+    assert publication.failure.details.to_value() == {"final_layout_code": "source_changed"}
     assert not context.sources_unchanged()
     assert runtime.resolve(context.identity).report.outcome is ResolutionOutcome.CANONICAL_FALLBACK
 
@@ -438,7 +780,7 @@ def test_source_replacement_between_restore_plan_and_commit_causes_no_mutation(t
 
     warm_model = _TinyPipeline()
     warm_context = _identity(warm_model, source)
-    plan = FinalLayoutBF16Restorer(warm_context).plan_restore(warm_model, hit.lease)
+    plan = FinalLayoutTensorRestorer(warm_context).plan_restore(warm_model, hit.lease)
     before = _pointer_snapshot(warm_model)
     source.weight_files[0].write_bytes(b"source-changed-before-commit")
 
@@ -471,28 +813,71 @@ def test_restore_rejects_wrong_identity_and_coverage_without_mutation(tmp_path: 
     with pytest.raises(ValueError, match="producer model implementation differs"):
         FinalLayoutBF16Producer(context, alternate, _dit_modules(alternate))
     with pytest.raises(ValueError, match="restore model implementation differs"):
-        FinalLayoutBF16Restorer(context).plan_restore(alternate, hit.lease)
+        FinalLayoutTensorRestorer(context).plan_restore(alternate, hit.lease)
 
     model = _TinyPipeline()
     wrong_context = _identity(
         model,
         source,
-        request=_request(tensor_parallel_size=2, tensor_parallel_rank=1),
+        request=_request(
+            parallel=FinalLayoutParallelIdentity(
+                tensor_parallel_size=2,
+                tensor_parallel_rank=1,
+            )
+        ),
     )
     with pytest.raises(ValueError, match="semantic identity differs"):
-        FinalLayoutBF16Restorer(wrong_context).plan_restore(model, hit.lease)
+        FinalLayoutTensorRestorer(wrong_context).plan_restore(model, hit.lease)
 
     exact_context = _identity(model, source)
     before = _pointer_snapshot(model)
     model.transformer.register_buffer("new_persistent_state", torch.tensor([1.0]))
     with pytest.raises(FinalLayoutContractError, match="tensor contract differs"):
-        FinalLayoutBF16Restorer(exact_context).plan_restore(model, hit.lease)
+        FinalLayoutTensorRestorer(exact_context).plan_restore(model, hit.lease)
     after = _pointer_snapshot(model)
     assert all(after[name] == value for name, value in before.items())
     hit.lease.close()
 
 
+def test_reduced_minimax_h3_satisfies_real_tensor_ownership_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer as h3
+
+    monkeypatch.setattr(h3, "ColumnParallelLinear", _FakeH3Linear)
+    monkeypatch.setattr(h3, "MergedColumnParallelLinear", _FakeH3Linear)
+    monkeypatch.setattr(h3, "QKVParallelLinear", _FakeH3Linear)
+    monkeypatch.setattr(h3, "RowParallelLinear", _FakeH3Linear)
+    monkeypatch.setattr(h3, "Attention", _FakeH3Attention)
+    monkeypatch.setattr(h3, "get_tensor_model_parallel_world_size", lambda: 1)
+
+    transformer = h3.MiniMaxH3DiTModel(_small_h3_config(), quant_config=None)
+    pipeline = _H3Pipeline(transformer)
+    source = _prepared_source(tmp_path, directory="minimax-h3-source")
+    context = _identity(pipeline, source)
+    targets = collect_final_layout_targets(
+        pipeline,
+        (("transformer", transformer),),
+        policy=FINAL_LAYOUT_BF16_POLICY,
+        require_materialized=True,
+    )
+    by_name = {target.name: target for target in targets}
+
+    assert context.model_contracts == (MiniMaxH3DiTModel.host_weight_restore_contract,)
+    assert "transformer.video_patch_proj.weight" in by_name
+    assert "transformer.blocks.0.attn.qkv_proj.weight" in by_name
+    assert "transformer.rope.inv_freq" in by_name
+    assert by_name["transformer.video_patch_proj.weight"].tensor.dtype is torch.float32
+    assert by_name["transformer.blocks.0.attn.qkv_proj.weight"].tensor.dtype is torch.bfloat16
+    assert by_name["transformer.rope.inv_freq"].role == "persistent_buffer"
+    transformer.validate_restored_host_weights()
+
+
 def test_minimax_h3_declares_the_final_layout_restore_contract() -> None:
-    assert MiniMaxH3DiTModel.host_weight_restore_contract == FINAL_LAYOUT_BF16_MODEL_CONTRACT
+    contract = MiniMaxH3DiTModel.host_weight_restore_contract
+    assert isinstance(contract, FinalLayoutModelContract)
+    assert contract.schema == FINAL_LAYOUT_TENSOR_MODEL_CONTRACT_SCHEMA
+    assert contract.implementation_id == "minimax-h3-dit"
     assert callable(MiniMaxH3DiTModel.validate_restored_host_weights)
-    assert "data_parallel" not in FinalLayoutBF16Request.__dataclass_fields__
+    assert "data_parallel" not in FinalLayoutRequest.__dataclass_fields__

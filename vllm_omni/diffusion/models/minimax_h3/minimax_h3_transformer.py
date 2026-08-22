@@ -44,6 +44,7 @@ from vllm_omni.diffusion.layers.activation import SiluAndMul
 from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qk_norm_rope
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
+from vllm_omni.diffusion.models.host_weight_contract import FinalLayoutModelContract
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
@@ -894,7 +895,10 @@ class MiniMaxH3DiTModel(nn.Module):
     # parameters and persistent buffers is sufficient to reconstruct a ready
     # inference model. The model-specific validator below checks the preserved
     # FP32 portion after a lease-backed restore commits.
-    host_weight_restore_contract = "vllm-omni.diffusion.final-layout-bf16-v1"
+    host_weight_restore_contract = FinalLayoutModelContract(
+        implementation_id="minimax-h3-dit",
+        version="1",
+    )
 
     _cache_dit_adapter_config = CacheDiTAdapterConfig(
         block_forward_patterns={"blocks": ForwardPattern.Pattern_3},

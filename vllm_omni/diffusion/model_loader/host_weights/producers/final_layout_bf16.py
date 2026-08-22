@@ -1,84 +1,195 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Post-load producer for final-layout BF16 diffusion DiT weights."""
+"""Concrete BF16-with-preserved-FP32 final-layout artifact policy and producer."""
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING
+from collections.abc import Sequence
 
 import torch
 from torch import nn
 
+from vllm_omni.diffusion.models.host_weight_contract import (
+    FINAL_LAYOUT_TENSOR_MODEL_CONTRACT_SCHEMA,
+)
 from vllm_omni.host_weight_runtime import (
     ArtifactWriter,
     CanonicalJson,
     CoordinationScope,
     LookupPhase,
+    ProducerIdentity,
     ProductionMetadata,
     ProductionSourceMode,
+    TensorKind,
     TensorWriteSpec,
-    WeightArtifactIdentity,
     WeightProductionSpec,
+    WeightRepresentation,
 )
 
-from ..tensor_layout import (
+from ..contracts import (
+    FINAL_LAYOUT_TENSOR_RESTORER_SCHEMA,
+    FinalLayoutArtifactSpec,
+    FinalLayoutContractCode,
     FinalLayoutContractError,
+    FinalLayoutRequest,
+    final_layout_producer_error,
+    implementation_abi_fingerprint,
+)
+from ..identity_adapter import (
+    FinalLayoutIdentityContext,
+    validate_final_layout_identity,
+)
+from ..tensor_layout import (
     RuntimeTensorTarget,
     collect_final_layout_targets,
-    tensor_contract_sha256,
     validate_final_layout_model_contract,
 )
-
-if TYPE_CHECKING:
-    from ..identity_adapter import FinalLayoutBF16IdentityContext
 
 FINAL_LAYOUT_BF16_PRODUCER_ID = "vllm-omni.diffusion.final-layout-bf16"
 FINAL_LAYOUT_BF16_VERSION = "1"
 FINAL_LAYOUT_BF16_REPRESENTATION = "diffusion-final-layout-bf16"
 FINAL_LAYOUT_BF16_MANIFEST_SCHEMA = "diffusion-final-layout-bf16-manifest-v1"
-FINAL_LAYOUT_BF16_RESTORER_SCHEMA = "diffusion-final-layout-bf16-restorer-v1"
 DEFAULT_SHARD_SIZE_BYTES = 5 * 1024**3
 
+_BF16_PARAMETER_DTYPES = {torch.bfloat16, torch.float32}
+_BF16_BUFFER_DTYPES = {
+    torch.bool,
+    torch.uint8,
+    torch.int8,
+    torch.int16,
+    torch.int32,
+    torch.int64,
+    torch.float16,
+    torch.bfloat16,
+    torch.float32,
+    torch.float64,
+}
+for _dtype_name in (
+    "float8_e4m3fn",
+    "float8_e5m2",
+    "float8_e4m3fnuz",
+    "float8_e5m2fnuz",
+):
+    if (_dtype := getattr(torch, _dtype_name, None)) is not None:
+        _BF16_BUFFER_DTYPES.add(_dtype)
 
-def _identity_metadata(identity: WeightArtifactIdentity) -> tuple[Mapping[str, object], Mapping[str, object]]:
-    component = identity.component.metadata.to_value()
-    layout = identity.layout.metadata.to_value()
-    if not isinstance(component, dict) or not isinstance(layout, dict):
-        raise FinalLayoutContractError(
-            "identity_incompatible",
-            "final-layout BF16 identity metadata must use JSON objects",
+_BF16_IMPLEMENTATION_ABI = CanonicalJson.from_value(
+    {
+        "artifact_identity": "diffusion-final-layout-identity-v1",
+        "model_contract": FINAL_LAYOUT_TENSOR_MODEL_CONTRACT_SCHEMA,
+        "producer": "finalized-bf16-tensor-writer-v1",
+        "representation_policy": "bf16-with-preserved-fp32-v1",
+        "restorer": "exact-final-layout-tensor-rebind-v1",
+        "source_identity": "prepared-diffusion-weight-source-v1",
+        "tensor_contract": "complete-strided-tensor-ownership-v1",
+    }
+)
+
+FINAL_LAYOUT_BF16_SPEC = FinalLayoutArtifactSpec(
+    representation=WeightRepresentation(
+        name=FINAL_LAYOUT_BF16_REPRESENTATION,
+        dtype=str(torch.bfloat16),
+        metadata=CanonicalJson.from_value(
+            {
+                "format": FINAL_LAYOUT_BF16_REPRESENTATION,
+                "mixed_precision_policy": "bf16-with-preserved-fp32",
+            }
+        ),
+    ),
+    producer=ProducerIdentity(
+        producer_id=FINAL_LAYOUT_BF16_PRODUCER_ID,
+        version=FINAL_LAYOUT_BF16_VERSION,
+        implementation_fingerprint=implementation_abi_fingerprint(_BF16_IMPLEMENTATION_ABI),
+        manifest_schema=FINAL_LAYOUT_BF16_MANIFEST_SCHEMA,
+        restorer_schema=FINAL_LAYOUT_TENSOR_RESTORER_SCHEMA,
+    ),
+    implementation_abi=_BF16_IMPLEMENTATION_ABI,
+)
+
+
+class FinalLayoutBF16Policy:
+    """Concrete compatibility and metadata policy for finalized BF16 tensors."""
+
+    @property
+    def spec(self) -> FinalLayoutArtifactSpec:
+        return FINAL_LAYOUT_BF16_SPEC
+
+    def validate_request(self, request: FinalLayoutRequest) -> None:
+        if request.load_format != "default":
+            raise ValueError(f"final-layout BF16 artifacts require load_format='default', got {request.load_format!r}")
+        if request.adaptation.kind != "base" or request.adaptation.fingerprint is not None:
+            raise ValueError("merged or static LoRA requires a representation-specific producer")
+        parallel = request.parallel
+        if parallel.pipeline_parallel_size != 1:
+            raise ValueError("pipeline-parallel ownership is not supported by the final-layout BF16 producer")
+        if parallel.cfg_parallel_size != 1:
+            raise ValueError("CFG-parallel ownership is not supported by the final-layout BF16 producer")
+        if parallel.use_hsdp:
+            raise ValueError("HSDP/DTensor layouts are not supported by the final-layout BF16 producer")
+        if parallel.enable_expert_parallel:
+            raise ValueError("expert-parallel ownership is not supported by the final-layout BF16 producer")
+
+    def tensor_role(self, name: str, tensor: torch.Tensor, kind: TensorKind) -> str:
+        del name, tensor
+        if kind is TensorKind.PARAMETER:
+            return "weight"
+        return "persistent_buffer"
+
+    def validate_target(self, target: RuntimeTensorTarget) -> None:
+        if target.kind is TensorKind.PARAMETER and target.tensor.dtype not in _BF16_PARAMETER_DTYPES:
+            raise FinalLayoutContractError(
+                FinalLayoutContractCode.DTYPE_UNSUPPORTED,
+                f"{target.name!r} must be BF16 or an explicitly preserved FP32 parameter, got {target.tensor.dtype}",
+            )
+        if target.kind is TensorKind.BUFFER and target.tensor.dtype not in _BF16_BUFFER_DTYPES:
+            raise FinalLayoutContractError(
+                FinalLayoutContractCode.DTYPE_UNSUPPORTED,
+                f"{target.name!r} uses unsupported buffer dtype {target.tensor.dtype}",
+            )
+
+    def validate_collection(self, targets: Sequence[RuntimeTensorTarget]) -> None:
+        if not any(target.kind is TensorKind.PARAMETER and target.tensor.dtype is torch.bfloat16 for target in targets):
+            raise FinalLayoutContractError(
+                FinalLayoutContractCode.DTYPE_UNSUPPORTED,
+                "final-layout BF16 representation requires at least one BF16 parameter",
+            )
+
+    def build_format_metadata(
+        self,
+        *,
+        component_names: tuple[str, ...],
+        tensor_contract_digest: str,
+        tensor_count: int,
+    ) -> CanonicalJson:
+        return CanonicalJson.from_value(
+            {
+                "component_names": list(component_names),
+                "format": FINAL_LAYOUT_BF16_REPRESENTATION,
+                "mixed_precision_policy": "bf16-with-preserved-fp32",
+                "tensor_contract_sha256": tensor_contract_digest,
+                "tensor_count": tensor_count,
+                "tensor_layout": "contiguous",
+            }
         )
-    return component, layout
+
+    def validate_format_metadata(
+        self,
+        metadata: CanonicalJson,
+        *,
+        component_names: tuple[str, ...],
+        tensor_contract_digest: str,
+        tensor_count: int,
+    ) -> None:
+        expected = self.build_format_metadata(
+            component_names=component_names,
+            tensor_contract_digest=tensor_contract_digest,
+            tensor_count=tensor_count,
+        )
+        if metadata != expected:
+            raise ValueError("lease format metadata differs from the BF16 artifact policy")
 
 
-def validate_final_layout_bf16_identity(
-    identity: WeightArtifactIdentity,
-    *,
-    dit_names: Sequence[str],
-    tensor_contract_digest: str,
-) -> None:
-    """Require the exact producer, representation, ownership, and layout ABI."""
-    if identity.producer.producer_id != FINAL_LAYOUT_BF16_PRODUCER_ID:
-        raise FinalLayoutContractError("identity_incompatible", "identity names a different producer")
-    if identity.producer.version != FINAL_LAYOUT_BF16_VERSION:
-        raise FinalLayoutContractError("identity_incompatible", "identity producer version is incompatible")
-    if identity.producer.manifest_schema != FINAL_LAYOUT_BF16_MANIFEST_SCHEMA:
-        raise FinalLayoutContractError("identity_incompatible", "identity manifest schema is incompatible")
-    if identity.producer.restorer_schema != FINAL_LAYOUT_BF16_RESTORER_SCHEMA:
-        raise FinalLayoutContractError("identity_incompatible", "identity restorer schema is incompatible")
-    if identity.representation.name != FINAL_LAYOUT_BF16_REPRESENTATION:
-        raise FinalLayoutContractError("identity_incompatible", "identity names a different representation")
-    if identity.representation.dtype != str(torch.bfloat16):
-        raise FinalLayoutContractError("identity_incompatible", "identity representation dtype is not BF16")
-    if identity.component.name != "diffusion-dit" or identity.component.ownership != "complete-final-layout-tensors":
-        raise FinalLayoutContractError("identity_incompatible", "identity DiT ownership is incompatible")
-
-    component, layout = _identity_metadata(identity)
-    if component.get("component_names") != list(dit_names):
-        raise FinalLayoutContractError("identity_incompatible", "identity DiT component names are incompatible")
-    if layout.get("tensor_contract_sha256") != tensor_contract_digest:
-        raise FinalLayoutContractError("identity_incompatible", "identity tensor contract differs from the model")
+FINAL_LAYOUT_BF16_POLICY = FinalLayoutBF16Policy()
 
 
 def _split_shards(
@@ -103,11 +214,11 @@ def _split_shards(
 
 
 class FinalLayoutBF16Producer:
-    """Publish already-finalized model tensors through a store-scoped writer."""
+    """Publish finalized BF16-policy tensors through a store-scoped writer."""
 
     def __init__(
         self,
-        context: FinalLayoutBF16IdentityContext,
+        context: FinalLayoutIdentityContext,
         pipeline: nn.Module,
         dit_modules: Sequence[tuple[str, nn.Module]],
         *,
@@ -115,6 +226,8 @@ class FinalLayoutBF16Producer:
     ) -> None:
         if max_shard_bytes <= 0:
             raise ValueError("final-layout BF16 shard size must be positive")
+        if context.spec != FINAL_LAYOUT_BF16_SPEC:
+            raise ValueError("producer requires the exact BF16 artifact specification")
         self._context = context
         self._pipeline = pipeline
         self._dit_modules = tuple(dit_modules)
@@ -138,26 +251,26 @@ class FinalLayoutBF16Producer:
         return self._spec
 
     def produce(self, writer: ArtifactWriter) -> ProductionMetadata:
+        try:
+            return self._produce(writer)
+        except FinalLayoutContractError as exc:
+            raise final_layout_producer_error(exc) from exc
+
+    def _produce(self, writer: ArtifactWriter) -> ProductionMetadata:
         self._context.ensure_sources_unchanged()
-        validators = validate_final_layout_model_contract(self._dit_modules)
+        bindings = validate_final_layout_model_contract(
+            self._dit_modules,
+            expected_schema=self._context.spec.model_contract_schema,
+        )
         records = collect_final_layout_targets(
             self._pipeline,
             self._dit_modules,
+            policy=FINAL_LAYOUT_BF16_POLICY,
             require_materialized=True,
         )
-        if frozenset(record.name for record in records) != self._context.tensor_names:
-            raise FinalLayoutContractError(
-                "tensor_contract_changed",
-                "finalized DiT tensor ownership differs from the pre-load identity",
-            )
-        contract_digest = tensor_contract_sha256(records)
-        validate_final_layout_bf16_identity(
-            self._context.identity,
-            dit_names=self._context.dit_names,
-            tensor_contract_digest=contract_digest,
-        )
-        for validator in validators:
-            validator()
+        contract_digest = validate_final_layout_identity(self._context, records)
+        for binding in bindings:
+            binding.validator()
 
         shards = _split_shards(records, self._max_shard_bytes)
         shard_count = len(shards)
@@ -180,16 +293,11 @@ class FinalLayoutBF16Producer:
         self._context.ensure_sources_unchanged()
         return ProductionMetadata(
             producer_schema=FINAL_LAYOUT_BF16_MANIFEST_SCHEMA,
-            restorer_schema=FINAL_LAYOUT_BF16_RESTORER_SCHEMA,
-            format_metadata=CanonicalJson.from_value(
-                {
-                    "component_names": list(self._context.dit_names),
-                    "format": FINAL_LAYOUT_BF16_REPRESENTATION,
-                    "mixed_precision_policy": "bf16-with-preserved-fp32",
-                    "tensor_contract_sha256": contract_digest,
-                    "tensor_count": len(records),
-                    "tensor_layout": "contiguous",
-                }
+            restorer_schema=FINAL_LAYOUT_TENSOR_RESTORER_SCHEMA,
+            format_metadata=FINAL_LAYOUT_BF16_POLICY.build_format_metadata(
+                component_names=self._context.dit_names,
+                tensor_contract_digest=contract_digest,
+                tensor_count=len(records),
             ),
         )
 
@@ -197,10 +305,11 @@ class FinalLayoutBF16Producer:
 __all__ = [
     "DEFAULT_SHARD_SIZE_BYTES",
     "FINAL_LAYOUT_BF16_MANIFEST_SCHEMA",
+    "FINAL_LAYOUT_BF16_POLICY",
     "FINAL_LAYOUT_BF16_PRODUCER_ID",
     "FINAL_LAYOUT_BF16_REPRESENTATION",
-    "FINAL_LAYOUT_BF16_RESTORER_SCHEMA",
+    "FINAL_LAYOUT_BF16_SPEC",
     "FINAL_LAYOUT_BF16_VERSION",
+    "FinalLayoutBF16Policy",
     "FinalLayoutBF16Producer",
-    "validate_final_layout_bf16_identity",
 ]
