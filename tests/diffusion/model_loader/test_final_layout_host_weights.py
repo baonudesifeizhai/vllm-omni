@@ -30,6 +30,7 @@ from vllm_omni.diffusion.model_loader.host_weights import (
 from vllm_omni.diffusion.model_loader.host_weights.contracts import (
     FINAL_LAYOUT_TENSOR_RESTORER_SCHEMA,
     FinalLayoutArtifactSpec,
+    FinalLayoutContractCode,
     FinalLayoutContractError,
     FinalLayoutTensorPolicy,
     implementation_abi_fingerprint,
@@ -107,6 +108,13 @@ class _TinyPipeline(nn.Module):
 
 class _AlternateTinyPipeline(_TinyPipeline):
     pass
+
+
+class _MultiTinyPipeline(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.transformer_a = _TinyDiT()
+        self.transformer_b = _TinyDiT()
 
 
 class _Float32DiT(nn.Module):
@@ -327,6 +335,7 @@ def _prepared_source(
     requested_revision: str | None = None,
     resolved_revision: str | None = None,
     directory: str = "canonical",
+    prefix: str = "transformer.",
 ) -> PreparedWeightSource:
     source_root = tmp_path / directory
     if resolved_revision is not None:
@@ -341,7 +350,7 @@ def _prepared_source(
         model_or_path="test-org/tiny-diffusion",
         subfolder=None,
         requested_revision=requested_revision,
-        prefix="transformer.",
+        prefix=prefix,
         resolved_root=source_root,
         weight_files=(weight_file,),
         use_safetensors=True,
@@ -378,6 +387,22 @@ def _identity(
         prepared_sources=(source,),
         request=request or _request(),
         policy=policy,
+    )
+
+
+def _multi_identity(
+    model: _MultiTinyPipeline,
+    sources: tuple[PreparedWeightSource, ...],
+) -> FinalLayoutIdentityContext:
+    return build_final_layout_identity(
+        model,
+        dit_modules=(
+            ("transformer_a", model.transformer_a),
+            ("transformer_b", model.transformer_b),
+        ),
+        prepared_sources=sources,
+        request=_request(),
+        policy=FINAL_LAYOUT_BF16_POLICY,
     )
 
 
@@ -470,6 +495,72 @@ def test_generic_identity_and_tensor_discovery_accept_a_second_policy(tmp_path: 
     assert context.identity.producer.implementation_fingerprint != (
         FINAL_LAYOUT_BF16_SPEC.producer.implementation_fingerprint
     )
+
+
+def test_source_identity_requires_complete_multi_component_coverage(tmp_path: Path) -> None:
+    model = _MultiTinyPipeline()
+    source_a = _prepared_source(
+        tmp_path,
+        directory="source-a",
+        prefix="transformer_a.",
+    )
+
+    with pytest.raises(FinalLayoutContractError, match="transformer_b") as exc_info:
+        _multi_identity(model, (source_a,))
+    assert exc_info.value.code is FinalLayoutContractCode.SOURCE_COVERAGE_INVALID
+
+    source_b = _prepared_source(
+        tmp_path,
+        directory="source-b",
+        prefix="transformer_b.",
+    )
+    context = _multi_identity(model, (source_a, source_b))
+    metadata = context.identity.source.metadata.to_value()
+    assert isinstance(metadata, dict)
+    bindings = metadata["target_bindings"]
+    assert isinstance(bindings, list)
+    assert {binding["source_prefix"] for binding in bindings} == {
+        "transformer_a.",
+        "transformer_b.",
+    }
+    assert {binding["target_name"].split(".", 1)[0] for binding in bindings} == {
+        "transformer_a",
+        "transformer_b",
+    }
+
+
+def test_source_identity_resolves_longest_prefix_and_rejects_ties(tmp_path: Path) -> None:
+    model = _MultiTinyPipeline()
+    root_source = _prepared_source(
+        tmp_path,
+        directory="root-source",
+        prefix="",
+    )
+    source_a = _prepared_source(
+        tmp_path,
+        directory="specific-a",
+        prefix="transformer_a.",
+    )
+
+    context = _multi_identity(model, (root_source, source_a))
+    reordered = _multi_identity(model, (source_a, root_source))
+    assert context.identity == reordered.identity
+    metadata = context.identity.source.metadata.to_value()
+    assert isinstance(metadata, dict)
+    bindings = metadata["target_bindings"]
+    assert isinstance(bindings, list)
+    by_target = {binding["target_name"]: binding["source_prefix"] for binding in bindings}
+    assert all(prefix == "transformer_a." for name, prefix in by_target.items() if name.startswith("transformer_a."))
+    assert all(prefix == "" for name, prefix in by_target.items() if name.startswith("transformer_b."))
+
+    conflicting_a = _prepared_source(
+        tmp_path,
+        directory="conflicting-a",
+        prefix="transformer_a.",
+    )
+    with pytest.raises(FinalLayoutContractError, match="equally specific") as exc_info:
+        _multi_identity(model, (root_source, source_a, conflicting_a))
+    assert exc_info.value.code is FinalLayoutContractCode.SOURCE_COVERAGE_INVALID
 
 
 def test_identity_uses_resolved_revision_and_exact_semantics(tmp_path: Path) -> None:

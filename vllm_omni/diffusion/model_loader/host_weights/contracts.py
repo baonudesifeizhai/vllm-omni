@@ -48,6 +48,7 @@ def _require_positive_int(name: str, value: object) -> int:
 
 class FinalLayoutContractCode(str, Enum):
     SOURCE_CHANGED = "source_changed"
+    SOURCE_COVERAGE_INVALID = "source_coverage_invalid"
     MODEL_CONTRACT_UNSUPPORTED = "model_contract_unsupported"
     OWNERSHIP_AMBIGUOUS = "ownership_ambiguous"
     TENSOR_UNSUPPORTED = "tensor_unsupported"

@@ -225,6 +225,39 @@ def _snapshot_source(source: PreparedWeightSource) -> _SourceSnapshot:
     return _SourceSnapshot(semantic=semantic, revision=revision, files=tuple(files))
 
 
+def _resolve_target_sources(
+    prepared_sources: Sequence[PreparedWeightSource],
+    target_names: frozenset[str],
+) -> dict[str, PreparedWeightSource]:
+    """Bind every target to one source using deterministic longest-prefix wins."""
+    if not target_names:
+        raise FinalLayoutContractError(
+            FinalLayoutContractCode.SOURCE_COVERAGE_INVALID,
+            "final-layout source identity requires at least one owned tensor",
+        )
+
+    bindings: dict[str, PreparedWeightSource] = {}
+    for target_name in sorted(target_names):
+        matches = [source for source in prepared_sources if target_name.startswith(source.prefix)]
+        if not matches:
+            raise FinalLayoutContractError(
+                FinalLayoutContractCode.SOURCE_COVERAGE_INVALID,
+                f"no canonical weight source covers final-layout tensor {target_name!r}",
+            )
+        longest_prefix = max(len(source.prefix) for source in matches)
+        winners = [source for source in matches if len(source.prefix) == longest_prefix]
+        if len(winners) != 1:
+            candidates = sorted(
+                f"{source.model_or_path}:{source.subfolder or ''}:{source.prefix}" for source in winners
+            )
+            raise FinalLayoutContractError(
+                FinalLayoutContractCode.SOURCE_COVERAGE_INVALID,
+                f"multiple equally specific canonical sources cover {target_name!r}: {candidates}",
+            )
+        bindings[target_name] = winners[0]
+    return bindings
+
+
 def resolve_final_layout_source_identity(
     prepared_sources: Sequence[PreparedWeightSource],
     *,
@@ -232,16 +265,25 @@ def resolve_final_layout_source_identity(
     target_names: frozenset[str],
 ) -> FinalLayoutSourceContext:
     """Resolve exact source identity for files covering the owned tensors."""
-    relevant_sources = tuple(
-        source for source in prepared_sources if any(name.startswith(source.prefix) for name in target_names)
-    )
-    if not relevant_sources:
-        raise ValueError("no canonical weight source covers the discovered DiT tensors")
-
-    snapshots = tuple(_snapshot_source(source) for source in relevant_sources)
+    bindings = _resolve_target_sources(prepared_sources, target_names)
+    selected_sources = frozenset(bindings.values())
+    snapshot_by_source = {source: _snapshot_source(source) for source in selected_sources}
+    snapshots = tuple(sorted(snapshot_by_source.values(), key=lambda snapshot: snapshot.semantic.encoded))
     source_semantics = [snapshot.semantic.to_value() for snapshot in snapshots]
-    source_fingerprint = hashlib.sha256(canonical_json(source_semantics)).hexdigest()
-    unique_revisions = tuple(dict.fromkeys(snapshot.revision for snapshot in snapshots))
+    target_bindings = [
+        {
+            "source_fingerprint": hashlib.sha256(snapshot_by_source[source].semantic.encoded).hexdigest(),
+            "source_prefix": source.prefix,
+            "target_name": target_name,
+        }
+        for target_name, source in sorted(bindings.items())
+    ]
+    source_document = {
+        "sources": source_semantics,
+        "target_bindings": target_bindings,
+    }
+    source_fingerprint = hashlib.sha256(canonical_json(source_document)).hexdigest()
+    unique_revisions = tuple(sorted({snapshot.revision for snapshot in snapshots}))
     aggregate_revision = (
         unique_revisions[0]
         if len(unique_revisions) == 1
@@ -252,7 +294,7 @@ def resolve_final_layout_source_identity(
             model_id=_logical_model_id(model_id),
             revision=aggregate_revision,
             fingerprint=source_fingerprint,
-            metadata=CanonicalJson.from_value({"sources": source_semantics}),
+            metadata=CanonicalJson.from_value(source_document),
         ),
         snapshots=snapshots,
     )
