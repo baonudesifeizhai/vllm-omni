@@ -9,6 +9,7 @@ import os
 import stat
 from collections.abc import Sequence
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 
 import regex as re
@@ -26,6 +27,11 @@ _HASH_CHUNK_BYTES = 8 * 1024**2
 _IMMUTABLE_REVISION_RE = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\Z")
 
 
+class WeightSourceKind(str, Enum):
+    LOCAL_PATH = "local_path"
+    HUGGING_FACE_HUB = "hugging_face_hub"
+
+
 @dataclass(frozen=True)
 class PreparedWeightSource:
     """Canonical source files and adapter ABI selected by the ordinary loader."""
@@ -38,6 +44,7 @@ class PreparedWeightSource:
     weight_files: tuple[Path, ...]
     use_safetensors: bool
     checkpoint_adapter: ImplementationIdentity | None = None
+    source_kind: WeightSourceKind = WeightSourceKind.LOCAL_PATH
 
     def __post_init__(self) -> None:
         if not self.model_or_path or not isinstance(self.prefix, str):
@@ -55,6 +62,8 @@ class PreparedWeightSource:
             ImplementationIdentity,
         ):
             raise ValueError("checkpoint adapter must use ImplementationIdentity")
+        if not isinstance(self.source_kind, WeightSourceKind):
+            raise ValueError("prepared source kind must use WeightSourceKind")
 
 
 @dataclass(frozen=True)
@@ -128,14 +137,43 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _blob_content_id(path: Path) -> str | None:
-    if not path.is_symlink():
+def _hf_blob_content_id(
+    path: Path,
+    *,
+    source: PreparedWeightSource,
+    source_root: Path,
+) -> str | None:
+    if source.source_kind is not WeightSourceKind.HUGGING_FACE_HUB or not path.is_symlink():
         return None
+    if Path(source.model_or_path).expanduser().exists():
+        return None
+
+    parts = source_root.parts
+    snapshot_indexes = [index for index, part in enumerate(parts[:-1]) if part == "snapshots"]
+    if not snapshot_indexes:
+        return None
+    snapshot_index = snapshot_indexes[-1]
+    revision = parts[snapshot_index + 1]
+    if _IMMUTABLE_REVISION_RE.fullmatch(revision) is None:
+        return None
+    repo_root = Path(*parts[:snapshot_index])
+    expected_repo_name = f"models--{source.model_or_path.replace('/', '--')}"
+    if repo_root.name != expected_repo_name:
+        return None
+    snapshot_root = repo_root / "snapshots" / revision
     try:
-        target = os.readlink(path)
+        path.relative_to(snapshot_root)
+    except ValueError:
+        return None
+    blobs_root = repo_root / "blobs"
+    try:
+        resolved_target = path.resolve(strict=True)
+        resolved_blobs_root = blobs_root.resolve(strict=True)
     except OSError:
         return None
-    blob_name = Path(target).name
+    if resolved_target.parent != resolved_blobs_root:
+        return None
+    blob_name = resolved_target.name
     if _IMMUTABLE_REVISION_RE.fullmatch(blob_name) is None:
         return None
     return f"immutable-blob:{blob_name.lower()}"
@@ -189,7 +227,11 @@ def _snapshot_source(source: PreparedWeightSource) -> _SourceSnapshot:
         if not stat.S_ISREG(current.st_mode):
             raise ValueError(f"canonical weight source is not a regular file: {candidate}")
         symlink_target = os.readlink(candidate) if candidate.is_symlink() else None
-        content_id = _blob_content_id(candidate)
+        content_id = _hf_blob_content_id(
+            candidate,
+            source=source,
+            source_root=root,
+        )
         if content_id is None:
             content_id = f"sha256:{_sha256_file(candidate)}"
         files.append(
@@ -218,6 +260,7 @@ def _snapshot_source(source: PreparedWeightSource) -> _SourceSnapshot:
             "model_or_path": _logical_model_id(source.model_or_path),
             "prefix": source.prefix,
             "resolved_revision": revision,
+            "source_kind": source.source_kind.value,
             "subfolder": source.subfolder,
             "use_safetensors": source.use_safetensors,
         }
@@ -303,5 +346,6 @@ def resolve_final_layout_source_identity(
 __all__ = [
     "FinalLayoutSourceContext",
     "PreparedWeightSource",
+    "WeightSourceKind",
     "resolve_final_layout_source_identity",
 ]

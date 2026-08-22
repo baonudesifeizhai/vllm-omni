@@ -19,7 +19,7 @@ from .producers import (
     FinalLayoutBF16Producer,
 )
 from .restorer import FinalLayoutTensorRestorer
-from .source_identity import PreparedWeightSource
+from .source_identity import PreparedWeightSource, WeightSourceKind
 
 __all__ = [
     "FINAL_LAYOUT_BF16_POLICY",
@@ -33,5 +33,6 @@ __all__ = [
     "FinalLayoutTensorRestorer",
     "ImplementationIdentity",
     "PreparedWeightSource",
+    "WeightSourceKind",
     "build_final_layout_identity",
 ]

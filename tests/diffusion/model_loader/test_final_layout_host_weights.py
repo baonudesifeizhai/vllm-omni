@@ -25,6 +25,7 @@ from vllm_omni.diffusion.model_loader.host_weights import (
     FinalLayoutTensorRestorer,
     ImplementationIdentity,
     PreparedWeightSource,
+    WeightSourceKind,
     build_final_layout_identity,
 )
 from vllm_omni.diffusion.model_loader.host_weights.contracts import (
@@ -144,7 +145,7 @@ _SYNTHETIC_FP32_ABI = CanonicalJson.from_value(
         "producer": "test-fp32-producer-v1",
         "representation_policy": "test-all-fp32-v1",
         "restorer": "exact-final-layout-tensor-rebind-v1",
-        "source_identity": "prepared-diffusion-weight-source-v1",
+        "source_identity": "prepared-diffusion-weight-source-v2",
         "tensor_contract": "complete-strided-tensor-ownership-v1",
     }
 )
@@ -563,6 +564,72 @@ def test_source_identity_resolves_longest_prefix_and_rejects_ties(tmp_path: Path
     assert exc_info.value.code is FinalLayoutContractCode.SOURCE_COVERAGE_INVALID
 
 
+def test_local_hex_named_symlink_target_is_content_hashed_across_startups(tmp_path: Path) -> None:
+    model = _TinyPipeline()
+    source_root = tmp_path / "local-symlink-source"
+    blobs_root = tmp_path / "local-blobs"
+    source_root.mkdir()
+    blobs_root.mkdir()
+    blob_path = blobs_root / ("a" * 64)
+    blob_path.write_bytes(b"a" * 32)
+    weight_path = source_root / "model.safetensors"
+    weight_path.symlink_to(blob_path)
+    source = PreparedWeightSource(
+        model_or_path=str(source_root),
+        subfolder=None,
+        requested_revision=None,
+        prefix="transformer.",
+        resolved_root=source_root,
+        weight_files=(weight_path,),
+        use_safetensors=True,
+    )
+
+    first = _identity(model, source)
+    first_metadata = first.identity.source.metadata.to_value()
+    assert isinstance(first_metadata, dict)
+    first_sources = first_metadata["sources"]
+    assert isinstance(first_sources, list)
+    assert first_sources[0]["files"][0]["content_id"].startswith("sha256:")
+
+    blob_path.write_bytes(b"b" * 32)
+    second = _identity(model, source)
+
+    assert second.identity != first.identity
+
+
+def test_hf_blob_shortcut_requires_validated_snapshot_topology(tmp_path: Path) -> None:
+    model = _TinyPipeline()
+    model_id = "test-org/tiny-diffusion"
+    repo_root = tmp_path / "models--test-org--tiny-diffusion"
+    blobs_root = repo_root / "blobs"
+    revision = "1" * 40
+    snapshot_root = repo_root / "snapshots" / revision
+    blobs_root.mkdir(parents=True)
+    snapshot_root.mkdir(parents=True)
+    blob_name = "2" * 64
+    blob_path = blobs_root / blob_name
+    blob_path.write_bytes(b"trusted-hf-blob")
+    weight_path = snapshot_root / "model.safetensors"
+    weight_path.symlink_to(Path("..") / ".." / "blobs" / blob_name)
+    source = PreparedWeightSource(
+        model_or_path=model_id,
+        subfolder=None,
+        requested_revision="main",
+        prefix="transformer.",
+        resolved_root=snapshot_root,
+        weight_files=(weight_path,),
+        use_safetensors=True,
+        source_kind=WeightSourceKind.HUGGING_FACE_HUB,
+    )
+
+    context = _identity(model, source)
+    metadata = context.identity.source.metadata.to_value()
+    assert isinstance(metadata, dict)
+    sources = metadata["sources"]
+    assert isinstance(sources, list)
+    assert sources[0]["files"][0]["content_id"] == f"immutable-blob:{blob_name}"
+
+
 def test_identity_uses_resolved_revision_and_exact_semantics(tmp_path: Path) -> None:
     model = _TinyPipeline()
     commit = "0123456789abcdef0123456789abcdef01234567"
@@ -635,7 +702,7 @@ def test_identity_uses_resolved_revision_and_exact_semantics(tmp_path: Path) -> 
             "producer": "finalized-bf16-tensor-writer-v1",
             "representation_policy": "bf16-with-preserved-fp32-v1",
             "restorer": "exact-final-layout-tensor-rebind-v2",
-            "source_identity": "prepared-diffusion-weight-source-v1",
+            "source_identity": "prepared-diffusion-weight-source-v2",
             "tensor_contract": "complete-strided-tensor-ownership-v1",
         }
     )

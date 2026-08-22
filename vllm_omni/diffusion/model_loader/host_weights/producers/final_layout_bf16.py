@@ -80,7 +80,7 @@ _BF16_IMPLEMENTATION_ABI = CanonicalJson.from_value(
         "producer": "finalized-bf16-tensor-writer-v1",
         "representation_policy": "bf16-with-preserved-fp32-v1",
         "restorer": "exact-final-layout-tensor-rebind-v1",
-        "source_identity": "prepared-diffusion-weight-source-v1",
+        "source_identity": "prepared-diffusion-weight-source-v2",
         "tensor_contract": "complete-strided-tensor-ownership-v1",
     }
 )

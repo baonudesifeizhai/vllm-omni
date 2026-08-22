@@ -241,7 +241,10 @@ The contract is intentionally separate from loader activation:
 - `PreparedWeightSource` snapshots immutable revisions or exact local file
   content plus a typed checkpoint-adapter identity before ordinary
   materialization. Source replacement before or during production fails
-  publication.
+  publication. A hash-looking symlink basename is trusted only for an explicit
+  Hugging Face Hub source whose repository ID and
+  `models--.../snapshots/<revision> -> blobs/<hash>` topology validate; every
+  local or otherwise unverified symlink target is content-hashed.
 - the tensor ownership digest records exact runtime names, kinds, shapes,
   semantic roles, dtypes, and strides from a CPU or meta model skeleton;
 - `FinalLayoutTensorRestorer` accepts only an exact lease identity, validates
