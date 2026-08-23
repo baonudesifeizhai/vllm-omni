@@ -610,12 +610,6 @@ class OmniServeCommand(CLISubcommand):
             "but mutually exclusive with --diffusion-attention-config.default.backend.",
         )
         omni_config_group.add_argument(
-            "--fastvideo-vsa-topk",
-            type=int,
-            default=None,
-            help="Number of key/value blocks selected per query block by FASTVIDEO_VSA.",
-        )
-        omni_config_group.add_argument(
             "--diffusion-attention-config",
             "-dac",
             dest="diffusion_attention_config",
@@ -742,23 +736,15 @@ class OmniServeCommand(CLISubcommand):
             "--host-weight-runtime-mode",
             choices=("disabled", "preferred", "required"),
             default="disabled",
-            help=(
-                "Host Weight Runtime policy for eligible no-AllGather DLO: "
-                "disabled does not consult HWR; preferred restores an exact hit "
-                "or canonically loads and publishes on a miss; required restores "
-                "an exact hit or fails startup. Populate a required store with "
-                "preferred first."
-            ),
+            help="Reuse exact final-layout host weights for eligible DLO configurations "
+            "(disabled by default).",
         )
         omni_config_group.add_argument(
             "--host-weight-runtime-root",
             type=str,
             default=None,
-            help=(
-                "Writable node-local Host Weight Runtime store shared by workers "
-                "in one storage domain. Required for preferred and required; use "
-                "the same persistent path for population and serving."
-            ),
+            help="Node-local Host Weight Runtime store root. Required when the "
+            "runtime mode is preferred or required.",
         )
         omni_config_group.add_argument(
             "--dlo-host-registration-limit-gib",

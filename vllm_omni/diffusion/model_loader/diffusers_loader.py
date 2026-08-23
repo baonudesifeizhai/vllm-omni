@@ -3,7 +3,6 @@
 import contextlib
 import dataclasses
 import glob
-import json
 import os
 import re
 import time
@@ -11,20 +10,21 @@ from collections.abc import Generator, Iterable, Sequence
 from pathlib import Path
 from typing import cast
 
-import huggingface_hub
 import torch
 from torch import nn
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.model_loader.weight_utils import (
+    download_safetensors_index_file_from_hf,
     download_weights_from_hf,
+    filter_duplicate_safetensors_files,
     filter_files_not_needed_for_inference,
     maybe_download_from_modelscope,
     multi_thread_safetensors_weights_iterator,
     safetensors_weights_iterator,
 )
-from vllm.transformers_utils.repo_utils import hf_api
+from vllm.transformers_utils.repo_utils import file_exists
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.torch_utils import set_default_torch_dtype
 
@@ -34,16 +34,20 @@ from vllm_omni.diffusion.distributed.hsdp import HSDPInferenceConfig, apply_hsdp
 from vllm_omni.diffusion.model_loader.checkpoint_adapters import (
     get_checkpoint_adapter,
 )
-from vllm_omni.diffusion.model_loader.host_weight_loader import HWRLoaderMixin, _HWRCommitError
 from vllm_omni.diffusion.model_loader.host_weight_plan import (
     HostWeightPlan,
     build_checkpoint_mmap_plan,
     has_online_quantization,
 )
+from vllm_omni.diffusion.model_loader.hwr_loader import HWRLoaderMixin, _HWRCommitError
+from vllm_omni.diffusion.model_loader.host_weights.runtime_fp8 import (
+    resolve_runtime_fp8,
+    runtime_fp8_requested,
+)
 from vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter import DiffusersAdapterPipeline
 from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 from vllm_omni.diffusion.registry import initialize_model
-from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
+from vllm_omni.host_weight_runtime import RuntimeMode
 
 
 # download_gguf was removed from upstream vLLM (commit 6635279d8).
@@ -90,23 +94,6 @@ def _natural_sort_key(filepath: str) -> list:
 DIFFUSION_MODEL_WEIGHTS_INDEX = "diffusion_pytorch_model.safetensors.index.json"
 TRANSFORMER_WEIGHTS_INDEX = "model.safetensors.index.json"
 INDEX_FILES = [DIFFUSION_MODEL_WEIGHTS_INDEX, TRANSFORMER_WEIGHTS_INDEX]
-SHARDED_SAFETENSORS_PATTERN = re.compile(r"^(?P<family>.+)-\d+-of-(?P<count>\d+)\.safetensors$")
-
-
-def _validate_unindexed_safetensors_layout(weight_files: Sequence[str]) -> None:
-    """Reject ambiguous shard families when no index is available."""
-    shard_counts: dict[str, set[int]] = {}
-    for weight_file in weight_files:
-        match = SHARDED_SAFETENSORS_PATTERN.fullmatch(os.path.basename(weight_file))
-        if match is not None:
-            shard_counts.setdefault(match.group("family"), set()).add(int(match.group("count")))
-
-    conflicts = {family: sorted(counts) for family, counts in shard_counts.items() if len(counts) > 1}
-    if conflicts:
-        raise ValueError(
-            "Ambiguous unindexed safetensors checkpoint with conflicting shard totals: "
-            f"{conflicts}. Refusing to load potentially stale checkpoint shards."
-        )
 
 
 def _resolve_custom_pipeline_cls(custom_pipeline_name: str | type | None) -> type:
@@ -170,60 +157,6 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         self.host_weight_plan = None
         return plan
 
-    @staticmethod
-    def _repo_relative_path(subfolder: str | None, filename: str) -> str:
-        if subfolder is None:
-            return filename
-        prefix = f"{subfolder.rstrip('/')}/"
-        return filename if filename.startswith(prefix) else f"{prefix}{filename.lstrip('/')}"
-
-    def _resolve_weight_index(
-        self,
-        model_name_or_path: Path | str,
-        subfolder: str | None,
-        revision: str | None,
-    ) -> list[str] | None:
-        """Resolve an index and return its authoritative shard manifest."""
-        is_local = os.path.isdir(model_name_or_path)
-        index_paths: list[tuple[str, Path]] = []
-        for index_file in INDEX_FILES:
-            repo_index_path = self._repo_relative_path(subfolder, index_file)
-            if is_local:
-                index_path = Path(model_name_or_path) / repo_index_path
-                if index_path.is_file():
-                    index_paths.append((index_file, index_path))
-                continue
-
-            try:
-                index_path = hf_api().hf_hub_download(
-                    repo_id=str(model_name_or_path),
-                    filename=repo_index_path,
-                    cache_dir=self.load_config.download_dir,
-                    revision=revision,
-                    local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
-                )
-            except huggingface_hub.errors.EntryNotFoundError:
-                continue
-            index_paths.append((index_file, Path(index_path)))
-
-        if len(index_paths) > 1:
-            raise ValueError(
-                f"Multiple index files found in {model_name_or_path} with subfolder {subfolder}: "
-                f"{[index_file for index_file, _ in index_paths]}"
-            )
-        if not index_paths:
-            return None
-
-        index_file, index_path = index_paths[0]
-        with open(index_path) as f:
-            index = json.load(f)
-        weight_map = index.get("weight_map") if isinstance(index, dict) else None
-        if not isinstance(weight_map, dict) or not weight_map:
-            raise ValueError(f"Weight index {index_file} must contain a non-empty `weight_map`")
-        if not all(isinstance(filename, str) and filename for filename in weight_map.values()):
-            raise ValueError(f"Weight index {index_file} contains an invalid shard filename")
-        return sorted(set(weight_map.values()))
-
     def _prepare_weights(
         self,
         model_name_or_path: Path | str,
@@ -240,11 +173,17 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         is_local = os.path.isdir(model_name_or_path)
         load_format = self.load_config.load_format
         use_safetensors = False
-        indexed_weight_files = (
-            self._resolve_weight_index(model_name_or_path, subfolder, revision)
-            if allow_patterns_overrides is None
-            else None
-        )
+        possible_index_files = [
+            f"{subfolder}/{index_file}" if subfolder is not None else index_file for index_file in INDEX_FILES
+        ]
+        available_index_file = [
+            f for f in possible_index_files if file_exists(model_name_or_path, f, revision=revision)
+        ]
+        if len(available_index_file) > 1:
+            raise ValueError(
+                f"Multiple index files found in {model_name_or_path} with subfolder {subfolder}: {available_index_file}"
+            )
+        index_file = available_index_file[0] if available_index_file else ""
 
         # only hf is supported currently
         if load_format == "auto":
@@ -262,16 +201,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         if allow_patterns_overrides is not None:
             allow_patterns = allow_patterns_overrides
 
-        if not is_local and indexed_weight_files is not None:
-            hf_folder = download_weights_from_hf_specific(
-                model_name_or_path=str(model_name_or_path),
-                cache_dir=self.load_config.download_dir,
-                allow_patterns=[self._repo_relative_path(subfolder, filename) for filename in indexed_weight_files],
-                revision=revision,
-                ignore_patterns=self.load_config.ignore_patterns,
-                require_all=True,
-            )
-        elif not is_local:
+        if not is_local:
             hf_folder = download_weights_from_hf(
                 model_name_or_path,
                 self.load_config.download_dir,
@@ -286,24 +216,31 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         if subfolder is not None:
             hf_folder = os.path.join(hf_folder, subfolder)
 
-        if indexed_weight_files is not None:
-            hf_weights_files = [os.path.join(hf_folder, filename) for filename in indexed_weight_files]
-            missing_files = [filename for filename in hf_weights_files if not os.path.isfile(filename)]
-            if missing_files:
-                raise FileNotFoundError(f"Weight files referenced in index but missing: {missing_files}")
-            use_safetensors = any(filename.endswith(".safetensors") for filename in hf_weights_files)
+        hf_weights_files: list[str] = []
+        for pattern in allow_patterns:
+            hf_weights_files += glob.glob(os.path.join(hf_folder, pattern))
+            if len(hf_weights_files) > 0:
+                # Decide by actual files rather than pattern name (patterns may include subfolders).
+                use_safetensors = any(f.endswith(".safetensors") for f in hf_weights_files)
+                break
+
+        if use_safetensors:
+            # For models like Mistral-7B-Instruct-v0.3
+            # there are both sharded safetensors files and a consolidated
+            # safetensors file. Using both breaks.
+            # Here, we download the `model.safetensors.index.json` and filter
+            # any files not found in the index.
+            if not is_local:
+                download_safetensors_index_file_from_hf(
+                    model_name_or_path,
+                    index_file,
+                    cache_dir=self.load_config.download_dir,
+                    subfolder=subfolder,
+                    revision=revision,
+                )
+            hf_weights_files = filter_duplicate_safetensors_files(hf_weights_files, hf_folder, index_file)
         else:
-            hf_weights_files = []
-            for pattern in allow_patterns:
-                hf_weights_files += glob.glob(os.path.join(hf_folder, pattern))
-                if hf_weights_files:
-                    # Decide by actual files rather than pattern name (patterns may include subfolders).
-                    use_safetensors = any(f.endswith(".safetensors") for f in hf_weights_files)
-                    break
-            if use_safetensors:
-                _validate_unindexed_safetensors_layout(hf_weights_files)
-            else:
-                hf_weights_files = filter_files_not_needed_for_inference(hf_weights_files)
+            hf_weights_files = filter_files_not_needed_for_inference(hf_weights_files)
 
         if len(hf_weights_files) == 0:
             raise RuntimeError(f"Cannot find any model weights with `{model_name_or_path}`")
@@ -482,25 +419,25 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         }
         if load_format is None:
             load_format = "default"
-        # CPU offload + quantization: for offline-quantized models (e.g., AutoRound MXFP8),
-        # weights are already quantized in the checkpoint — load directly on CPU.
-        # For online quantization, load on device so quantization can run on accelerator,
-        # then move back to CPU afterward.
-        offload_after_quant = False
-        if load_device == "cpu" and self.quant_config is not None and device is not None:
+
+        canonical_load_device = load_device
+        canonical_offload_after_quant = False
+        if canonical_load_device == "cpu" and self.quant_config is not None and device is not None:
             quant_cfg = self.quant_config
             is_offline = getattr(quant_cfg, "data_type", None) == "mx_fp" or getattr(
                 quant_cfg, "is_checkpoint_quantized", False
             )
             if not is_offline:
-                load_device = device.type
-                offload_after_quant = True
-                logger.info(
-                    "Online quantization with CPU offload, using %s for weight loading (will offload back to CPU)",
-                    load_device,
-                )
-            else:
-                logger.info("Offline-quantized model with CPU offload, loading weights directly on CPU")
+                canonical_load_device = device.type
+                canonical_offload_after_quant = True
+
+        runtime_requested = (
+            not self._force_canonical_load
+            and self.quant_config is not None
+            and runtime_fp8_requested(self.od_config, load_format, device)
+        )
+        load_device = "cpu" if runtime_requested else canonical_load_device
+        offload_after_quant = False if runtime_requested else canonical_offload_after_quant
 
         target_device = torch.device(load_device)
         with set_default_torch_dtype(self.od_config.dtype):
@@ -513,7 +450,6 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
 
                 _dist_offload = getattr(self.od_config, "enable_distributed_layerwise_offload", False)
                 _use_ag = getattr(self.od_config, "dlo_use_allgather", True)
-                _has_online_quant = self._has_online_quant(model)
                 _tp_size = int(getattr(self.parallel_config, "tensor_parallel_size", 1))
                 _use_hsdp = bool(getattr(self.parallel_config, "use_hsdp", False))
                 _dp_size = int(getattr(self.parallel_config, "data_parallel_size", 1))
@@ -522,12 +458,42 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
 
                 plan_result = None
                 weight_sources = self._get_weight_sources(model)
+                modules = ModuleDiscovery.discover(model)
                 hwr_state = None
-                if not self._force_canonical_load:
+                if runtime_requested:
+                    try:
+                        assert device is not None
+                        self.host_weight_plan = resolve_runtime_fp8(
+                            model,
+                            config=self.od_config,
+                            load_format=load_format,
+                            device=device,
+                            dit_modules=tuple(zip(modules.dit_names, modules.dits)),
+                            sources=weight_sources,
+                            prepare_weights=self._prepare_weights,
+                        )
+                    except Exception as exc:
+                        mode = RuntimeMode(getattr(self.od_config, "host_weight_runtime_mode", "disabled"))
+                        if mode is RuntimeMode.REQUIRED:
+                            raise RuntimeError("required runtime FP8 resolution failed") from exc
+                        logger.warning("Host Weight Runtime preferred fallback: %s", exc)
+                        del model
+                        load_device = canonical_load_device
+                        offload_after_quant = canonical_offload_after_quant
+                        target_device = torch.device(load_device)
+                        model = self._init_from_load_format(
+                            load_format,
+                            target_device,
+                            custom_pipeline_name,
+                            is_hsdp=False,
+                        )
+                        modules = ModuleDiscovery.discover(model)
+                        weight_sources = self._get_weight_sources(model)
+                elif not self._force_canonical_load:
                     try:
                         hwr_state = self._resolve_hwr(
                             model,
-                            ModuleDiscovery.discover(model),
+                            modules,
                             dist_offload=_dist_offload,
                             use_allgather=_use_ag,
                             load_format=load_format,
@@ -546,11 +512,15 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                         del model
                         return self.load_fresh_canonical_model()
                 self._hwr_state = hwr_state
-                hwr_active = hwr_state is not None
-                if hwr_active and hwr_state is not None:
+                if hwr_state is not None:
                     self.host_weight_plan = cast(HostWeightPlan | None, hwr_state.get("plan"))
-                if _dist_offload and not hwr_active and not self._force_canonical_load:
-                    modules = ModuleDiscovery.discover(model)
+                _has_online_quant = self._has_online_quant(model)
+                if (
+                    _dist_offload
+                    and self.host_weight_plan is None
+                    and hwr_state is None
+                    and not self._force_canonical_load
+                ):
                     plan_result = build_checkpoint_mmap_plan(
                         model,
                         dit_modules=tuple(zip(modules.dit_names, modules.dits)),
@@ -562,19 +532,18 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                     )
                     self.host_weight_plan = plan_result.plan
 
-                _skip_load = self.host_weight_plan is not None
-
-                if _skip_load:
+                host_weight_plan = self.host_weight_plan
+                if host_weight_plan is not None:
                     logger.info(
                         "DLO host-weight plan active (%s, %s): skipping ordinary materialization for %s",
                         "AllGather" if _use_ag and _dlo_group_size > 1 else "rank-local",
-                        self.host_weight_plan.backing_kind,
-                        sorted(self.host_weight_plan.planned_source_prefixes) or "legacy DiT sources",
+                        host_weight_plan.backing_kind,
+                        sorted(host_weight_plan.planned_source_prefixes) or "legacy DiT sources",
                     )
                     ordinary_sources = tuple(
                         source
                         for source in weight_sources
-                        if source.prefix not in self.host_weight_plan.planned_source_prefixes
+                        if source.prefix not in host_weight_plan.planned_source_prefixes
                     )
                     if ordinary_sources:
                         logger.info(
@@ -584,7 +553,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                         self.load_weights(
                             model,
                             sources=ordinary_sources,
-                            planned_weights=self.host_weight_plan.bindings,
+                            planned_weights=host_weight_plan.planned_tensor_names,
                         )
                 else:
                     if _dist_offload and _use_ag and _has_online_quant:
