@@ -42,6 +42,10 @@ from vllm_omni.diffusion.model_loader.host_weight_plan import (
     build_checkpoint_mmap_plan,
     has_online_quantization,
 )
+from vllm_omni.diffusion.model_loader.host_weights.runtime_fp8 import (
+    resolve_runtime_fp8,
+    runtime_fp8_requested,
+)
 from vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter import DiffusersAdapterPipeline
 from vllm_omni.diffusion.offloader.component_utils import encoder_component_type
 from vllm_omni.diffusion.offloader.config import (
@@ -53,6 +57,7 @@ from vllm_omni.diffusion.offloader.config import (
 from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 from vllm_omni.diffusion.offloader.offload_plan import get_offload_plan
 from vllm_omni.diffusion.registry import initialize_model
+from vllm_omni.host_weight_runtime import RuntimeMode
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
 
@@ -649,25 +654,24 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         }
         if load_format is None:
             load_format = "default"
-        # CPU offload + quantization: for offline-quantized models (e.g., AutoRound MXFP8),
-        # weights are already quantized in the checkpoint — load directly on CPU.
-        # For online quantization, load on device so quantization can run on accelerator,
-        # then move back to CPU afterward.
-        offload_after_quant = False
-        if load_device == "cpu" and self.quant_config is not None and device is not None:
+        canonical_load_device = load_device
+        canonical_offload_after_quant = False
+        if canonical_load_device == "cpu" and self.quant_config is not None and device is not None:
             quant_cfg = self.quant_config
             is_offline = getattr(quant_cfg, "data_type", None) == "mx_fp" or getattr(
                 quant_cfg, "is_checkpoint_quantized", False
             )
             if not is_offline:
-                load_device = device.type
-                offload_after_quant = True
-                logger.info(
-                    "Online quantization with CPU offload, using %s for weight loading (will offload back to CPU)",
-                    load_device,
-                )
-            else:
-                logger.info("Offline-quantized model with CPU offload, loading weights directly on CPU")
+                canonical_load_device = device.type
+                canonical_offload_after_quant = True
+
+        runtime_requested = (
+            not self._force_canonical_load
+            and self.quant_config is not None
+            and runtime_fp8_requested(self.od_config, load_format, device)
+        )
+        load_device = "cpu" if runtime_requested else canonical_load_device
+        offload_after_quant = False if runtime_requested else canonical_offload_after_quant
 
         target_device = torch.device(load_device)
         with set_default_torch_dtype(self.od_config.dtype):
@@ -727,7 +731,36 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 plan_result = None
                 weight_sources = self._get_weight_sources(model)
                 hwr_state = None
-                if not self._force_canonical_load:
+                if runtime_requested:
+                    try:
+                        assert device is not None
+                        self.host_weight_plan = resolve_runtime_fp8(
+                            model,
+                            config=self.od_config,
+                            load_format=load_format,
+                            device=device,
+                            dit_modules=tuple(zip(modules.dit_names, modules.dits)),
+                            sources=weight_sources,
+                            prepare_weights=self._prepare_weights,
+                        )
+                    except Exception as exc:
+                        mode = RuntimeMode(getattr(self.od_config, "host_weight_runtime_mode", "disabled"))
+                        if mode is RuntimeMode.REQUIRED:
+                            raise RuntimeError("required runtime FP8 resolution failed") from exc
+                        logger.warning("Host Weight Runtime preferred fallback: %s", exc)
+                        del model
+                        load_device = canonical_load_device
+                        offload_after_quant = canonical_offload_after_quant
+                        target_device = torch.device(load_device)
+                        model = self._init_from_load_format(
+                            load_format,
+                            target_device,
+                            custom_pipeline_name,
+                            is_hsdp=False,
+                        )
+                        modules = ModuleDiscovery.discover(model)
+                        weight_sources = self._get_weight_sources(model)
+                elif not self._force_canonical_load:
                     try:
                         hwr_state = self._resolve_hwr(
                             model,
@@ -753,7 +786,12 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 hwr_active = hwr_state is not None
                 if hwr_active and hwr_state is not None:
                     self.host_weight_plan = cast(HostWeightPlan | None, hwr_state.get("plan"))
-                if dit_distributed_offload and not hwr_active and not self._force_canonical_load:
+                if (
+                    dit_distributed_offload
+                    and self.host_weight_plan is None
+                    and not hwr_active
+                    and not self._force_canonical_load
+                ):
                     lora_backend = getattr(self.od_config, "lora_backend", None)
                     has_distilled_lora = lora_backend in (LoRABackend.DISTILL, "distill") and bool(
                         getattr(self.od_config, "lora_path", None)
@@ -837,13 +875,11 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                     self._assert_final_layout_tensors_unchanged(model, cast(dict[str, tuple[int, str]], warm_snapshot))
                 self._publish_hwr_after_load(model, ModuleDiscovery.discover(model), self._hwr_state)
         except Exception:
-            hwr_plan = self._hwr_state.get("plan") if self._hwr_state is not None else None
-            if isinstance(hwr_plan, HostWeightPlan):
+            hwr_plan = self.host_weight_plan
+            if hwr_plan is not None and hwr_plan.backing_kind == "host_weight_runtime":
                 carrier = hwr_plan.lease_carrier
                 if carrier is not None:
                     carrier.close()
-                from vllm_omni.host_weight_runtime import RuntimeMode
-
                 mode = RuntimeMode(getattr(self.od_config, "host_weight_runtime_mode", "disabled"))
                 if mode is RuntimeMode.PREFERRED:
                     logger.warning(
