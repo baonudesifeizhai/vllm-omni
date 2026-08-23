@@ -12,7 +12,7 @@ from safetensors import safe_open
 from torch import nn
 from vllm import _custom_ops as ops
 
-from vllm_omni.diffusion.model_loader.host_weight_plan import HostWeightPlan, TensorBinding
+from vllm_omni.diffusion.model_loader.host_weight_plan import HostWeightPlan
 from vllm_omni.host_weight_runtime import (
     ArtifactWriter,
     CoordinationScope,
@@ -133,22 +133,20 @@ class FinalLayoutFP8Producer:
             ),
         )
 
-    def _source(self, name: str) -> tuple[torch.Tensor, TensorBinding]:
+    def _source(self, name: str) -> torch.Tensor:
         binding = self._bindings[name]
         with safe_open(binding.file_path, framework="pt", device="cpu") as handle:
             tensor = handle.get_tensor(binding.checkpoint_key)
         if binding.transform is not None:
             tensor = binding.transform(tensor)
-        return tensor, binding
+        return tensor
 
     def _write_checkpoint_tensor(self, output: TensorFileWriter, record: RuntimeTensorTarget) -> None:
-        source, binding = self._source(record.name)
+        source = self._source(record.name)
         output.write_tensor(record.name, source)
-        del source
-        binding.release_source_pages()
 
     def _write_fp8_weight(self, output: TensorFileWriter, record: RuntimeTensorTarget) -> torch.Tensor:
-        source, binding = self._source(record.name)
+        source = self._source(record.name)
         rows_per_chunk = max(
             1,
             self._quant_chunk_bytes // (source.shape[1] * source.element_size()),
@@ -157,8 +155,6 @@ class FinalLayoutFP8Producer:
         slots = self._make_slots(source, record.tensor.dtype, rows_per_chunk)
         scale = self._find_scale(source, slots, rows_per_chunk)
         self._quantize_rows(output, record.name, source, slots, rows_per_chunk, scale)
-        del source
-        binding.release_source_pages()
         return scale.cpu()
 
     def _make_slots(
