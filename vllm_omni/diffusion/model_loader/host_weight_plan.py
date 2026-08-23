@@ -7,9 +7,8 @@ from __future__ import annotations
 import glob
 import json
 import os
-import struct
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -35,20 +34,6 @@ class TensorBinding:
     checkpoint_key: str
     file_path: str
     transform: TensorTransform | None = None
-    byte_offset: int = field(default=0, compare=False)
-    byte_length: int = field(default=0, compare=False)
-
-    def release_source_pages(self) -> None:
-        """Drop checkpoint pages after the bounded producer consumes them."""
-        if not self.byte_length or not hasattr(os, "posix_fadvise"):
-            return
-        with open(self.file_path, "rb", buffering=0) as source:
-            os.posix_fadvise(
-                source.fileno(),
-                self.byte_offset,
-                self.byte_length,
-                os.POSIX_FADV_DONTNEED,
-            )
 
 
 @dataclass(frozen=True)
@@ -270,23 +255,10 @@ def _planned_source_prefixes(
     return expected
 
 
-def _payload_ranges(file_path: str) -> dict[str, tuple[int, int]]:
-    with open(file_path, "rb") as source:
-        header_size = struct.unpack("<Q", source.read(8))[0]
-        header = json.loads(source.read(header_size))
-    payload_start = 8 + header_size
-    return {
-        name: (payload_start + offsets[0], offsets[1] - offsets[0])
-        for name, metadata in header.items()
-        if name != "__metadata__"
-        for offsets in (metadata["data_offsets"],)
-    }
-
-
 def _validate_source_metadata(
     required: dict[str, torch.Tensor],
     bindings: dict[str, TensorBinding],
-) -> dict[str, TensorBinding]:
+) -> None:
     by_file: dict[str, list[tuple[str, torch.Tensor, TensorBinding]]] = {}
     for runtime_name, target in required.items():
         by_file.setdefault(bindings[runtime_name].file_path, []).append((runtime_name, target, bindings[runtime_name]))
@@ -295,7 +267,6 @@ def _validate_source_metadata(
         if not os.path.isfile(file_path):
             raise _PlanIncompatibleError(f"checkpoint file does not exist: {file_path}")
         with safe_open(file_path, framework="pt", device="cpu") as handle:
-            ranges = _payload_ranges(file_path)
             available = set(handle.keys())
             for runtime_name, target, binding in entries:
                 if binding.checkpoint_key not in available:
@@ -313,13 +284,6 @@ def _validate_source_metadata(
                     raise _PlanIncompatibleError(
                         f"dtype mismatch for {runtime_name!r}: checkpoint={source.get_dtype()}, runtime={target.dtype}"
                     )
-                byte_offset, byte_length = ranges[binding.checkpoint_key]
-                bindings[runtime_name] = replace(
-                    binding,
-                    byte_offset=byte_offset,
-                    byte_length=byte_length,
-                )
-    return bindings
 
 
 def build_checkpoint_mmap_plan(
@@ -380,7 +344,7 @@ def build_checkpoint_mmap_plan(
                 transform=policy.transform if policy is not None else None,
             )
 
-        bindings = _validate_source_metadata(required, bindings)
+        _validate_source_metadata(required, bindings)
     except (OSError, ValueError, _PlanIncompatibleError) as exc:
         return HostWeightPlanResult(None, str(exc))
 
