@@ -736,15 +736,13 @@ class OmniServeCommand(CLISubcommand):
             "--host-weight-runtime-mode",
             choices=("disabled", "preferred", "required"),
             default="disabled",
-            help="Reuse exact final-layout host weights for eligible DLO configurations "
-            "(disabled by default).",
+            help="Reuse exact final-layout host weights for eligible DLO configurations (disabled by default).",
         )
         omni_config_group.add_argument(
             "--host-weight-runtime-root",
             type=str,
             default=None,
-            help="Node-local Host Weight Runtime store root. Required when the "
-            "runtime mode is preferred or required.",
+            help="Node-local Host Weight Runtime store root. Required when the runtime mode is preferred or required.",
         )
         omni_config_group.add_argument(
             "--dlo-host-registration-limit-gib",

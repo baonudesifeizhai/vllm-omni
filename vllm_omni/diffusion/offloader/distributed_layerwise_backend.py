@@ -1702,7 +1702,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self._using_mmap = host_weight_plan is not None
         self._using_rank_local_mmap = False
         self._using_runtime_lease = False
-        if self._using_mmap:
+        if host_weight_plan is not None:
             if host_weight_plan.backing_kind == "host_weight_runtime":
                 carrier = host_weight_plan.lease_carrier
                 if carrier is None:
