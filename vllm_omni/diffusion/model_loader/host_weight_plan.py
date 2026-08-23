@@ -19,6 +19,7 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.model_loader.checkpoint_adapters import (
     get_direct_mmap_adapter,
 )
+
 logger = init_logger(__name__)
 
 if TYPE_CHECKING:
@@ -45,12 +46,10 @@ class HostWeightPlan:
     planned_source_prefixes: frozenset[str] = frozenset()
     lease_carrier: HostWeightLeaseCarrier | None = None
     restore_plan: WeightRestorePlan | None = None
+    # The selected HWR mode is retained for runner-side startup recovery.  It
+    # is deliberately metadata only; the transport still consumes the exact
+    # lease carried above.
     runtime_mode: str | None = None
-    restored_tensor_names: frozenset[str] = frozenset()
-
-    @property
-    def planned_tensor_names(self) -> frozenset[str]:
-        return frozenset(self.bindings) | self.restored_tensor_names
 
 
 @dataclass(frozen=True)
