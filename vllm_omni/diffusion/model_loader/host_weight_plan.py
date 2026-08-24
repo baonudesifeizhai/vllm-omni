@@ -23,7 +23,7 @@ from vllm_omni.diffusion.model_loader.checkpoint_adapters import (
 logger = init_logger(__name__)
 
 if TYPE_CHECKING:
-    from vllm_omni.host_weight_runtime import HostWeightLeaseCarrier, WeightRestorePlan
+    from vllm_omni.host_weight_runtime import HostWeightLeaseCarrier
 
 TensorTransform = Callable[[torch.Tensor], torch.Tensor]
 
@@ -45,11 +45,6 @@ class HostWeightPlan:
     bindings: dict[str, TensorBinding]
     planned_source_prefixes: frozenset[str] = frozenset()
     lease_carrier: HostWeightLeaseCarrier | None = None
-    restore_plan: WeightRestorePlan | None = None
-    # The selected HWR mode is retained for runner-side startup recovery.  It
-    # is deliberately metadata only; the transport still consumes the exact
-    # lease carried above.
-    runtime_mode: str | None = None
 
 
 @dataclass(frozen=True)
