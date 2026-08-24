@@ -4,6 +4,9 @@
 
 from __future__ import annotations
 
+import json
+import os
+import struct
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -41,6 +44,18 @@ DEFAULT_FP8_SHARD_SIZE_BYTES = 5 * 1024**3
 DEFAULT_FP8_QUANT_CHUNK_BYTES = 256 * 1024**2
 
 
+def _tensor_ranges(path: str) -> dict[str, tuple[int, int]]:
+    with open(path, "rb") as handle:
+        header_size = struct.unpack("<Q", handle.read(8))[0]
+        header = json.loads(handle.read(header_size))
+    payload_offset = 8 + header_size
+    return {
+        name: (payload_offset + entry["data_offsets"][0], entry["data_offsets"][1] - entry["data_offsets"][0])
+        for name, entry in header.items()
+        if name != "__metadata__"
+    }
+
+
 @dataclass
 class _QuantSlot:
     stream: torch.cuda.Stream
@@ -75,6 +90,7 @@ class FinalLayoutFP8Producer:
         self._device = device
         self._max_shard_bytes = max_shard_bytes
         self._quant_chunk_bytes = quant_chunk_bytes
+        self._source_ranges: dict[str, dict[str, tuple[int, int]]] = {}
         self._spec = WeightProductionSpec(
             producer_id=FINAL_LAYOUT_FP8_PRODUCER_ID,
             outputs=(context.identity,),
@@ -141,9 +157,23 @@ class FinalLayoutFP8Producer:
             tensor = binding.transform(tensor)
         return tensor
 
+    def _release_source_pages(self, name: str) -> None:
+        binding = self._bindings[name]
+        ranges = self._source_ranges.get(binding.file_path)
+        if ranges is None:
+            ranges = _tensor_ranges(binding.file_path)
+            self._source_ranges[binding.file_path] = ranges
+        offset, nbytes = ranges[binding.checkpoint_key]
+        if not nbytes:
+            return
+        with open(binding.file_path, "rb") as handle:
+            os.posix_fadvise(handle.fileno(), offset, nbytes, os.POSIX_FADV_DONTNEED)
+
     def _write_checkpoint_tensor(self, output: TensorFileWriter, record: RuntimeTensorTarget) -> None:
         source = self._source(record.name)
         output.write_tensor(record.name, source)
+        del source
+        self._release_source_pages(record.name)
 
     def _write_fp8_weight(self, output: TensorFileWriter, record: RuntimeTensorTarget) -> torch.Tensor:
         source = self._source(record.name)
@@ -155,7 +185,10 @@ class FinalLayoutFP8Producer:
         slots = self._make_slots(source, record.tensor.dtype, rows_per_chunk)
         scale = self._find_scale(source, slots, rows_per_chunk)
         self._quantize_rows(output, record.name, source, slots, rows_per_chunk, scale)
-        return scale.cpu()
+        host_scale = scale.cpu()
+        del source
+        self._release_source_pages(record.name)
+        return host_scale
 
     def _make_slots(
         self,
