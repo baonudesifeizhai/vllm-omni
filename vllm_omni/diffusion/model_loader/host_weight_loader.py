@@ -619,6 +619,7 @@ class HWRLoaderMixin:
             bindings={name: TensorBinding(name, "") for name in context.tensor_names},
             planned_source_prefixes=planned_prefixes,
             lease_carrier=carrier,
+            runtime_mode=mode.value,
         )
         state["warm_snapshot"] = warm_snapshot
         return state
