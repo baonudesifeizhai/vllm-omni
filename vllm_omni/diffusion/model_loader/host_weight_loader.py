@@ -243,6 +243,7 @@ class HWRLoaderMixin:
         policy: FinalLayoutTensorPolicy | None = None,
         source_digest_cache: NodeSourceDigestCache | None = None,
         quantization_identity: object | None = None,
+        canonical_sequence_parallel: bool = False,
     ) -> FinalLayoutIdentityContext:
         from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 
@@ -308,6 +309,15 @@ class HWRLoaderMixin:
             use_hsdp=bool(getattr(parallel, "use_hsdp", False)),
             enable_expert_parallel=bool(getattr(parallel, "enable_expert_parallel", False)),
         )
+        if canonical_sequence_parallel:
+            semantic_parallel = dataclasses.replace(
+                semantic_parallel,
+                sequence_parallel_size=1,
+                ulysses_degree=1,
+                ring_degree=1,
+                allgather_degree=1,
+                ulysses_mode="strict",
+            )
         model_id = str(getattr(self.od_config, "model", "") or "")
         if not model_id:
             raise ValueError("final-layout HWR requires a canonical model identifier")
@@ -436,6 +446,7 @@ class HWRLoaderMixin:
                 self.quant_config,
                 tuple(name for name, _ in dit_modules),
             ),
+            canonical_sequence_parallel=True,
         )
         producer = FinalLayoutFP8Producer(
             context,
