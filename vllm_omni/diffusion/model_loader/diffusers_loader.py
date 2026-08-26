@@ -488,8 +488,18 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         if load_format is None:
             load_format = "default"
 
+        runtime_requested = (
+            not self._force_canonical_load
+            and self.quant_config is not None
+            and runtime_fp8_requested(self.od_config, load_format, device)
+        )
+
+        # Offline-quantized checkpoints can load directly on CPU. Ordinary
+        # online quantization must run on the accelerator before CPU offload.
         offload_after_quant = False
-        if load_device == "cpu" and self.quant_config is not None and device is not None:
+        if runtime_requested:
+            load_device = "cpu"
+        elif load_device == "cpu" and self.quant_config is not None and device is not None:
             quant_cfg = self.quant_config
             is_offline = getattr(quant_cfg, "data_type", None) == "mx_fp" or getattr(
                 quant_cfg, "is_checkpoint_quantized", False
@@ -497,15 +507,12 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             if not is_offline:
                 load_device = device.type
                 offload_after_quant = True
-
-        runtime_requested = (
-            not self._force_canonical_load
-            and self.quant_config is not None
-            and runtime_fp8_requested(self.od_config, load_format, device)
-        )
-        if runtime_requested:
-            load_device = "cpu"
-            offload_after_quant = False
+                logger.info(
+                    "Online quantization with CPU offload, using %s for weight loading (will offload back to CPU)",
+                    load_device,
+                )
+            else:
+                logger.info("Offline-quantized model with CPU offload, loading weights directly on CPU")
 
         target_device = torch.device(load_device)
         with set_default_torch_dtype(self.od_config.dtype):

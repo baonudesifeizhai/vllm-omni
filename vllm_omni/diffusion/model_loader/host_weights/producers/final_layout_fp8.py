@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import struct
 from collections.abc import Sequence
@@ -117,6 +118,7 @@ class FinalLayoutFP8Producer:
             require_materialized=False,
         )
         contract_digest = validate_final_layout_identity(self._context, records)
+        records = tuple(sorted(records, key=self._production_order))
         generated_scales: dict[str, torch.Tensor] = {}
 
         shards = split_tensor_targets_by_bytes(records, self._max_shard_bytes)
@@ -148,6 +150,12 @@ class FinalLayoutFP8Producer:
                 tensor_count=len(records),
             ),
         )
+
+    @staticmethod
+    def _production_order(record: RuntimeTensorTarget) -> tuple[str, int]:
+        if record.role == "fp8_scale":
+            return record.name.removesuffix("_scale"), 1
+        return record.name, 0
 
     def _source(self, name: str) -> torch.Tensor:
         binding = self._bindings[name]
@@ -185,9 +193,11 @@ class FinalLayoutFP8Producer:
         slots = self._make_slots(source, record.tensor.dtype, rows_per_chunk)
         scale = self._find_scale(source, slots, rows_per_chunk)
         self._quantize_rows(output, record.name, source, slots, rows_per_chunk, scale)
-        host_scale = scale.cpu()
+        host_scale = slots[0].host_amax
+        host_scale.copy_(scale, non_blocking=True)
         del source
         self._release_source_pages(record.name)
+        torch.cuda.current_stream(self._device).synchronize()
         return host_scale
 
     def _make_slots(
@@ -231,8 +241,19 @@ class FinalLayoutFP8Producer:
             slot.pending_rows = rows
         for slot in slots:
             amax = self._collect_amax(slot, amax)
-        probe = amax.to(device=self._device, dtype=source.dtype).reshape(1, 1)
-        return ops.scaled_fp8_quant(probe)[1]
+        amax_value = amax.item()
+        if not math.isfinite(amax_value):
+            raise ValueError("cannot quantize a tensor containing non-finite values")
+        if amax_value == 0:
+            scale = torch.ones((1,), dtype=torch.float32, device=self._device)
+        else:
+            probe = amax.to(device=self._device, dtype=source.dtype).reshape(1, 1)
+            scale = ops.scaled_fp8_quant(probe)[1]
+        scale_ready = torch.cuda.Event()
+        scale_ready.record(torch.cuda.current_stream(self._device))
+        for slot in slots:
+            slot.stream.wait_event(scale_ready)
+        return scale
 
     @staticmethod
     def _collect_amax(slot: _QuantSlot, current: torch.Tensor) -> torch.Tensor:
@@ -240,7 +261,8 @@ class FinalLayoutFP8Producer:
             return current
         slot.ready.synchronize()
         slot.pending_rows = 0
-        return torch.maximum(current, slot.host_amax)
+        torch.maximum(current, slot.host_amax, out=current)
+        return current
 
     def _quantize_rows(
         self,
