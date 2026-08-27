@@ -151,10 +151,9 @@ For no-AllGather, the existing artifact modes remain unchanged:
   artifact for the next startup;
 - `required` consumes only an existing exact artifact and fails on a miss.
 
-The AllGather derivation plan recognizes immutable Hugging Face snapshot blobs
-and the SHA-256 metadata written by `hf download --local-dir`. Other local
-checkpoint files are hashed once and their digests are reused only while file
-identity and timestamps remain unchanged.
+The AllGather derivation plan recognizes immutable Hugging Face snapshot blobs.
+Local checkpoint files are hashed once and their digests are reused only while
+file identity and timestamps remain unchanged.
 
 Every AllGather rank must agree on the source identity, source-content digest,
 checkpoint bindings, and final DLO transport layout before the first weight

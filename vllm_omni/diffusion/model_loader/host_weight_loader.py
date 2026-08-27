@@ -476,133 +476,63 @@ class HWRLoaderMixin:
         )
         from vllm_omni.host_weight_runtime.filesystem import detect_storage_class
 
-        context = None
-        plan = None
-        plan_digest = None
-        runtime = None
-        fallback_reason = None
-        preflight_error: Exception | None = None
-        try:
-            parallel = self.parallel_config
-            dp_size = int(getattr(parallel, "data_parallel_size", 1) or 1)
-            sp_size = int(getattr(parallel, "sequence_parallel_size", 1) or 1)
-            expected_size = dp_size if dp_size > 1 else sp_size
-            if int(getattr(coordinator, "world_size")) != expected_size:
-                raise RuntimeError(
-                    "BF16 HWR AllGather group size differs from the configured DLO topology: "
-                    f"resolved={coordinator.world_size}, expected={expected_size}"
-                )
+        root = Path(self.od_config.host_weight_runtime_root).expanduser()
+        root.mkdir(parents=True, exist_ok=True)
+        runtime = HostWeightRuntime.from_config(
+            HostWeightRuntimeConfig(
+                mode=mode,
+                domain=StorageDomainPolicy(root=root, storage_class=detect_storage_class(root)),
+                production=ProductionPolicy(
+                    allow_local_build=False,
+                    allow_post_load_publish=False,
+                ),
+            )
+        )
+        context = self._build_hwr_context(
+            model,
+            modules,
+            load_format=load_format,
+            sources=sources,
+            source_digest_cache=NodeSourceDigestCache(
+                root,
+                timeout_seconds=runtime.config.wait.coordination_timeout_seconds,
+            ),
+        )
+        dit_modules = tuple(zip(modules.dit_names, modules.dits))  # type: ignore[attr-defined]
+        result = build_checkpoint_mmap_plan(
+            model,
+            dit_modules=dit_modules,
+            sources=sources,
+            model_path=str(self.od_config.model),
+            tensor_parallel_size=self.parallel_config.tensor_parallel_size,
+            use_hsdp=self.parallel_config.use_hsdp,
+            online_quantization=has_online_quantization(model),
+        )
+        if result.plan is None:
+            reason = result.fallback_reason or "checkpoint mmap planning failed"
+            if mode is RuntimeMode.REQUIRED:
+                raise ValueError(f"required Host Weight Runtime derivation is ineligible: {reason}")
+            logger.info("BF16 HWR derivation is ineligible; using canonical DLO: %s", reason)
+            return None
 
-            expected_prefixes = frozenset(f"{name}." for name in getattr(modules, "dit_names", ()))
-            available_prefixes = frozenset(getattr(source, "prefix", "") for source in sources)
-            if not expected_prefixes <= available_prefixes:
-                fallback_reason = "source derivation requires one dedicated source prefix per owned DiT"
-            else:
-                overlapping_prefixes = frozenset(
-                    prefix
-                    for prefix in available_prefixes
-                    if any(dit_prefix.startswith(prefix) for dit_prefix in expected_prefixes)
-                )
-                if not overlapping_prefixes <= expected_prefixes:
-                    fallback_reason = "source derivation rejects mixed DiT/component checkpoint sources"
-
-            if fallback_reason is None:
-                root_value = getattr(self.od_config, "host_weight_runtime_root", None)
-                if not isinstance(root_value, str) or not root_value.strip():
-                    raise ValueError("enabled Host Weight Runtime requires host_weight_runtime_root")
-                root = Path(root_value).expanduser()
-                root.mkdir(parents=True, exist_ok=True)
-                runtime = HostWeightRuntime.from_config(
-                    HostWeightRuntimeConfig(
-                        mode=mode,
-                        domain=StorageDomainPolicy(root=root, storage_class=detect_storage_class(root)),
-                        production=ProductionPolicy(
-                            allow_local_build=False,
-                            allow_post_load_publish=False,
-                        ),
-                    )
-                )
-                context = self._build_hwr_context(
-                    model,
-                    modules,
-                    load_format=load_format,
-                    sources=sources,
-                    source_digest_cache=NodeSourceDigestCache(
-                        root,
-                        timeout_seconds=runtime.config.wait.coordination_timeout_seconds,
-                    ),
-                )
-                dit_modules = tuple(zip(getattr(modules, "dit_names", ()), getattr(modules, "dits", ())))
-                result = build_checkpoint_mmap_plan(
-                    model,
-                    dit_modules=dit_modules,
-                    sources=sources,
-                    model_path=str(getattr(self.od_config, "model", "")) or None,
-                    tensor_parallel_size=int(getattr(parallel, "tensor_parallel_size", 1)),
-                    use_hsdp=bool(getattr(parallel, "use_hsdp", False)),
-                    online_quantization=has_online_quantization(model),
-                )
-                if result.plan is None:
-                    fallback_reason = result.fallback_reason or "checkpoint mmap planning failed"
-                else:
-                    context.ensure_sources_unchanged()
-                    plan = dataclasses.replace(
-                        result.plan,
-                        backing_kind="host_weight_runtime_derivation",
-                    )
-                    plan_digest = self._derivation_plan_digest(plan)
-        except Exception as exc:
-            preflight_error = exc
+        context.ensure_sources_unchanged()
+        plan = dataclasses.replace(result.plan, backing_kind="host_weight_runtime_derivation")
+        plan_digest = self._derivation_plan_digest(plan)
 
         records = self._coordinate_hwr_group(
             coordinator,
             "derivation_plan",
             {
-                "identity_digest": context.identity.key if context is not None else None,
-                "content_digest": context.identity.source.fingerprint if context is not None else None,
+                "identity_digest": context.identity.key,
+                "content_digest": context.identity.source.fingerprint,
                 "plan_digest": plan_digest,
-                "status": "error" if preflight_error is not None else "fallback" if fallback_reason else "ready",
-                "error_type": type(preflight_error).__name__ if preflight_error is not None else None,
             },
-            require_identity=False,
         )
-        failed_ranks = [record.get("group_rank") for record in records if record.get("status") == "error"]
-        if failed_ranks:
-            raise RuntimeError(
-                f"BF16 HWR AllGather derivation-plan preflight failed on group ranks {failed_ranks}"
-            ) from preflight_error
-
-        fallback_ranks = [record.get("group_rank") for record in records if record.get("status") == "fallback"]
-        if fallback_ranks:
-            if len(fallback_ranks) != len(records):
-                raise RuntimeError(
-                    f"BF16 HWR AllGather derivation-plan eligibility differs across ranks: fallback={fallback_ranks}"
-                )
-            if mode is RuntimeMode.REQUIRED:
-                raise ValueError(
-                    "required Host Weight Runtime derivation plan is ineligible: "
-                    f"{fallback_reason or 'peer derivation-plan fallback'}"
-                )
-            logger.info(
-                "BF16 HWR derivation plan is ineligible on group ranks %s; using canonical DLO: %s",
-                fallback_ranks,
-                fallback_reason or "peer derivation-plan fallback",
-            )
-            return None
-
-        for field, label in (
-            ("identity_digest", "source identity"),
-            ("content_digest", "source content"),
-            ("plan_digest", "checkpoint binding plan"),
-        ):
+        for field in ("content_digest", "plan_digest"):
             values = {record.get(field) for record in records}
-            if len(values) != 1 or None in values:
-                raise RuntimeError(f"BF16 HWR AllGather {label} differs across ranks")
+            if len(values) != 1:
+                raise RuntimeError(f"BF16 HWR AllGather {field} differs across ranks")
 
-        assert context is not None
-        assert plan is not None
-        assert plan_digest is not None
-        assert runtime is not None
         resolution = runtime.resolve_derivation(
             SourceDerivationSpec(
                 identity=context.identity,
@@ -611,48 +541,12 @@ class HWRLoaderMixin:
                 validate_source=context.ensure_sources_unchanged,
             )
         )
-        derivation_lease = resolution.lease if isinstance(resolution.lease, HostWeightDerivationLease) else None
-        try:
-            resolution_records = self._coordinate_hwr_group(
-                coordinator,
-                "derivation_resolution",
-                {
-                    "identity_digest": context.identity.key,
-                    "content_digest": context.identity.source.fingerprint,
-                    "plan_digest": plan_digest,
-                    "status": (
-                        "ready"
-                        if resolution.report.outcome is ResolutionOutcome.SOURCE_DERIVATION
-                        else "fallback"
-                        if resolution.report.outcome is ResolutionOutcome.CANONICAL_FALLBACK
-                        else "error"
-                    ),
-                    "outcome": resolution.report.outcome.value,
-                },
-            )
-        except Exception:
-            if derivation_lease is not None:
-                derivation_lease.close()
-            raise
-        failed_ranks = [record.get("group_rank") for record in resolution_records if record.get("status") == "error"]
-        fallback_ranks = [
-            record.get("group_rank") for record in resolution_records if record.get("status") == "fallback"
-        ]
-        if failed_ranks or fallback_ranks:
-            if derivation_lease is not None:
-                derivation_lease.close()
-            if fallback_ranks and len(fallback_ranks) == len(resolution_records):
-                logger.info("BF16 HWR derivation fell back on all group ranks: %s", fallback_ranks)
-                return None
-            affected_ranks = failed_ranks or fallback_ranks
-            raise RuntimeError(
-                f"BF16 HWR AllGather derivation resolution differs or failed on group ranks {affected_ranks}"
-            )
-        outcomes = {record.get("outcome") for record in resolution_records}
-        if outcomes != {ResolutionOutcome.SOURCE_DERIVATION.value} or derivation_lease is None:
-            if derivation_lease is not None:
-                derivation_lease.close()
-            raise RuntimeError("BF16 HWR AllGather derivation resolution returned no derivation lease")
+        if resolution.report.outcome is ResolutionOutcome.CANONICAL_FALLBACK:
+            logger.info("BF16 HWR derivation validation failed; using canonical DLO")
+            return None
+        if resolution.report.outcome is not ResolutionOutcome.SOURCE_DERIVATION:
+            raise RuntimeError(f"BF16 HWR derivation failed: {resolution.report.outcome.value}")
+        derivation_lease = cast(HostWeightDerivationLease, resolution.lease)
         plan = dataclasses.replace(plan, lease_carrier=HostWeightLeaseCarrier(derivation_lease))
         logger.info(
             "Resolved BF16 HWR checkpoint derivation: outcome=%s, identity=%s, tensors=%d",
@@ -695,59 +589,17 @@ class HWRLoaderMixin:
         )
         from vllm_omni.host_weight_runtime.filesystem import detect_storage_class
 
-        try:
-            requested_mode = RuntimeMode(getattr(self.od_config, "host_weight_runtime_mode", "disabled"))
-        except ValueError as exc:
-            raise ValueError("host_weight_runtime_mode must be disabled, preferred, or required") from exc
-        if requested_mode is RuntimeMode.DISABLED or not dist_offload:
-            self._hwr_eligibility_mode(
-                model,
-                modules,
-                dist_offload=dist_offload,
-                use_allgather=use_allgather,
-                load_format=load_format,
-            )
+        mode = self._hwr_eligibility_mode(
+            model,
+            modules,
+            dist_offload=dist_offload,
+            use_allgather=use_allgather,
+            load_format=load_format,
+        )
+        if mode is None:
             return None
 
         coordinator = self._resolve_hwr_allgather_coordinator(use_allgather)
-        mode = None
-        eligibility_error: Exception | None = None
-        try:
-            mode = self._hwr_eligibility_mode(
-                model,
-                modules,
-                dist_offload=dist_offload,
-                use_allgather=use_allgather,
-                load_format=load_format,
-            )
-        except Exception as exc:
-            eligibility_error = exc
-        eligibility_records = self._coordinate_hwr_group(
-            coordinator,
-            "eligibility",
-            {
-                "identity_digest": "bf16-final-layout-eligibility-v1",
-                "status": "error" if eligibility_error is not None else "ineligible" if mode is None else "eligible",
-                "error_type": type(eligibility_error).__name__ if eligibility_error is not None else None,
-            },
-            require_identity=False,
-        )
-        resolution_scope = "BF16 HWR AllGather" if coordinator is not None else "Host Weight Runtime"
-        failed_ranks = [record.get("group_rank") for record in eligibility_records if record.get("status") == "error"]
-        if failed_ranks:
-            if coordinator is None and eligibility_error is not None:
-                raise eligibility_error
-            raise RuntimeError(
-                f"{resolution_scope} eligibility failed on group ranks {failed_ranks}"
-            ) from eligibility_error
-        ineligible_ranks = [
-            record.get("group_rank") for record in eligibility_records if record.get("status") == "ineligible"
-        ]
-        if ineligible_ranks:
-            if len(ineligible_ranks) == len(eligibility_records):
-                return None
-            raise RuntimeError(f"BF16 HWR AllGather eligibility differs across ranks: ineligible={ineligible_ranks}")
-        assert isinstance(mode, RuntimeMode)
         if coordinator is not None:
             return self._resolve_hwr_allgather_derivation(
                 model,

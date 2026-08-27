@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import os
 import stat
 import time
@@ -311,66 +310,6 @@ def _hf_blob_content_id(
     return f"immutable-blob:{blob_name.lower()}"
 
 
-def _hf_local_dir_content_id(
-    path: Path,
-    *,
-    source: PreparedWeightSource,
-    state: _FileState,
-) -> str | None:
-    """Use trusted ``hf download --local-dir`` metadata without rehashing.
-
-    Hugging Face records the remote ETag beside every local-dir download. LFS
-    payload ETags are the lowercase SHA-256 of the complete file.  Accept the
-    shortcut only while the download metadata is newer than the source inode;
-    a later local write changes ctime and forces the ordinary content hash.
-    """
-    model_root = Path(source.model_or_path).expanduser()
-    try:
-        model_root = model_root.resolve(strict=True)
-        candidate = path.resolve(strict=True)
-        candidate.relative_to(model_root)
-    except (OSError, ValueError):
-        return None
-
-    metadata = None
-    for local_root in (model_root, *model_root.parents):
-        try:
-            relative = candidate.relative_to(local_root)
-        except ValueError:
-            continue
-        candidate_metadata = local_root / ".cache" / "huggingface" / "download" / f"{relative.as_posix()}.metadata"
-        if candidate_metadata.is_file():
-            metadata = candidate_metadata
-            break
-    if metadata is None:
-        return None
-    try:
-        metadata_stat = metadata.stat()
-        source_stat = candidate.stat()
-        if metadata.is_symlink() or not stat.S_ISREG(metadata_stat.st_mode):
-            return None
-        if metadata_stat.st_uid != source_stat.st_uid or metadata_stat.st_mode & 0o022:
-            return None
-        lines = metadata.read_text(encoding="utf-8").splitlines()
-        if len(lines) < 3:
-            return None
-        commit, etag = lines[0].strip().lower(), lines[1].strip().lower()
-        downloaded_at = float(lines[2].strip())
-    except (OSError, UnicodeError, ValueError):
-        return None
-
-    if (
-        _IMMUTABLE_REVISION_RE.fullmatch(commit) is None
-        or re.fullmatch(r"[0-9a-f]{64}", etag) is None
-        or not math.isfinite(downloaded_at)
-    ):
-        return None
-    trusted_after_ns = max(metadata_stat.st_mtime_ns, int(downloaded_at * 1_000_000_000))
-    if state.ctime_ns > trusted_after_ns:
-        return None
-    return f"sha256:{etag}"
-
-
 def _snapshot_revision(path: Path) -> str | None:
     parts = path.absolute().parts
     for index, part in enumerate(parts[:-1]):
@@ -420,12 +359,6 @@ def _snapshot_source(
             source=source,
             source_root=root,
         )
-        if content_id is None:
-            content_id = _hf_local_dir_content_id(
-                candidate,
-                source=source,
-                state=current,
-            )
         if content_id is None:
             content_id = (
                 digest_cache.content_id(candidate, current)

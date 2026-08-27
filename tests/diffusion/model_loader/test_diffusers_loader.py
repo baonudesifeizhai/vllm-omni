@@ -269,18 +269,7 @@ def test_hwr_selects_artifact_restore_or_checkpoint_derivation_allgather(
         second_plan.lease_carrier.close()
     assert hash_calls == 1
     assert len(tuple((store_root / "source-digests-v1" / "entries").glob("*.json"))) == 1
-    assert consensus_phases == (
-        [
-            "eligibility",
-            "derivation_plan",
-            "derivation_resolution",
-            "eligibility",
-            "derivation_plan",
-            "derivation_resolution",
-        ]
-        if use_allgather
-        else []
-    )
+    assert consensus_phases == (["derivation_plan", "derivation_plan"] if use_allgather else [])
 
 
 def test_hwr_commit_failure_discards_model_and_reloads_without_hwr_or_mmap(tmp_path: Path, monkeypatch):
@@ -337,7 +326,7 @@ def test_required_hwr_empty_store_reports_typed_resolution_failure(
     assert loader.take_host_weight_plan() is None
 
 
-def test_hwr_allgather_rejects_mixed_derivation_plan_readiness(
+def test_hwr_allgather_rejects_different_derivation_plans(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -363,26 +352,19 @@ def test_hwr_allgather_rejects_mixed_derivation_plan_readiness(
     monkeypatch.setattr(warm_loader, "_init_from_load_format", lambda *_args, **_kwargs: warm_model)
     monkeypatch.setattr(warm_loader, "_resolve_hwr_allgather_coordinator", lambda _enabled: coordinator)
 
-    def mixed_derivation_plan(output, local, *, group):
+    def mismatched_derivation_plan(output, local, *, group):
         assert group is coordinator.cpu_group
-        if local["phase"] == "eligibility":
-            output[0] = local
-            output[1] = {**local, "group_rank": 1}
-            return
         assert local["phase"] == "derivation_plan"
         output[0] = local
         output[1] = {
             **local,
             "group_rank": 1,
-            "status": "fallback",
-            "identity_digest": None,
-            "content_digest": None,
-            "plan_digest": None,
+            "plan_digest": "different-plan",
         }
 
-    monkeypatch.setattr(torch.distributed, "all_gather_object", mixed_derivation_plan)
+    monkeypatch.setattr(torch.distributed, "all_gather_object", mismatched_derivation_plan)
 
-    with pytest.raises(RuntimeError, match="derivation-plan eligibility differs across ranks"):
+    with pytest.raises(RuntimeError, match="plan_digest differs across ranks"):
         warm_loader.load_model(load_device="cpu", device=torch.device("cpu"))
     assert warm_model.load_count == 0
 
@@ -446,104 +428,6 @@ def test_hwr_allgather_resolves_the_same_dp_or_sp_cohort_as_dlo(
     coordinator = loader._resolve_hwr_allgather_coordinator(True)
 
     assert coordinator is (dp_group if expected_group == "dp" else sp_group)
-
-
-def test_hwr_allgather_rejects_mixed_eligibility_before_store_interaction(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    canonical_root = tmp_path / "canonical"
-    canonical_root.mkdir()
-    save_file(
-        {"weight": torch.arange(4, dtype=torch.float32).to(torch.bfloat16).reshape(2, 2)},
-        str(canonical_root / "model.safetensors"),
-    )
-    store_root = tmp_path / "must-not-be-touched"
-    coordinator = SimpleNamespace(
-        world_size=2,
-        rank_in_group=0,
-        ranks=(0, 1),
-        cpu_group=object(),
-        device_group=object(),
-    )
-    loader = DiffusersPipelineLoader(
-        LoadConfig(),
-        _hwr_config(canonical_root, store_root, use_allgather=True, data_parallel_size=2),
-    )
-    model = _HWRPipeline(canonical_root)
-    monkeypatch.setattr(loader, "_init_from_load_format", lambda *_args, **_kwargs: model)
-    monkeypatch.setattr(loader, "_resolve_hwr_allgather_coordinator", lambda _enabled: coordinator)
-
-    def mixed_eligibility(output, local, *, group):
-        assert group is coordinator.cpu_group
-        assert local["phase"] == "eligibility"
-        output[0] = local
-        output[1] = {**local, "group_rank": 1, "status": "ineligible"}
-
-    monkeypatch.setattr(torch.distributed, "all_gather_object", mixed_eligibility)
-
-    with pytest.raises(RuntimeError, match="eligibility differs across ranks"):
-        loader.load_model(load_device="cpu", device=torch.device("cpu"))
-
-    assert not store_root.exists()
-    assert model.load_count == 0
-
-
-def test_hwr_allgather_derivation_plan_failure_notifies_group(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    canonical_root = tmp_path / "canonical"
-    canonical_root.mkdir()
-    save_file(
-        {"weight": torch.arange(4, dtype=torch.float32).to(torch.bfloat16).reshape(2, 2)},
-        str(canonical_root / "model.safetensors"),
-    )
-    coordinator = SimpleNamespace(
-        world_size=2,
-        rank_in_group=0,
-        ranks=(0, 1),
-        cpu_group=object(),
-        device_group=object(),
-    )
-    loader = DiffusersPipelineLoader(
-        LoadConfig(),
-        _hwr_config(canonical_root, tmp_path / "store", use_allgather=True, data_parallel_size=2),
-    )
-    model = _HWRPipeline(canonical_root)
-    statuses: list[str] = []
-    monkeypatch.setattr(loader, "_init_from_load_format", lambda *_args, **_kwargs: model)
-    monkeypatch.setattr(loader, "_resolve_hwr_allgather_coordinator", lambda _enabled: coordinator)
-    monkeypatch.setattr(
-        loader,
-        "_build_hwr_context",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("source identity failed")),
-    )
-
-    def gather_derivation_plan(output, local, *, group):
-        assert group is coordinator.cpu_group
-        if local["phase"] == "eligibility":
-            output[0] = local
-            output[1] = {**local, "group_rank": 1}
-            return
-        assert local["phase"] == "derivation_plan"
-        statuses.append(local["status"])
-        output[0] = local
-        output[1] = {
-            **local,
-            "group_rank": 1,
-            "status": "ready",
-            "error_type": None,
-            "identity_digest": "peer-identity",
-        }
-
-    monkeypatch.setattr(torch.distributed, "all_gather_object", gather_derivation_plan)
-
-    with pytest.raises(RuntimeError, match=r"derivation-plan preflight failed on group ranks \[0\]"):
-        loader.load_model(load_device="cpu", device=torch.device("cpu"))
-
-    assert statuses == ["error"]
-    assert model.load_count == 0
 
 
 def _make_dlo_online_quant_config() -> OmniDiffusionConfig:

@@ -243,12 +243,9 @@ the artifact-backed no-AllGather path, `required` AllGather does not require a
 pre-populated HWR artifact.
 
 The HWR root remains meaningful for node-shared source-digest records.
-Content-addressed Hugging Face snapshot blobs are used directly. Local
-directories created by `hf download --local-dir` can use the downloader's
-trusted 64-character LFS ETag as the file SHA-256 while the source inode has not
-changed since the metadata was written. Other local files are hashed in
-parallel and cached under the HWR root; cache reuse requires the same path,
-inode, size, timestamps, symlink target, and record checksum.
+Content-addressed Hugging Face snapshot blobs are used directly. Local files
+are hashed in parallel and cached under the HWR root; cache reuse requires the
+same path, inode, size, timestamps, symlink target, and record checksum.
 
 The process-local derivation lease checks those observations immediately before
 and after checkpoint mmap realization. Before the first weight collective,
