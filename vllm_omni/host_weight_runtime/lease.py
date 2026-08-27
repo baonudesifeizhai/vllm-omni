@@ -159,21 +159,87 @@ class HostWeightLease:
             self.close()
 
 
+@dataclass(frozen=True)
+class SourceDerivationSpec:
+    """Validated input for deriving one exact runtime representation."""
+
+    identity: WeightArtifactIdentity
+    source_content_digest: str
+    plan_digest: str
+    validate_source: Callable[[], None]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.identity, WeightArtifactIdentity):
+            raise TypeError("source derivation identity must use WeightArtifactIdentity")
+        if not self.source_content_digest or not self.plan_digest:
+            raise ValueError("source derivation content and plan digests must not be empty")
+        if not callable(self.validate_source):
+            raise TypeError("source derivation validator must be callable")
+
+
+@dataclass(frozen=True)
+class SourceDerivationProvenance:
+    resolution_id: str
+    identity_digest: str
+    source_content_digest: str
+    plan_digest: str
+    validation_level: str
+
+
+class HostWeightDerivationLease:
+    """Ownership boundary for deferred derivation from a canonical source."""
+
+    def __init__(self, spec: SourceDerivationSpec, provenance: SourceDerivationProvenance) -> None:
+        if provenance.identity_digest != spec.identity.key:
+            raise ValueError("derivation lease identity differs from its source specification")
+        if provenance.source_content_digest != spec.source_content_digest:
+            raise ValueError("derivation lease content differs from its source specification")
+        if provenance.plan_digest != spec.plan_digest:
+            raise ValueError("derivation lease plan differs from its source specification")
+        self.identity = spec.identity
+        self.provenance = provenance
+        self._validate_source = spec.validate_source
+        self._state_lock = threading.RLock()
+        self._closed = False
+
+    @property
+    def closed(self) -> bool:
+        with self._state_lock:
+            return self._closed
+
+    def ensure_source_unchanged(self) -> None:
+        with self._state_lock:
+            if self._closed:
+                raise RuntimeError("cannot validate a closed HostWeightDerivationLease")
+            self._validate_source()
+
+    def close(self) -> None:
+        with self._state_lock:
+            self._closed = True
+
+    def __reduce_ex__(self, _protocol: SupportsIndex) -> NoReturn:
+        raise TypeError("HostWeightDerivationLease is process-local and cannot be serialized")
+
+    def __del__(self) -> None:
+        with contextlib.suppress(Exception):
+            self.close()
+
+
 class HostWeightLeaseCarrier:
     """Process-local, single-take ownership carrier for a host-weight lease.
 
-    The loader creates the carrier after a restore transaction has committed.
-    The runner/backend takes the lease exactly once before starting any
-    asynchronous transport work.  If setup fails before that handoff, closing
-    the carrier releases the loader-owned lease.
+    The loader creates the carrier after artifact restore commits or source
+    derivation resolves. The runner/backend takes the lease exactly once before
+    starting transport work. If setup fails before that handoff, closing the
+    carrier releases the loader-owned lease.
     """
 
-    def __init__(self, lease: HostWeightLease) -> None:
-        if not isinstance(lease, HostWeightLease):
-            raise TypeError("HostWeightLeaseCarrier requires one HostWeightLease")
+    def __init__(self, lease: HostWeightLease | HostWeightDerivationLease) -> None:
+        if not isinstance(lease, HostWeightLease | HostWeightDerivationLease):
+            raise TypeError("HostWeightLeaseCarrier requires one host-weight lease")
         if lease.closed:
             raise ValueError("cannot carry a closed HostWeightLease")
-        self._lease: HostWeightLease | None = lease
+        self._lease: HostWeightLease | HostWeightDerivationLease | None = lease
         self._taken = False
         self._lock = threading.RLock()
 
@@ -187,7 +253,7 @@ class HostWeightLeaseCarrier:
         with self._lock:
             return self._lease is None or self._lease.closed
 
-    def take(self) -> HostWeightLease:
+    def take(self) -> HostWeightLease | HostWeightDerivationLease:
         """Transfer the lease to the transport owner exactly once."""
         with self._lock:
             if self._taken:
@@ -215,4 +281,12 @@ class HostWeightLeaseCarrier:
             self.close()
 
 
-__all__ = ["HostWeightLease", "HostWeightLeaseCarrier", "LeaseProvenance", "MappedHostRegion"]
+__all__ = [
+    "HostWeightDerivationLease",
+    "HostWeightLease",
+    "HostWeightLeaseCarrier",
+    "LeaseProvenance",
+    "MappedHostRegion",
+    "SourceDerivationProvenance",
+    "SourceDerivationSpec",
+]

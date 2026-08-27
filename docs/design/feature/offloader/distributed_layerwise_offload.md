@@ -196,10 +196,11 @@ adopt it.
 
 ### BF16 Host Weight Runtime consumers
 
-BF16 uses two different HWR storage contracts because the DLO transports have
-different lifetime requirements.
+BF16 uses two HWR materialization points because the DLO transports have
+different lifetime requirements. The canonical checkpoint is upstream of the
+optional runtime-ready artifact; it is not a peer artifact backing.
 
-#### AllGather: source-backed checkpoint plan
+#### AllGather: deferred checkpoint derivation
 
 Native BF16 safetensors already contain the representation that DLO AllGather
 needs. Creating another final-layout BF16 artifact would add a complete
@@ -214,15 +215,17 @@ When HWR is enabled for a multi-rank AllGather cohort, the loader:
 3. builds the existing checkpoint-mmap bindings, including any bounded
    loader-owned transforms;
 4. exchanges the source identity, source-content digest, and binding-plan
-   digest across the DLO DP-or-SP group; and
-5. hands DLO a `host_weight_runtime_source` plan that references the original
-   safetensors files.
+   digest across the DLO DP-or-SP group;
+5. asks HWR to resolve that exact pre-artifact `SourceDerivationSpec`; and
+6. hands the resulting `HostWeightDerivationLease` and a
+   `host_weight_runtime_derivation` plan to DLO.
 
 DLO then maps those files through the existing checkpoint-mmap loader, copies
 only the rank's padded AllGather shard into persistent CPU storage, and releases
 the source mappings after coordinated setup. No HWR payload safetensors,
-`manifest.json`, `READY.json`, final-layout restore, or HWR lease is involved
-in this AllGather path.
+`manifest.json`, `READY.json`, or final-layout restore is involved. The small
+process-local derivation lease expresses identity, validation, and lifetime; it
+is closed after the checkpoint mappings are released.
 
 The current model-declared BF16 boundary covers MiniMax H3 and
 `black-forest-labs/FLUX.2-klein-4B`. The FLUX.2-klein contract covers both
@@ -232,11 +235,12 @@ machinery supports TP1 and TP2 rank identities plus SP layout identities;
 FLUX.2-klein evidence is currently TP1-only, while its TP2/SP layouts remain
 unmeasured.
 
-`preferred` permits an ineligible source plan to use the ordinary canonical
-DLO path. `required` requires a valid source-backed plan and fails the complete
-group if source identity, checkpoint bindings, or group consensus cannot be
-established. Unlike the artifact-backed no-AllGather path, `required`
-AllGather does not require a pre-populated HWR artifact store.
+`preferred` permits an ineligible derivation plan or retryable derivation
+failure to use the ordinary canonical DLO path. `required` requires an exact
+derivation lease and fails the complete group if source identity, checkpoint
+bindings, source validation, or group consensus cannot be established. Unlike
+the artifact-backed no-AllGather path, `required` AllGather does not require a
+pre-populated HWR artifact.
 
 The HWR root remains meaningful for node-shared source-digest records.
 Content-addressed Hugging Face snapshot blobs are used directly. Local
@@ -246,10 +250,10 @@ changed since the metadata was written. Other local files are hashed in
 parallel and cached under the HWR root; cache reuse requires the same path,
 inode, size, timestamps, symlink target, and record checksum.
 
-A process-local source guard checks those observations immediately before and
-after checkpoint mmap realization. Before the first weight collective, every
-rank also exchanges a transport digest covering group membership, hook order,
-dtypes, tensor names, shapes, strides, offsets, padding, shard sizes, and
+The process-local derivation lease checks those observations immediately before
+and after checkpoint mmap realization. Before the first weight collective,
+every rank also exchanges a transport digest covering group membership, hook
+order, dtypes, tensor names, shapes, strides, offsets, padding, shard sizes, and
 collective output sizes. Any mismatch or local setup failure rolls the complete
 cohort back before it enters a mismatched weight collective.
 
@@ -258,7 +262,7 @@ checkpoint-mmap baseline:
 
 ```text
 original BF16 checkpoint mmap
-  -> validate HWR source identity and binding consensus
+  -> resolve HWR derivation identity and binding consensus
   -> copy only this rank's DLO shard
   -> release source mappings
 ```
@@ -321,7 +325,7 @@ the owned DiT source prefixes normally. Any plan that skips ordinary DiT
 materialization must cover every required parameter and persistent buffer;
 otherwise startup fails closed before DLO can consume a partial plan.
 
-Promotion checks for the source-backed AllGather path are:
+Promotion checks for the checkpoint-derivation AllGather path are:
 
 - no copied checkpoint-sized payload appears below the HWR root;
 - all ranks agree on source identity, source content, checkpoint bindings, and

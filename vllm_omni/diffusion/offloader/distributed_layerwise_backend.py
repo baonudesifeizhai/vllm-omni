@@ -23,7 +23,7 @@ import threading
 import time
 from collections.abc import Callable
 from itertools import chain
-from typing import Any
+from typing import Any, cast
 
 import torch
 import torch.distributed
@@ -34,7 +34,11 @@ from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
 from vllm_omni.diffusion.model_loader.host_weight_plan import (
     HostWeightPlan,
 )
-from vllm_omni.host_weight_runtime import CanonicalJson, HostWeightLease
+from vllm_omni.host_weight_runtime import (
+    CanonicalJson,
+    HostWeightDerivationLease,
+    HostWeightLease,
+)
 from vllm_omni.platforms import current_omni_platform
 
 from .base import OffloadBackend, OffloadConfig
@@ -1039,6 +1043,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self._using_runtime_lease = False
         self.host_weight_plan = host_weight_plan
         self._host_weight_lease: HostWeightLease | None = None
+        self._host_weight_derivation_lease: HostWeightDerivationLease | None = None
         self._host_registration: HostRegistration | None = None
         self._release_runtime_source_pages: Callable[[torch.Tensor], None] | None = None
         self._mmap_transforms_by_tensor_id: dict[int, Any] = {}
@@ -1205,8 +1210,6 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         """
         from safetensors import safe_open
 
-        if plan.source_guard is not None:
-            plan.source_guard()
         logger.info(
             "Loading DiT weights via mmap (meta -> shared page cache): %d tensors",
             len(plan.bindings),
@@ -1375,8 +1378,6 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 f"{len(remaining_meta)} DiT tensors on the meta device "
                 f"(first 5: {remaining_meta[:5]})."
             )
-        if plan.source_guard is not None:
-            plan.source_guard()
 
     def _init_dp_group(self) -> None:
         """Reuse the process group initialized by parallel_state.
@@ -1438,7 +1439,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         plan = self.host_weight_plan
         return bool(
             plan is not None
-            and plan.backing_kind in {"host_weight_runtime", "host_weight_runtime_source"}
+            and plan.backing_kind in {"host_weight_runtime", "host_weight_runtime_derivation"}
             and self.config.dlo_use_allgather
             and self.dp_size > 1
         )
@@ -1497,9 +1498,10 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         digest = None
         if error is None:
             digest = self._transport_plan_digest(hooks or [])
-        lease = self._host_weight_lease
-        provenance = lease.provenance if lease is not None else None
-        plan = self.host_weight_plan
+        artifact_lease = self._host_weight_lease
+        derivation_lease = self._host_weight_derivation_lease
+        artifact_provenance = artifact_lease.provenance if artifact_lease is not None else None
+        derivation_provenance = derivation_lease.provenance if derivation_lease is not None else None
         local = {
             "status": "ready" if error is None else "error",
             "error_type": None if error is None else type(error).__name__,
@@ -1507,14 +1509,18 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             "group_rank": self.rank,
             "group_ranks": list(self._group_ranks),
             "identity_digest": (
-                getattr(provenance, "identity_digest", None)
-                if provenance is not None
-                else getattr(plan, "identity_digest", None)
+                artifact_provenance.identity_digest
+                if artifact_provenance is not None
+                else derivation_provenance.identity_digest
+                if derivation_provenance is not None
+                else None
             ),
             "content_digest": (
-                getattr(provenance, "artifact_content_sha256", None)
-                if provenance is not None
-                else getattr(plan, "content_digest", None)
+                artifact_provenance.artifact_content_sha256
+                if artifact_provenance is not None
+                else derivation_provenance.source_content_digest
+                if derivation_provenance is not None
+                else None
             ),
             "transport_digest": digest,
         }
@@ -1868,7 +1874,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 carrier = host_weight_plan.lease_carrier
                 if carrier is None:
                     raise RuntimeError("DLO received a Host Weight Runtime plan without a lease carrier")
-                self._host_weight_lease = carrier.take()
+                self._host_weight_lease = cast(HostWeightLease, carrier.take())
                 if self._host_weight_lease.closed:
                     raise RuntimeError("DLO received a closed Host Weight Runtime lease")
                 # The final-layout restorer has already rebound the model to
@@ -1884,15 +1890,31 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                     self._host_weight_lease.provenance.resolution_id,
                     "bounded rank-local staging" if self._using_rank_local_mmap else "sharded AllGather",
                 )
-            elif host_weight_plan.backing_kind in {"checkpoint_mmap", "host_weight_runtime_source"}:
+            elif host_weight_plan.backing_kind in {"checkpoint_mmap", "host_weight_runtime_derivation"}:
+                if host_weight_plan.backing_kind == "host_weight_runtime_derivation":
+                    carrier = host_weight_plan.lease_carrier
+                    if carrier is None:
+                        raise RuntimeError("DLO received an HWR derivation plan without a lease carrier")
+                    lease = carrier.take()
+                    if not isinstance(lease, HostWeightDerivationLease):
+                        lease.close()
+                        raise TypeError("DLO derivation plan received a non-derivation HWR lease")
+                    self._host_weight_derivation_lease = lease
+                    self._using_runtime_lease = True
+                    lease.ensure_source_unchanged()
                 self._using_rank_local_mmap = self.dp_size <= 1
                 self._load_weights_via_mmap(
                     pipeline,
                     modules,
                     host_weight_plan,
                 )
-                if host_weight_plan.backing_kind == "host_weight_runtime_source":
-                    logger.info("DLO consuming BF16 HWR source-backed checkpoint mappings via sharded AllGather")
+                if host_weight_plan.backing_kind == "host_weight_runtime_derivation":
+                    assert self._host_weight_derivation_lease is not None
+                    self._host_weight_derivation_lease.ensure_source_unchanged()
+                    logger.info(
+                        "DLO consuming BF16 HWR derivation lease %s via sharded AllGather",
+                        self._host_weight_derivation_lease.provenance.resolution_id,
+                    )
             else:
                 raise ValueError(f"Unsupported DLO host-weight backing: {host_weight_plan.backing_kind}")
             if self._using_rank_local_mmap:
@@ -2196,10 +2218,15 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 hook.release_source_pages = None
         lease = self._host_weight_lease
         self._host_weight_lease = None
+        derivation_lease = self._host_weight_derivation_lease
+        self._host_weight_derivation_lease = None
         self._release_runtime_source_pages = None
         if lease is not None and not lease.closed:
             lease.close()
             logger.info("Released Host Weight Runtime lease %s", lease.provenance.resolution_id)
+        if derivation_lease is not None and not derivation_lease.closed:
+            derivation_lease.close()
+            logger.info("Released Host Weight Runtime derivation lease %s", derivation_lease.provenance.resolution_id)
         if self.host_weight_plan is not None and self.host_weight_plan.lease_carrier is not None:
             self.host_weight_plan.lease_carrier.close()
 
@@ -2217,7 +2244,12 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             pass
 
     def disable(self) -> None:
-        has_open_lease = self._host_weight_lease is not None and not self._host_weight_lease.closed
+        has_open_lease = (
+            self._host_weight_lease is not None
+            and not self._host_weight_lease.closed
+            or self._host_weight_derivation_lease is not None
+            and not self._host_weight_derivation_lease.closed
+        )
         has_registration = self._host_registration is not None
         has_carrier = (
             self.host_weight_plan is not None

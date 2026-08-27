@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 from .errors import HostWeightFailure, ResolutionAction, ResolutionStage
 
 if TYPE_CHECKING:
-    from .lease import HostWeightLease
+    from .lease import HostWeightDerivationLease, HostWeightLease
 
 
 class StoreStatus(str, Enum):
@@ -55,6 +55,7 @@ class ResolutionOutcome(str, Enum):
     LOCAL_HIT = "local_hit"
     REMOTE_IMPORT = "remote_import"
     LOCAL_PRODUCTION = "local_production"
+    SOURCE_DERIVATION = "source_derivation"
     CANONICAL_DIRECT = "canonical_direct"
     CANONICAL_FALLBACK = "canonical_fallback"
     FAILED = "failed"
@@ -107,13 +108,14 @@ class ResolutionReport:
 @dataclass(frozen=True)
 class HostWeightResolution:
     report: ResolutionReport
-    lease: HostWeightLease | None = None
+    lease: HostWeightLease | HostWeightDerivationLease | None = None
 
     def __post_init__(self) -> None:
         lease_outcomes = {
             ResolutionOutcome.LOCAL_HIT,
             ResolutionOutcome.REMOTE_IMPORT,
             ResolutionOutcome.LOCAL_PRODUCTION,
+            ResolutionOutcome.SOURCE_DERIVATION,
         }
         if (self.report.outcome in lease_outcomes) != (self.lease is not None):
             raise ValueError("resolution outcome has inconsistent lease ownership")

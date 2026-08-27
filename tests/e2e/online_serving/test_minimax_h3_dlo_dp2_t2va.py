@@ -125,7 +125,7 @@ def test_minimax_h3_bf16_hwr_dlo_dp2_t2va(
     tmp_path: Path,
     run_level: str,
 ) -> None:
-    """Run BF16 HWR source-backed DP2 AllGather without a copied artifact."""
+    """Run BF16 HWR checkpoint derivation with DP2 AllGather."""
     original_model = get_model_prefix() + MODEL
     server_model = resolve_tiny_model_path(original_model) if run_level == "core_model" else original_model
     served_model_name = original_model if server_model != original_model else None
@@ -146,4 +146,4 @@ def test_minimax_h3_bf16_hwr_dlo_dp2_t2va(
     for video in videos:
         assert_video_valid(video, width=WIDTH, height=HEIGHT, fps=FPS)
         _assert_audio_stream_present(video)
-    assert not tuple(hwr_root.rglob("*.safetensors")), "source-backed BF16 HWR copied checkpoint payloads"
+    assert not tuple(hwr_root.rglob("*.safetensors")), "BF16 derivation copied checkpoint payloads"

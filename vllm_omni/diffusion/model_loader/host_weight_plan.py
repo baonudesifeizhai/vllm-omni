@@ -45,9 +45,6 @@ class HostWeightPlan:
     bindings: dict[str, TensorBinding]
     planned_source_prefixes: frozenset[str] = frozenset()
     lease_carrier: HostWeightLeaseCarrier | None = None
-    identity_digest: str | None = None
-    content_digest: str | None = None
-    source_guard: Callable[[], None] | None = None
 
 
 @dataclass(frozen=True)

@@ -27,7 +27,9 @@ from vllm_omni.diffusion.model_loader.host_weight_plan import (
 from vllm_omni.diffusion.model_loader.host_weights import source_identity as source_identity_module
 from vllm_omni.diffusion.models.helios import HeliosPipeline
 from vllm_omni.diffusion.models.host_weight_contract import FinalLayoutModelContract
+from vllm_omni.diffusion.offloader.startup import take_offload_startup_state
 from vllm_omni.diffusion.registry import initialize_model
+from vllm_omni.host_weight_runtime import HostWeightDerivationLease
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -171,7 +173,7 @@ def _make_loader_with_weights(weight_names: list[str]) -> DiffusersPipelineLoade
 
 
 @pytest.mark.parametrize("use_allgather", [False, True])
-def test_hwr_selects_artifact_restore_or_source_backed_allgather(
+def test_hwr_selects_artifact_restore_or_checkpoint_derivation_allgather(
     tmp_path: Path,
     monkeypatch,
     use_allgather: bool,
@@ -232,6 +234,11 @@ def test_hwr_selects_artifact_restore_or_source_backed_allgather(
     assert first is first_model
     assert first_model.load_count == (0 if use_allgather else 1)
     assert first_loader._hwr_state is not None
+    if use_allgather:
+        first_startup = take_offload_startup_state(first)
+        assert first_startup is not None
+        assert first_startup.host_weight_plan.lease_carrier is not None
+        first_startup.host_weight_plan.lease_carrier.close()
 
     second_loader, second_model = make_loader()
     monkeypatch.setattr(
@@ -244,18 +251,16 @@ def test_hwr_selects_artifact_restore_or_source_backed_allgather(
     assert second is second_model
     assert second_model.load_count == 0
     assert torch.equal(second_model.transformer.weight, first_model.transformer.weight)
-    from vllm_omni.diffusion.offloader.startup import take_offload_startup_state
-
     startup_state = take_offload_startup_state(second)
     assert startup_state is not None
     second_plan = startup_state.host_weight_plan
     assert second_plan is not None
     if use_allgather:
-        assert second_plan.backing_kind == "host_weight_runtime_source"
-        assert second_plan.lease_carrier is None
-        assert second_plan.identity_digest
-        assert second_plan.content_digest
-        assert second_plan.source_guard is not None
+        assert second_plan.backing_kind == "host_weight_runtime_derivation"
+        assert second_plan.lease_carrier is not None
+        derivation_lease = second_plan.lease_carrier.take()
+        assert isinstance(derivation_lease, HostWeightDerivationLease)
+        derivation_lease.close()
         assert set(second_plan.bindings) == {"transformer.weight"}
         assert not tuple((store_root / "artifacts").glob("*"))
     else:
@@ -267,9 +272,11 @@ def test_hwr_selects_artifact_restore_or_source_backed_allgather(
     assert consensus_phases == (
         [
             "eligibility",
-            "source_plan",
+            "derivation_plan",
+            "derivation_resolution",
             "eligibility",
-            "source_plan",
+            "derivation_plan",
+            "derivation_resolution",
         ]
         if use_allgather
         else []
@@ -330,7 +337,7 @@ def test_required_hwr_empty_store_reports_typed_resolution_failure(
     assert loader.take_host_weight_plan() is None
 
 
-def test_hwr_allgather_rejects_mixed_source_plan_readiness(
+def test_hwr_allgather_rejects_mixed_derivation_plan_readiness(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -356,13 +363,13 @@ def test_hwr_allgather_rejects_mixed_source_plan_readiness(
     monkeypatch.setattr(warm_loader, "_init_from_load_format", lambda *_args, **_kwargs: warm_model)
     monkeypatch.setattr(warm_loader, "_resolve_hwr_allgather_coordinator", lambda _enabled: coordinator)
 
-    def mixed_source_plan(output, local, *, group):
+    def mixed_derivation_plan(output, local, *, group):
         assert group is coordinator.cpu_group
         if local["phase"] == "eligibility":
             output[0] = local
             output[1] = {**local, "group_rank": 1}
             return
-        assert local["phase"] == "source_plan"
+        assert local["phase"] == "derivation_plan"
         output[0] = local
         output[1] = {
             **local,
@@ -373,9 +380,9 @@ def test_hwr_allgather_rejects_mixed_source_plan_readiness(
             "plan_digest": None,
         }
 
-    monkeypatch.setattr(torch.distributed, "all_gather_object", mixed_source_plan)
+    monkeypatch.setattr(torch.distributed, "all_gather_object", mixed_derivation_plan)
 
-    with pytest.raises(RuntimeError, match="source-plan eligibility differs across ranks"):
+    with pytest.raises(RuntimeError, match="derivation-plan eligibility differs across ranks"):
         warm_loader.load_model(load_device="cpu", device=torch.device("cpu"))
     assert warm_model.load_count == 0
 
@@ -482,7 +489,7 @@ def test_hwr_allgather_rejects_mixed_eligibility_before_store_interaction(
     assert model.load_count == 0
 
 
-def test_hwr_allgather_source_plan_failure_notifies_group(
+def test_hwr_allgather_derivation_plan_failure_notifies_group(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -513,13 +520,13 @@ def test_hwr_allgather_source_plan_failure_notifies_group(
         lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("source identity failed")),
     )
 
-    def gather_source_plan(output, local, *, group):
+    def gather_derivation_plan(output, local, *, group):
         assert group is coordinator.cpu_group
         if local["phase"] == "eligibility":
             output[0] = local
             output[1] = {**local, "group_rank": 1}
             return
-        assert local["phase"] == "source_plan"
+        assert local["phase"] == "derivation_plan"
         statuses.append(local["status"])
         output[0] = local
         output[1] = {
@@ -530,9 +537,9 @@ def test_hwr_allgather_source_plan_failure_notifies_group(
             "identity_digest": "peer-identity",
         }
 
-    monkeypatch.setattr(torch.distributed, "all_gather_object", gather_source_plan)
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather_derivation_plan)
 
-    with pytest.raises(RuntimeError, match=r"source-plan preflight failed on group ranks \[0\]"):
+    with pytest.raises(RuntimeError, match=r"derivation-plan preflight failed on group ranks \[0\]"):
         loader.load_model(load_device="cpu", device=torch.device("cpu"))
 
     assert statuses == ["error"]

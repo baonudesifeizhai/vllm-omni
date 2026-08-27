@@ -419,7 +419,7 @@ class HWRLoaderMixin:
             source_digest_cache=source_digest_cache,
         )
 
-    def _source_plan_digest(self, plan: HostWeightPlan) -> str:
+    def _derivation_plan_digest(self, plan: HostWeightPlan) -> str:
         bindings = []
         for runtime_name, binding in sorted(plan.bindings.items()):
             transform = binding.transform
@@ -446,7 +446,7 @@ class HWRLoaderMixin:
             }
         )
 
-    def _resolve_hwr_allgather_source_plan(
+    def _resolve_hwr_allgather_derivation(
         self,
         model: nn.Module,
         modules: object,
@@ -456,20 +456,30 @@ class HWRLoaderMixin:
         load_format: str,
         sources: Sequence[_WeightSource],
     ) -> dict[str, object] | None:
-        """Resolve BF16 AllGather directly against immutable checkpoints.
+        """Resolve BF16 AllGather as deferred derivation from a checkpoint.
 
         Native BF16 checkpoints already contain the representation consumed by
-        DLO.  HWR therefore owns identity and group consensus while the plan
-        references the original safetensors mappings; no normalized copy is
-        produced in the HWR artifact store.
+        DLO. HWR authorizes the pre-artifact derivation lifetime while the
+        loader owns model-specific bindings and distributed consensus.
         """
         from vllm_omni.diffusion.model_loader.host_weights import NodeSourceDigestCache
-        from vllm_omni.host_weight_runtime import ResolutionOutcome, RuntimeMode, WaitPolicy
+        from vllm_omni.host_weight_runtime import (
+            HostWeightDerivationLease,
+            HostWeightLeaseCarrier,
+            HostWeightRuntime,
+            HostWeightRuntimeConfig,
+            ProductionPolicy,
+            ResolutionOutcome,
+            RuntimeMode,
+            SourceDerivationSpec,
+            StorageDomainPolicy,
+        )
         from vllm_omni.host_weight_runtime.filesystem import detect_storage_class
 
         context = None
         plan = None
         plan_digest = None
+        runtime = None
         fallback_reason = None
         preflight_error: Exception | None = None
         try:
@@ -486,7 +496,7 @@ class HWRLoaderMixin:
             expected_prefixes = frozenset(f"{name}." for name in getattr(modules, "dit_names", ()))
             available_prefixes = frozenset(getattr(source, "prefix", "") for source in sources)
             if not expected_prefixes <= available_prefixes:
-                fallback_reason = "source-backed HWR requires one dedicated source prefix per owned DiT"
+                fallback_reason = "source derivation requires one dedicated source prefix per owned DiT"
             else:
                 overlapping_prefixes = frozenset(
                     prefix
@@ -494,7 +504,7 @@ class HWRLoaderMixin:
                     if any(dit_prefix.startswith(prefix) for dit_prefix in expected_prefixes)
                 )
                 if not overlapping_prefixes <= expected_prefixes:
-                    fallback_reason = "source-backed HWR rejects mixed DiT/component checkpoint sources"
+                    fallback_reason = "source derivation rejects mixed DiT/component checkpoint sources"
 
             if fallback_reason is None:
                 root_value = getattr(self.od_config, "host_weight_runtime_root", None)
@@ -502,7 +512,16 @@ class HWRLoaderMixin:
                     raise ValueError("enabled Host Weight Runtime requires host_weight_runtime_root")
                 root = Path(root_value).expanduser()
                 root.mkdir(parents=True, exist_ok=True)
-                detect_storage_class(root)
+                runtime = HostWeightRuntime.from_config(
+                    HostWeightRuntimeConfig(
+                        mode=mode,
+                        domain=StorageDomainPolicy(root=root, storage_class=detect_storage_class(root)),
+                        production=ProductionPolicy(
+                            allow_local_build=False,
+                            allow_post_load_publish=False,
+                        ),
+                    )
+                )
                 context = self._build_hwr_context(
                     model,
                     modules,
@@ -510,7 +529,7 @@ class HWRLoaderMixin:
                     sources=sources,
                     source_digest_cache=NodeSourceDigestCache(
                         root,
-                        timeout_seconds=WaitPolicy().coordination_timeout_seconds,
+                        timeout_seconds=runtime.config.wait.coordination_timeout_seconds,
                     ),
                 )
                 dit_modules = tuple(zip(getattr(modules, "dit_names", ()), getattr(modules, "dits", ())))
@@ -529,18 +548,15 @@ class HWRLoaderMixin:
                     context.ensure_sources_unchanged()
                     plan = dataclasses.replace(
                         result.plan,
-                        backing_kind="host_weight_runtime_source",
-                        identity_digest=context.identity.key,
-                        content_digest=context.identity.source.fingerprint,
-                        source_guard=context.ensure_sources_unchanged,
+                        backing_kind="host_weight_runtime_derivation",
                     )
-                    plan_digest = self._source_plan_digest(plan)
+                    plan_digest = self._derivation_plan_digest(plan)
         except Exception as exc:
             preflight_error = exc
 
         records = self._coordinate_hwr_group(
             coordinator,
-            "source_plan",
+            "derivation_plan",
             {
                 "identity_digest": context.identity.key if context is not None else None,
                 "content_digest": context.identity.source.fingerprint if context is not None else None,
@@ -553,24 +569,24 @@ class HWRLoaderMixin:
         failed_ranks = [record.get("group_rank") for record in records if record.get("status") == "error"]
         if failed_ranks:
             raise RuntimeError(
-                f"BF16 HWR AllGather source-plan preflight failed on group ranks {failed_ranks}"
+                f"BF16 HWR AllGather derivation-plan preflight failed on group ranks {failed_ranks}"
             ) from preflight_error
 
         fallback_ranks = [record.get("group_rank") for record in records if record.get("status") == "fallback"]
         if fallback_ranks:
             if len(fallback_ranks) != len(records):
                 raise RuntimeError(
-                    f"BF16 HWR AllGather source-plan eligibility differs across ranks: fallback={fallback_ranks}"
+                    f"BF16 HWR AllGather derivation-plan eligibility differs across ranks: fallback={fallback_ranks}"
                 )
             if mode is RuntimeMode.REQUIRED:
                 raise ValueError(
-                    "required Host Weight Runtime source plan is ineligible: "
-                    f"{fallback_reason or 'peer source-plan fallback'}"
+                    "required Host Weight Runtime derivation plan is ineligible: "
+                    f"{fallback_reason or 'peer derivation-plan fallback'}"
                 )
             logger.info(
-                "BF16 HWR source plan is ineligible on group ranks %s; using canonical DLO: %s",
+                "BF16 HWR derivation plan is ineligible on group ranks %s; using canonical DLO: %s",
                 fallback_ranks,
-                fallback_reason or "peer source-plan fallback",
+                fallback_reason or "peer derivation-plan fallback",
             )
             return None
 
@@ -585,17 +601,70 @@ class HWRLoaderMixin:
 
         assert context is not None
         assert plan is not None
-        context.ensure_sources_unchanged()
+        assert plan_digest is not None
+        assert runtime is not None
+        resolution = runtime.resolve_derivation(
+            SourceDerivationSpec(
+                identity=context.identity,
+                source_content_digest=context.identity.source.fingerprint,
+                plan_digest=plan_digest,
+                validate_source=context.ensure_sources_unchanged,
+            )
+        )
+        derivation_lease = resolution.lease if isinstance(resolution.lease, HostWeightDerivationLease) else None
+        try:
+            resolution_records = self._coordinate_hwr_group(
+                coordinator,
+                "derivation_resolution",
+                {
+                    "identity_digest": context.identity.key,
+                    "content_digest": context.identity.source.fingerprint,
+                    "plan_digest": plan_digest,
+                    "status": (
+                        "ready"
+                        if resolution.report.outcome is ResolutionOutcome.SOURCE_DERIVATION
+                        else "fallback"
+                        if resolution.report.outcome is ResolutionOutcome.CANONICAL_FALLBACK
+                        else "error"
+                    ),
+                    "outcome": resolution.report.outcome.value,
+                },
+            )
+        except Exception:
+            if derivation_lease is not None:
+                derivation_lease.close()
+            raise
+        failed_ranks = [record.get("group_rank") for record in resolution_records if record.get("status") == "error"]
+        fallback_ranks = [
+            record.get("group_rank") for record in resolution_records if record.get("status") == "fallback"
+        ]
+        if failed_ranks or fallback_ranks:
+            if derivation_lease is not None:
+                derivation_lease.close()
+            if fallback_ranks and len(fallback_ranks) == len(resolution_records):
+                logger.info("BF16 HWR derivation fell back on all group ranks: %s", fallback_ranks)
+                return None
+            affected_ranks = failed_ranks or fallback_ranks
+            raise RuntimeError(
+                f"BF16 HWR AllGather derivation resolution differs or failed on group ranks {affected_ranks}"
+            )
+        outcomes = {record.get("outcome") for record in resolution_records}
+        if outcomes != {ResolutionOutcome.SOURCE_DERIVATION.value} or derivation_lease is None:
+            if derivation_lease is not None:
+                derivation_lease.close()
+            raise RuntimeError("BF16 HWR AllGather derivation resolution returned no derivation lease")
+        plan = dataclasses.replace(plan, lease_carrier=HostWeightLeaseCarrier(derivation_lease))
         logger.info(
-            "Resolved BF16 HWR source-backed checkpoint plan: outcome=%s, identity=%s, tensors=%d",
-            ResolutionOutcome.CANONICAL_DIRECT.value,
+            "Resolved BF16 HWR checkpoint derivation: outcome=%s, identity=%s, tensors=%d",
+            resolution.report.outcome.value,
             context.identity.key,
             len(plan.bindings),
         )
         return {
             "mode": mode,
             "context": context,
-            "outcome": ResolutionOutcome.CANONICAL_DIRECT,
+            "runtime": runtime,
+            "outcome": resolution.report.outcome,
             "plan": plan,
         }
 
@@ -615,6 +684,7 @@ class HWRLoaderMixin:
             NodeSourceDigestCache,
         )
         from vllm_omni.host_weight_runtime import (
+            HostWeightLease,
             HostWeightLeaseCarrier,
             HostWeightRuntime,
             HostWeightRuntimeConfig,
@@ -679,7 +749,7 @@ class HWRLoaderMixin:
             raise RuntimeError(f"BF16 HWR AllGather eligibility differs across ranks: ineligible={ineligible_ranks}")
         assert isinstance(mode, RuntimeMode)
         if coordinator is not None:
-            return self._resolve_hwr_allgather_source_plan(
+            return self._resolve_hwr_allgather_derivation(
                 model,
                 modules,
                 coordinator=coordinator,
@@ -750,8 +820,8 @@ class HWRLoaderMixin:
             return state
 
         lease = resolution.lease
-        if lease is None:
-            raise RuntimeError("Host Weight Runtime returned LOCAL_HIT without a lease")
+        if not isinstance(lease, HostWeightLease):
+            raise RuntimeError("Host Weight Runtime returned LOCAL_HIT without an artifact lease")
         restorer = FinalLayoutTensorRestorer(context)
         try:
             restore_plan = restorer.plan_restore(model, lease)

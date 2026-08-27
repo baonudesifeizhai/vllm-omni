@@ -45,7 +45,11 @@ from vllm_omni.diffusion.offloader.offload_plan import (
     get_offload_plan,
 )
 from vllm_omni.diffusion.offloader.startup import OffloadStartupState, attach_offload_startup_state
-from vllm_omni.host_weight_runtime import MappedHostRegion
+from vllm_omni.host_weight_runtime import (
+    HostWeightDerivationLease,
+    HostWeightLeaseCarrier,
+    MappedHostRegion,
+)
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.cpu, pytest.mark.core_model]
@@ -1146,10 +1150,11 @@ class TestMmapWeightLoading:
         assert all(hook.rank_local_mmap for group in backend._all_hook_groups for hook in group)
         backend.disable()
 
-    def test_source_backed_hwr_plan_uses_checkpoint_mmap_and_source_guard(
+    def test_hwr_derivation_plan_uses_checkpoint_mmap_and_lease_guard(
         self,
         tmp_path,
         patched_offload_runtime,
+        mocker,
     ):
         class Transformer(nn.Module):
             _layerwise_offload_blocks_attrs = ["blocks"]
@@ -1180,19 +1185,14 @@ class TestMmapWeightLoading:
             online_quantization=False,
         )
         assert result.plan is not None
-        guard_calls = 0
-
-        def source_guard():
-            nonlocal guard_calls
-            guard_calls += 1
-
-        source_plan = HostWeightPlan(
-            backing_kind="host_weight_runtime_source",
+        derivation_lease = mocker.MagicMock(spec=HostWeightDerivationLease)
+        derivation_lease.closed = False
+        derivation_lease.provenance = SimpleNamespace(resolution_id="derivation-test")
+        derivation_plan = HostWeightPlan(
+            backing_kind="host_weight_runtime_derivation",
             bindings=result.plan.bindings,
             planned_source_prefixes=result.plan.planned_source_prefixes,
-            identity_digest="identity-digest",
-            content_digest="content-digest",
-            source_guard=source_guard,
+            lease_carrier=HostWeightLeaseCarrier(derivation_lease),
         )
         backend = DistributedLayerwiseOffloadBackend(
             OffloadConfig(
@@ -1202,15 +1202,17 @@ class TestMmapWeightLoading:
                 dlo_use_allgather=True,
             ),
             torch.device("cpu"),
-            host_weight_plan=source_plan,
+            host_weight_plan=derivation_plan,
         )
 
         backend.enable(pipeline)
 
-        assert guard_calls == 2
+        assert derivation_lease.ensure_source_unchanged.call_count == 2
         assert backend._host_weight_lease is None
+        assert backend._host_weight_derivation_lease is derivation_lease
         assert backend._using_rank_local_mmap
         backend.disable()
+        derivation_lease.close.assert_called_once_with()
 
     def test_hwr_carrier_is_taken_and_released_after_bounded_staging(self, patched_offload_runtime):
         """A warm HWR plan uses the existing two-slot rank-local transport."""

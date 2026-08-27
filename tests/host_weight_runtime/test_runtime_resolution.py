@@ -15,6 +15,7 @@ from vllm_omni.host_weight_runtime import (
     CanonicalJson,
     ComponentIdentity,
     FailureCode,
+    HostWeightDerivationLease,
     HostWeightFailure,
     HostWeightLease,
     HostWeightLeaseCarrier,
@@ -35,6 +36,7 @@ from vllm_omni.host_weight_runtime import (
     ResolutionStage,
     RuntimeMode,
     RuntimeWeightLayout,
+    SourceDerivationSpec,
     StorageDomainPolicy,
     StoreResult,
     StoreStatus,
@@ -165,6 +167,45 @@ def test_local_production_then_exact_warm_hit_emits_one_terminal_report_each(tmp
     assert producer.calls == 1
     assert reports == [cold.report, warm.report]
     assert all(report.resolution_id for report in reports)
+
+
+@pytest.mark.parametrize(
+    ("mode", "source_changed", "expected"),
+    [
+        (RuntimeMode.PREFERRED, False, ResolutionOutcome.SOURCE_DERIVATION),
+        (RuntimeMode.PREFERRED, True, ResolutionOutcome.CANONICAL_FALLBACK),
+        (RuntimeMode.REQUIRED, True, ResolutionOutcome.FAILED),
+    ],
+)
+def test_source_derivation_resolution(
+    tmp_path: Path,
+    mode: RuntimeMode,
+    source_changed: bool,
+    expected: ResolutionOutcome,
+) -> None:
+    identity = _identity()
+    validations = 0
+    runtime = HostWeightRuntime.from_config(HostWeightRuntimeConfig(mode=mode, domain=_domain(tmp_path / mode.value)))
+
+    def validate_source() -> None:
+        nonlocal validations
+        validations += 1
+        if source_changed:
+            raise OSError("checkpoint changed")
+
+    resolution = runtime.resolve_derivation(
+        SourceDerivationSpec(identity, "checkpoint-content", "binding-plan", validate_source)
+    )
+
+    assert resolution.report.outcome is expected
+    assert validations == 1
+    if expected is ResolutionOutcome.SOURCE_DERIVATION:
+        assert isinstance(resolution.lease, HostWeightDerivationLease)
+        resolution.lease.ensure_source_unchanged()
+        resolution.lease.close()
+        assert validations == 2
+    else:
+        assert resolution.lease is None
 
 
 def test_lease_carrier_is_single_take_and_process_local(tmp_path: Path) -> None:
