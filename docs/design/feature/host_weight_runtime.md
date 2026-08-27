@@ -243,7 +243,10 @@ The contract is intentionally separate from loader activation:
   publication. A hash-looking symlink basename is trusted only for an explicit
   Hugging Face Hub source whose repository ID and
   `models--.../snapshots/<revision> -> blobs/<hash>` topology validate; every
-  local or otherwise unverified symlink target is content-hashed.
+  local or otherwise unverified symlink target is content-hashed. Regular
+  files created by `hf download --local-dir` may use the downloader's
+  64-character LFS ETag as their SHA-256 only while trusted download metadata
+  is newer than the source inode; a later local write falls back to hashing.
 - the tensor ownership digest records exact runtime names, kinds, shapes,
   semantic roles, dtypes, and strides from a CPU or meta model skeleton;
 - `FinalLayoutTensorRestorer` accepts only an exact lease identity, validates

@@ -117,20 +117,27 @@ class _HWRPipeline(nn.Module):
         return loaded
 
 
-def _hwr_config(model: str | Path, root: Path, *, mode: str = "preferred") -> SimpleNamespace:
+def _hwr_config(
+    model: str | Path,
+    root: Path,
+    *,
+    mode: str = "preferred",
+    use_allgather: bool = False,
+    data_parallel_size: int = 1,
+) -> SimpleNamespace:
     return SimpleNamespace(
         model=str(model),
         dtype=torch.bfloat16,
         host_weight_runtime_mode=mode,
         host_weight_runtime_root=str(root),
         enable_distributed_layerwise_offload=True,
-        dlo_use_allgather=False,
+        dlo_use_allgather=use_allgather,
         lora_path=None,
         quantization_config=None,
         diffusion_attention_config=None,
         parallel_config=SimpleNamespace(
             use_hsdp=False,
-            data_parallel_size=1,
+            data_parallel_size=data_parallel_size,
             sequence_parallel_size=1,
             tensor_parallel_size=1,
             pipeline_parallel_size=1,
@@ -163,9 +170,11 @@ def _make_loader_with_weights(weight_names: list[str]) -> DiffusersPipelineLoade
     return loader
 
 
-def test_hwr_cold_publication_and_warm_restore_skip_ordinary_dit_loading(
+@pytest.mark.parametrize("use_allgather", [False, True])
+def test_hwr_selects_artifact_restore_or_source_backed_allgather(
     tmp_path: Path,
     monkeypatch,
+    use_allgather: bool,
 ):
     canonical_root = tmp_path / "canonical"
     canonical_root.mkdir()
@@ -183,40 +192,88 @@ def test_hwr_cold_publication_and_warm_restore_skip_ordinary_dit_loading(
         return original_sha256(path, state)  # type: ignore[arg-type]
 
     monkeypatch.setattr(source_identity_module, "_sha256_file", counted_sha256)
+    consensus_phases: list[str] = []
+
+    if use_allgather:
+        coordinator = SimpleNamespace(
+            world_size=2,
+            rank_in_group=0,
+            ranks=(0, 1),
+            cpu_group=object(),
+            device_group=object(),
+        )
+
+        def gather_object(output, local, *, group):
+            assert group is coordinator.cpu_group
+            consensus_phases.append(local["phase"])
+            output[0] = local
+            output[1] = {**local, "group_rank": 1}
+
+        monkeypatch.setattr(torch.distributed, "all_gather_object", gather_object)
 
     def make_loader() -> tuple[DiffusersPipelineLoader, _HWRPipeline]:
-        loader = DiffusersPipelineLoader(LoadConfig(), _hwr_config(canonical_root, store_root))
+        loader = DiffusersPipelineLoader(
+            LoadConfig(),
+            _hwr_config(
+                canonical_root,
+                store_root,
+                use_allgather=use_allgather,
+                data_parallel_size=2 if use_allgather else 1,
+            ),
+        )
+        if use_allgather:
+            monkeypatch.setattr(loader, "_resolve_hwr_allgather_coordinator", lambda _enabled: coordinator)
         pipeline = _HWRPipeline(canonical_root)
         monkeypatch.setattr(loader, "_init_from_load_format", lambda *args, **kwargs: pipeline)
         return loader, pipeline
 
-    cold_loader, cold_model = make_loader()
-    cold = cold_loader.load_model(load_device="cpu", device=torch.device("cpu"))
-    assert cold is cold_model
-    assert cold_model.load_count == 1
-    assert cold_loader._hwr_state is not None
+    first_loader, first_model = make_loader()
+    first = first_loader.load_model(load_device="cpu", device=torch.device("cpu"))
+    assert first is first_model
+    assert first_model.load_count == (0 if use_allgather else 1)
+    assert first_loader._hwr_state is not None
 
-    warm_loader, warm_model = make_loader()
+    second_loader, second_model = make_loader()
     monkeypatch.setattr(
-        warm_loader,
+        second_loader,
         "_process_weights_after_loading",
-        lambda *args, **kwargs: pytest.fail("warm HWR restore re-entered byte-changing finalization"),
+        lambda *args, **kwargs: pytest.fail("HWR resolution re-entered ordinary byte-changing finalization"),
     )
-    warm = warm_loader.load_model(load_device="cpu", device=torch.device("cpu"))
+    second = second_loader.load_model(load_device="cpu", device=torch.device("cpu"))
 
-    assert warm is warm_model
-    assert warm_model.load_count == 0
-    assert torch.equal(warm_model.transformer.weight, cold_model.transformer.weight)
+    assert second is second_model
+    assert second_model.load_count == 0
+    assert torch.equal(second_model.transformer.weight, first_model.transformer.weight)
     from vllm_omni.diffusion.offloader.startup import take_offload_startup_state
 
-    startup_state = take_offload_startup_state(warm)
+    startup_state = take_offload_startup_state(second)
     assert startup_state is not None
-    warm_plan = startup_state.host_weight_plan
-    assert warm_plan is not None
-    assert warm_plan.lease_carrier is not None
-    warm_plan.lease_carrier.close()
+    second_plan = startup_state.host_weight_plan
+    assert second_plan is not None
+    if use_allgather:
+        assert second_plan.backing_kind == "host_weight_runtime_source"
+        assert second_plan.lease_carrier is None
+        assert second_plan.identity_digest
+        assert second_plan.content_digest
+        assert second_plan.source_guard is not None
+        assert set(second_plan.bindings) == {"transformer.weight"}
+        assert not tuple((store_root / "artifacts").glob("*"))
+    else:
+        assert second_plan.backing_kind == "host_weight_runtime"
+        assert second_plan.lease_carrier is not None
+        second_plan.lease_carrier.close()
     assert hash_calls == 1
     assert len(tuple((store_root / "source-digests-v1" / "entries").glob("*.json"))) == 1
+    assert consensus_phases == (
+        [
+            "eligibility",
+            "source_plan",
+            "eligibility",
+            "source_plan",
+        ]
+        if use_allgather
+        else []
+    )
 
 
 def test_hwr_commit_failure_discards_model_and_reloads_without_hwr_or_mmap(tmp_path: Path, monkeypatch):
@@ -249,10 +306,10 @@ def test_hwr_commit_failure_discards_model_and_reloads_without_hwr_or_mmap(tmp_p
     assert loader.take_host_weight_plan() is None
 
 
-def test_required_hwr_miss_fails_before_ordinary_loading_or_publication(
+def test_required_hwr_empty_store_reports_typed_resolution_failure(
     tmp_path: Path,
-    monkeypatch,
-):
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     canonical_root = tmp_path / "canonical"
     canonical_root.mkdir()
     save_file(
@@ -263,14 +320,223 @@ def test_required_hwr_miss_fails_before_ordinary_loading_or_publication(
         LoadConfig(),
         _hwr_config(canonical_root, tmp_path / "empty-store", mode="required"),
     )
-    pipeline = _HWRPipeline(canonical_root)
-    monkeypatch.setattr(loader, "_init_from_load_format", lambda *args, **kwargs: pipeline)
+    model = _HWRPipeline(canonical_root)
+    monkeypatch.setattr(loader, "_init_from_load_format", lambda *_args, **_kwargs: model)
 
-    with pytest.raises(RuntimeError, match="Host Weight Runtime resolution failed"):
+    with pytest.raises(RuntimeError, match="resolution failed.*no allowed producer"):
         loader.load_model(load_device="cpu", device=torch.device("cpu"))
 
-    assert pipeline.load_count == 0
+    assert model.load_count == 0
     assert loader.take_host_weight_plan() is None
+
+
+def test_hwr_allgather_rejects_mixed_source_plan_readiness(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    canonical_root = tmp_path / "canonical"
+    canonical_root.mkdir()
+    save_file(
+        {"weight": torch.arange(4, dtype=torch.float32).to(torch.bfloat16).reshape(2, 2)},
+        str(canonical_root / "model.safetensors"),
+    )
+    store_root = tmp_path / "store"
+    coordinator = SimpleNamespace(
+        world_size=2,
+        rank_in_group=0,
+        ranks=(0, 1),
+        cpu_group=object(),
+        device_group=object(),
+    )
+    warm_loader = DiffusersPipelineLoader(
+        LoadConfig(),
+        _hwr_config(canonical_root, store_root, use_allgather=True, data_parallel_size=2),
+    )
+    warm_model = _HWRPipeline(canonical_root)
+    monkeypatch.setattr(warm_loader, "_init_from_load_format", lambda *_args, **_kwargs: warm_model)
+    monkeypatch.setattr(warm_loader, "_resolve_hwr_allgather_coordinator", lambda _enabled: coordinator)
+
+    def mixed_source_plan(output, local, *, group):
+        assert group is coordinator.cpu_group
+        if local["phase"] == "eligibility":
+            output[0] = local
+            output[1] = {**local, "group_rank": 1}
+            return
+        assert local["phase"] == "source_plan"
+        output[0] = local
+        output[1] = {
+            **local,
+            "group_rank": 1,
+            "status": "fallback",
+            "identity_digest": None,
+            "content_digest": None,
+            "plan_digest": None,
+        }
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", mixed_source_plan)
+
+    with pytest.raises(RuntimeError, match="source-plan eligibility differs across ranks"):
+        warm_loader.load_model(load_device="cpu", device=torch.device("cpu"))
+    assert warm_model.load_count == 0
+
+
+def test_hwr_group_consensus_rejects_different_group_membership(monkeypatch: pytest.MonkeyPatch) -> None:
+    coordinator = SimpleNamespace(
+        world_size=2,
+        rank_in_group=0,
+        ranks=(0, 1),
+        cpu_group=object(),
+        device_group=object(),
+    )
+
+    def mismatched_group(output, local, *, group):
+        assert group is coordinator.cpu_group
+        output[0] = local
+        output[1] = {**local, "group_rank": 1, "group_ranks": [0, 2]}
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", mismatched_group)
+
+    with pytest.raises(RuntimeError, match="process-group resolution differs"):
+        DiffusersPipelineLoader._coordinate_hwr_group(
+            coordinator,
+            "resolution",
+            {
+                "identity_digest": "identity",
+                "status": "resolved",
+                "outcome": "local_hit",
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    ("dp_size", "sp_size", "expected_group"),
+    [(4, 1, "dp"), (2, 2, "dp"), (1, 2, "sp")],
+)
+def test_hwr_allgather_resolves_the_same_dp_or_sp_cohort_as_dlo(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    dp_size: int,
+    sp_size: int,
+    expected_group: str,
+) -> None:
+    import vllm_omni.diffusion.distributed.parallel_state as parallel_state
+
+    config = _hwr_config(
+        "dummy-model",
+        tmp_path / "store",
+        use_allgather=True,
+        data_parallel_size=dp_size,
+    )
+    config.parallel_config.sequence_parallel_size = sp_size
+    loader = DiffusersPipelineLoader(LoadConfig(), config)
+    dp_group = SimpleNamespace(world_size=dp_size)
+    sp_group = SimpleNamespace(world_size=sp_size)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(parallel_state, "get_data_parallel_world_size", lambda: dp_size)
+    monkeypatch.setattr(parallel_state, "get_dp_group", lambda: dp_group)
+    monkeypatch.setattr(parallel_state, "get_sp_group", lambda: sp_group)
+
+    coordinator = loader._resolve_hwr_allgather_coordinator(True)
+
+    assert coordinator is (dp_group if expected_group == "dp" else sp_group)
+
+
+def test_hwr_allgather_rejects_mixed_eligibility_before_store_interaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    canonical_root = tmp_path / "canonical"
+    canonical_root.mkdir()
+    save_file(
+        {"weight": torch.arange(4, dtype=torch.float32).to(torch.bfloat16).reshape(2, 2)},
+        str(canonical_root / "model.safetensors"),
+    )
+    store_root = tmp_path / "must-not-be-touched"
+    coordinator = SimpleNamespace(
+        world_size=2,
+        rank_in_group=0,
+        ranks=(0, 1),
+        cpu_group=object(),
+        device_group=object(),
+    )
+    loader = DiffusersPipelineLoader(
+        LoadConfig(),
+        _hwr_config(canonical_root, store_root, use_allgather=True, data_parallel_size=2),
+    )
+    model = _HWRPipeline(canonical_root)
+    monkeypatch.setattr(loader, "_init_from_load_format", lambda *_args, **_kwargs: model)
+    monkeypatch.setattr(loader, "_resolve_hwr_allgather_coordinator", lambda _enabled: coordinator)
+
+    def mixed_eligibility(output, local, *, group):
+        assert group is coordinator.cpu_group
+        assert local["phase"] == "eligibility"
+        output[0] = local
+        output[1] = {**local, "group_rank": 1, "status": "ineligible"}
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", mixed_eligibility)
+
+    with pytest.raises(RuntimeError, match="eligibility differs across ranks"):
+        loader.load_model(load_device="cpu", device=torch.device("cpu"))
+
+    assert not store_root.exists()
+    assert model.load_count == 0
+
+
+def test_hwr_allgather_source_plan_failure_notifies_group(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    canonical_root = tmp_path / "canonical"
+    canonical_root.mkdir()
+    save_file(
+        {"weight": torch.arange(4, dtype=torch.float32).to(torch.bfloat16).reshape(2, 2)},
+        str(canonical_root / "model.safetensors"),
+    )
+    coordinator = SimpleNamespace(
+        world_size=2,
+        rank_in_group=0,
+        ranks=(0, 1),
+        cpu_group=object(),
+        device_group=object(),
+    )
+    loader = DiffusersPipelineLoader(
+        LoadConfig(),
+        _hwr_config(canonical_root, tmp_path / "store", use_allgather=True, data_parallel_size=2),
+    )
+    model = _HWRPipeline(canonical_root)
+    statuses: list[str] = []
+    monkeypatch.setattr(loader, "_init_from_load_format", lambda *_args, **_kwargs: model)
+    monkeypatch.setattr(loader, "_resolve_hwr_allgather_coordinator", lambda _enabled: coordinator)
+    monkeypatch.setattr(
+        loader,
+        "_build_hwr_context",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("source identity failed")),
+    )
+
+    def gather_source_plan(output, local, *, group):
+        assert group is coordinator.cpu_group
+        if local["phase"] == "eligibility":
+            output[0] = local
+            output[1] = {**local, "group_rank": 1}
+            return
+        assert local["phase"] == "source_plan"
+        statuses.append(local["status"])
+        output[0] = local
+        output[1] = {
+            **local,
+            "group_rank": 1,
+            "status": "ready",
+            "error_type": None,
+            "identity_digest": "peer-identity",
+        }
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather_source_plan)
+
+    with pytest.raises(RuntimeError, match=r"source-plan preflight failed on group ranks \[0\]"):
+        loader.load_model(load_device="cpu", device=torch.device("cpu"))
+
+    assert statuses == ["error"]
+    assert model.load_count == 0
 
 
 def _make_dlo_online_quant_config() -> OmniDiffusionConfig:
@@ -285,11 +551,10 @@ def _make_dlo_online_quant_config() -> OmniDiffusionConfig:
 
 
 @pytest.mark.parametrize(
-    ("dist_offload", "use_allgather", "mode"),
+    ("dist_offload", "use_allgather"),
     [
-        (False, False, "preferred"),
-        (True, True, "preferred"),
-        (True, False, "disabled"),
+        (False, False),
+        (False, True),
     ],
 )
 def test_hwr_disabled_for_noneligible_dlo_paths_without_store_interaction(
@@ -297,13 +562,12 @@ def test_hwr_disabled_for_noneligible_dlo_paths_without_store_interaction(
     tmp_path,
     dist_offload,
     use_allgather,
-    mode,
 ):
-    """Disabled and AllGather paths must never construct or probe HWR."""
+    """DLO-disabled paths must never construct or probe HWR."""
     from vllm_omni.host_weight_runtime import HostWeightRuntime
 
     root = tmp_path / "must-not-be-touched"
-    loader = DiffusersPipelineLoader(LoadConfig(), _hwr_config("dummy-model", root, mode=mode))
+    loader = DiffusersPipelineLoader(LoadConfig(), _hwr_config("dummy-model", root))
     model = _DummyPipelineModel(source_prefix="transformer.")
     modules = SimpleNamespace(dit_names=("transformer",), dits=(model.transformer,))
 

@@ -7,6 +7,7 @@ from __future__ import annotations
 import dataclasses
 import gc
 import json
+import os
 import threading
 from collections.abc import Sequence
 from pathlib import Path
@@ -836,6 +837,55 @@ def test_hf_blob_shortcut_requires_validated_snapshot_topology(tmp_path: Path) -
     sources = metadata["sources"]
     assert isinstance(sources, list)
     assert sources[0]["files"][0]["content_id"] == f"immutable-blob:{blob_name}"
+
+
+def test_hf_local_dir_metadata_avoids_rehash_and_invalidates_after_local_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _TinyPipeline()
+    local_root = tmp_path / "local-model"
+    model_root = local_root / "FL2VA"
+    source_root = model_root / "transformer"
+    source_root.mkdir(parents=True)
+    weight_path = source_root / "model.safetensors"
+    weight_path.write_bytes(b"downloaded-checkpoint")
+    metadata = (
+        local_root / ".cache" / "huggingface" / "download" / "FL2VA" / "transformer" / "model.safetensors.metadata"
+    )
+    metadata.parent.mkdir(parents=True)
+    etag = "2" * 64
+    metadata.write_text(f"{'1' * 40}\n{etag}\n1\n", encoding="utf-8")
+    source = PreparedWeightSource(
+        model_or_path=str(model_root),
+        subfolder="transformer",
+        requested_revision=None,
+        prefix="transformer.",
+        resolved_root=source_root,
+        weight_files=(weight_path,),
+        use_safetensors=True,
+    )
+    calls = 0
+    original_sha256 = source_identity_module._sha256_file
+
+    def counted_sha256(path: Path, state: object) -> str:
+        nonlocal calls
+        calls += 1
+        return original_sha256(path, state)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(source_identity_module, "_sha256_file", counted_sha256)
+    first = _identity(model, source)
+    first_metadata = first.identity.source.metadata.to_value()
+    assert isinstance(first_metadata, dict)
+    assert first_metadata["sources"][0]["files"][0]["content_id"] == f"sha256:{etag}"
+    assert calls == 0
+
+    os.utime(metadata, ns=(1_000_000_000, 1_000_000_000))
+    weight_path.write_bytes(b"locally-modified-checkpoint")
+    second = _identity(model, source)
+
+    assert calls == 1
+    assert second.identity != first.identity
 
 
 def test_identity_uses_resolved_revision_and_exact_semantics(tmp_path: Path) -> None:

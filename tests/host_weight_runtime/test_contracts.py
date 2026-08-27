@@ -6,11 +6,14 @@ from __future__ import annotations
 
 import ast
 import math
+import mmap
 from pathlib import Path
 from typing import get_type_hints
 
 import pytest
+import torch
 
+import vllm_omni.host_weight_runtime.lease as lease_module
 from vllm_omni.host_weight_runtime import (
     AdaptationIdentity,
     CanonicalJson,
@@ -147,6 +150,29 @@ def test_post_load_publication_policy_is_explicitly_enabled() -> None:
 
     assert policy.allow_local_build
     assert policy.allow_post_load_publish
+
+
+def test_lease_releases_complete_pages_covering_one_tensor(monkeypatch: pytest.MonkeyPatch) -> None:
+    tensor = torch.empty(17, dtype=torch.uint8)
+    calls: list[tuple[int, int, int]] = []
+
+    def record_madvise(address: int, length: int, advice: int) -> int:
+        calls.append((address, length, advice))
+        return 0
+
+    monkeypatch.setattr(
+        lease_module,
+        "_MADVISE",
+        record_madvise,
+    )
+
+    lease = object.__new__(lease_module.HostWeightLease)
+    lease.release_tensor_pages(tensor)
+
+    address = tensor.untyped_storage().data_ptr()
+    page_start = address - address % mmap.PAGESIZE
+    page_end = (address + tensor.untyped_storage().nbytes() + mmap.PAGESIZE - 1) // mmap.PAGESIZE * mmap.PAGESIZE
+    assert calls == [(page_start, page_end - page_start, mmap.MADV_DONTNEED)]
 
 
 def test_manifest_and_publication_marker_round_trip_exactly() -> None:

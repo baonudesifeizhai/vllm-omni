@@ -15,13 +15,18 @@ import hashlib
 import os
 from collections.abc import Iterable, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import torch
 from torch import nn
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.model_loader.host_weight_plan import HostWeightPlan, TensorBinding
+from vllm_omni.diffusion.model_loader.host_weight_plan import (
+    HostWeightPlan,
+    TensorBinding,
+    build_checkpoint_mmap_plan,
+    has_online_quantization,
+)
 
 logger = init_logger(__name__)
 
@@ -31,6 +36,24 @@ if TYPE_CHECKING:
         NodeSourceDigestCache,
         PreparedWeightSource,
     )
+    from vllm_omni.host_weight_runtime import RuntimeMode
+
+
+class _WeightSource(Protocol):
+    model_or_path: str
+    subfolder: str | None
+    revision: str | None
+    prefix: str
+    fall_back_to_pt: bool
+    allow_patterns_overrides: list[str] | None
+
+
+class _AllGatherCoordinator(Protocol):
+    world_size: int
+    rank_in_group: int
+    ranks: Sequence[int]
+    cpu_group: Any
+    device_group: Any
 
 
 class _HWRCommitError(RuntimeError):
@@ -39,6 +62,33 @@ class _HWRCommitError(RuntimeError):
 
 class HWRLoaderMixin:
     """Optional final-layout HWR behavior shared by diffusion loaders."""
+
+    if TYPE_CHECKING:
+        od_config: Any
+        parallel_config: Any
+        quant_config: Any
+        host_weight_plan: HostWeightPlan | None
+        _hwr_state: dict[str, object] | None
+        _last_load_request: dict[str, object] | None
+        _force_canonical_load: bool
+
+        def _prepare_weights(
+            self,
+            model_name_or_path: Path | str,
+            subfolder: str | None,
+            revision: str | None,
+            fall_back_to_pt: bool,
+            allow_patterns_overrides: list[str] | None,
+        ) -> tuple[Path | str, list[str], bool]: ...
+
+        def _get_checkpoint_adapter(
+            self,
+            model: nn.Module,
+            source: Any,
+            use_safetensors: bool,
+        ) -> Any: ...
+
+        def load_model(self, **kwargs: object) -> nn.Module: ...
 
     @staticmethod
     def _identity_value(value: object) -> object:
@@ -57,8 +107,8 @@ class HWRLoaderMixin:
                 return HWRLoaderMixin._identity_value(to_dict())
             except TypeError:
                 pass
-        if dataclasses.is_dataclass(value):
-            return HWRLoaderMixin._identity_value(dataclasses.asdict(value))
+        if dataclasses.is_dataclass(value) and not isinstance(value, type):
+            return HWRLoaderMixin._identity_value(dataclasses.asdict(cast(Any, value)))
         return f"{type(value).__module__}.{type(value).__qualname__}:{value!r}"
 
     @staticmethod
@@ -108,7 +158,7 @@ class HWRLoaderMixin:
         dist_offload: bool,
         use_allgather: bool,
         load_format: str,
-    ) -> object | None:
+    ) -> RuntimeMode | None:
         """Return the enabled HWR mode only after all zero-interaction gates."""
         from vllm_omni.host_weight_runtime import RuntimeMode
 
@@ -120,7 +170,7 @@ class HWRLoaderMixin:
 
         # These gates intentionally precede HWR imports, source preparation,
         # identity construction, and store creation.
-        if mode is RuntimeMode.DISABLED or not dist_offload or use_allgather:
+        if mode is RuntimeMode.DISABLED or not dist_offload:
             return None
 
         parallel = self.parallel_config
@@ -156,7 +206,7 @@ class HWRLoaderMixin:
         self,
         model: nn.Module,
         modules: object,
-        sources: Sequence[object],
+        sources: Sequence[_WeightSource],
     ) -> tuple[PreparedWeightSource, ...]:
         from vllm_omni.diffusion.model_loader.host_weights import (
             ImplementationIdentity,
@@ -211,13 +261,82 @@ class HWRLoaderMixin:
             )
         return tuple(prepared)
 
+    def _resolve_hwr_allgather_coordinator(self, use_allgather: bool) -> _AllGatherCoordinator | None:
+        """Resolve the same DP-or-SP cohort used later by DLO AllGather."""
+        parallel = self.parallel_config
+        dp_size = int(getattr(parallel, "data_parallel_size", 1) or 1)
+        sp_size = int(getattr(parallel, "sequence_parallel_size", 1) or 1)
+        expected_size = dp_size if dp_size > 1 else sp_size
+        if not use_allgather or expected_size <= 1:
+            return None
+        if not torch.distributed.is_initialized():
+            raise RuntimeError("BF16 HWR AllGather resolution requires initialized distributed groups")
+
+        from vllm_omni.diffusion.distributed.parallel_state import (
+            get_data_parallel_world_size,
+            get_dp_group,
+            get_sp_group,
+        )
+
+        coordinator = get_dp_group() if get_data_parallel_world_size() > 1 else get_sp_group()
+        return cast(_AllGatherCoordinator, coordinator)
+
+    @staticmethod
+    def _coordinate_hwr_group(
+        coordinator: _AllGatherCoordinator | None,
+        phase: str,
+        local_record: dict[str, object],
+        *,
+        require_identity: bool = True,
+    ) -> list[dict[str, object]]:
+        """Gather one bounded startup record and validate cohort membership."""
+        if coordinator is None:
+            return [
+                {
+                    **local_record,
+                    "phase": phase,
+                    "group_size": 1,
+                    "group_rank": 0,
+                    "group_ranks": [0],
+                }
+            ]
+
+        world_size = int(getattr(coordinator, "world_size"))
+        group_rank = int(getattr(coordinator, "rank_in_group"))
+        group_ranks = tuple(int(rank) for rank in getattr(coordinator, "ranks"))
+        record = {
+            **local_record,
+            "phase": phase,
+            "group_size": world_size,
+            "group_rank": group_rank,
+            "group_ranks": list(group_ranks),
+        }
+        gathered: list[object] = [None] * world_size
+        group = getattr(coordinator, "cpu_group", None) or getattr(coordinator, "device_group")
+        torch.distributed.all_gather_object(gathered, record, group=group)
+        records = [candidate for candidate in gathered if isinstance(candidate, dict)]
+        if len(records) != world_size:
+            raise RuntimeError(f"BF16 HWR AllGather {phase} consensus returned malformed rank records")
+        if (
+            any(candidate.get("phase") != phase for candidate in records)
+            or any(candidate.get("group_size") != world_size for candidate in records)
+            or any(candidate.get("group_ranks") != list(group_ranks) for candidate in records)
+            or {candidate.get("group_rank") for candidate in records} != set(range(world_size))
+        ):
+            raise RuntimeError(f"BF16 HWR AllGather process-group resolution differs during {phase}")
+        if require_identity:
+            identities = {candidate.get("identity_digest") for candidate in records}
+            if len(identities) != 1 or None in identities:
+                raise RuntimeError(f"BF16 HWR AllGather weight identity differs during {phase}")
+        return records
+
     def _build_hwr_context(
         self,
         model: nn.Module,
         modules: object,
         *,
         load_format: str,
-        sources: Sequence[object],
+        sources: Sequence[_WeightSource],
         source_digest_cache: NodeSourceDigestCache | None = None,
     ) -> FinalLayoutIdentityContext:
         from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
@@ -300,6 +419,186 @@ class HWRLoaderMixin:
             source_digest_cache=source_digest_cache,
         )
 
+    def _source_plan_digest(self, plan: HostWeightPlan) -> str:
+        bindings = []
+        for runtime_name, binding in sorted(plan.bindings.items()):
+            transform = binding.transform
+            bindings.append(
+                {
+                    "runtime_name": runtime_name,
+                    "checkpoint_key": binding.checkpoint_key,
+                    "file_path": str(Path(binding.file_path).resolve()),
+                    "transform": (
+                        None
+                        if transform is None
+                        else (
+                            f"{getattr(transform, '__module__', type(transform).__module__)}."
+                            f"{getattr(transform, '__qualname__', type(transform).__qualname__)}"
+                        )
+                    ),
+                }
+            )
+        return self._identity_fingerprint(
+            {
+                "backing_kind": plan.backing_kind,
+                "bindings": bindings,
+                "planned_source_prefixes": sorted(plan.planned_source_prefixes),
+            }
+        )
+
+    def _resolve_hwr_allgather_source_plan(
+        self,
+        model: nn.Module,
+        modules: object,
+        *,
+        coordinator: _AllGatherCoordinator,
+        mode: RuntimeMode,
+        load_format: str,
+        sources: Sequence[_WeightSource],
+    ) -> dict[str, object] | None:
+        """Resolve BF16 AllGather directly against immutable checkpoints.
+
+        Native BF16 checkpoints already contain the representation consumed by
+        DLO.  HWR therefore owns identity and group consensus while the plan
+        references the original safetensors mappings; no normalized copy is
+        produced in the HWR artifact store.
+        """
+        from vllm_omni.diffusion.model_loader.host_weights import NodeSourceDigestCache
+        from vllm_omni.host_weight_runtime import ResolutionOutcome, RuntimeMode, WaitPolicy
+        from vllm_omni.host_weight_runtime.filesystem import detect_storage_class
+
+        context = None
+        plan = None
+        plan_digest = None
+        fallback_reason = None
+        preflight_error: Exception | None = None
+        try:
+            parallel = self.parallel_config
+            dp_size = int(getattr(parallel, "data_parallel_size", 1) or 1)
+            sp_size = int(getattr(parallel, "sequence_parallel_size", 1) or 1)
+            expected_size = dp_size if dp_size > 1 else sp_size
+            if int(getattr(coordinator, "world_size")) != expected_size:
+                raise RuntimeError(
+                    "BF16 HWR AllGather group size differs from the configured DLO topology: "
+                    f"resolved={coordinator.world_size}, expected={expected_size}"
+                )
+
+            expected_prefixes = frozenset(f"{name}." for name in getattr(modules, "dit_names", ()))
+            available_prefixes = frozenset(getattr(source, "prefix", "") for source in sources)
+            if not expected_prefixes <= available_prefixes:
+                fallback_reason = "source-backed HWR requires one dedicated source prefix per owned DiT"
+            else:
+                overlapping_prefixes = frozenset(
+                    prefix
+                    for prefix in available_prefixes
+                    if any(dit_prefix.startswith(prefix) for dit_prefix in expected_prefixes)
+                )
+                if not overlapping_prefixes <= expected_prefixes:
+                    fallback_reason = "source-backed HWR rejects mixed DiT/component checkpoint sources"
+
+            if fallback_reason is None:
+                root_value = getattr(self.od_config, "host_weight_runtime_root", None)
+                if not isinstance(root_value, str) or not root_value.strip():
+                    raise ValueError("enabled Host Weight Runtime requires host_weight_runtime_root")
+                root = Path(root_value).expanduser()
+                root.mkdir(parents=True, exist_ok=True)
+                detect_storage_class(root)
+                context = self._build_hwr_context(
+                    model,
+                    modules,
+                    load_format=load_format,
+                    sources=sources,
+                    source_digest_cache=NodeSourceDigestCache(
+                        root,
+                        timeout_seconds=WaitPolicy().coordination_timeout_seconds,
+                    ),
+                )
+                dit_modules = tuple(zip(getattr(modules, "dit_names", ()), getattr(modules, "dits", ())))
+                result = build_checkpoint_mmap_plan(
+                    model,
+                    dit_modules=dit_modules,
+                    sources=sources,
+                    model_path=str(getattr(self.od_config, "model", "")) or None,
+                    tensor_parallel_size=int(getattr(parallel, "tensor_parallel_size", 1)),
+                    use_hsdp=bool(getattr(parallel, "use_hsdp", False)),
+                    online_quantization=has_online_quantization(model),
+                )
+                if result.plan is None:
+                    fallback_reason = result.fallback_reason or "checkpoint mmap planning failed"
+                else:
+                    context.ensure_sources_unchanged()
+                    plan = dataclasses.replace(
+                        result.plan,
+                        backing_kind="host_weight_runtime_source",
+                        identity_digest=context.identity.key,
+                        content_digest=context.identity.source.fingerprint,
+                        source_guard=context.ensure_sources_unchanged,
+                    )
+                    plan_digest = self._source_plan_digest(plan)
+        except Exception as exc:
+            preflight_error = exc
+
+        records = self._coordinate_hwr_group(
+            coordinator,
+            "source_plan",
+            {
+                "identity_digest": context.identity.key if context is not None else None,
+                "content_digest": context.identity.source.fingerprint if context is not None else None,
+                "plan_digest": plan_digest,
+                "status": "error" if preflight_error is not None else "fallback" if fallback_reason else "ready",
+                "error_type": type(preflight_error).__name__ if preflight_error is not None else None,
+            },
+            require_identity=False,
+        )
+        failed_ranks = [record.get("group_rank") for record in records if record.get("status") == "error"]
+        if failed_ranks:
+            raise RuntimeError(
+                f"BF16 HWR AllGather source-plan preflight failed on group ranks {failed_ranks}"
+            ) from preflight_error
+
+        fallback_ranks = [record.get("group_rank") for record in records if record.get("status") == "fallback"]
+        if fallback_ranks:
+            if len(fallback_ranks) != len(records):
+                raise RuntimeError(
+                    f"BF16 HWR AllGather source-plan eligibility differs across ranks: fallback={fallback_ranks}"
+                )
+            if mode is RuntimeMode.REQUIRED:
+                raise ValueError(
+                    "required Host Weight Runtime source plan is ineligible: "
+                    f"{fallback_reason or 'peer source-plan fallback'}"
+                )
+            logger.info(
+                "BF16 HWR source plan is ineligible on group ranks %s; using canonical DLO: %s",
+                fallback_ranks,
+                fallback_reason or "peer source-plan fallback",
+            )
+            return None
+
+        for field, label in (
+            ("identity_digest", "source identity"),
+            ("content_digest", "source content"),
+            ("plan_digest", "checkpoint binding plan"),
+        ):
+            values = {record.get(field) for record in records}
+            if len(values) != 1 or None in values:
+                raise RuntimeError(f"BF16 HWR AllGather {label} differs across ranks")
+
+        assert context is not None
+        assert plan is not None
+        context.ensure_sources_unchanged()
+        logger.info(
+            "Resolved BF16 HWR source-backed checkpoint plan: outcome=%s, identity=%s, tensors=%d",
+            ResolutionOutcome.CANONICAL_DIRECT.value,
+            context.identity.key,
+            len(plan.bindings),
+        )
+        return {
+            "mode": mode,
+            "context": context,
+            "outcome": ResolutionOutcome.CANONICAL_DIRECT,
+            "plan": plan,
+        }
+
     def _resolve_hwr(
         self,
         model: nn.Module,
@@ -308,9 +607,9 @@ class HWRLoaderMixin:
         dist_offload: bool,
         use_allgather: bool,
         load_format: str,
-        sources: Sequence[object],
+        sources: Sequence[_WeightSource],
     ) -> dict[str, object] | None:
-        """Resolve an eligible no-AllGather final-layout HWR transaction."""
+        """Resolve an eligible final-layout BF16 HWR transaction."""
         from vllm_omni.diffusion.model_loader.host_weights import (
             FinalLayoutTensorRestorer,
             NodeSourceDigestCache,
@@ -326,16 +625,69 @@ class HWRLoaderMixin:
         )
         from vllm_omni.host_weight_runtime.filesystem import detect_storage_class
 
-        mode = self._hwr_eligibility_mode(
-            model,
-            modules,
-            dist_offload=dist_offload,
-            use_allgather=use_allgather,
-            load_format=load_format,
-        )
-        if mode is None:
+        try:
+            requested_mode = RuntimeMode(getattr(self.od_config, "host_weight_runtime_mode", "disabled"))
+        except ValueError as exc:
+            raise ValueError("host_weight_runtime_mode must be disabled, preferred, or required") from exc
+        if requested_mode is RuntimeMode.DISABLED or not dist_offload:
+            self._hwr_eligibility_mode(
+                model,
+                modules,
+                dist_offload=dist_offload,
+                use_allgather=use_allgather,
+                load_format=load_format,
+            )
             return None
+
+        coordinator = self._resolve_hwr_allgather_coordinator(use_allgather)
+        mode = None
+        eligibility_error: Exception | None = None
+        try:
+            mode = self._hwr_eligibility_mode(
+                model,
+                modules,
+                dist_offload=dist_offload,
+                use_allgather=use_allgather,
+                load_format=load_format,
+            )
+        except Exception as exc:
+            eligibility_error = exc
+        eligibility_records = self._coordinate_hwr_group(
+            coordinator,
+            "eligibility",
+            {
+                "identity_digest": "bf16-final-layout-eligibility-v1",
+                "status": "error" if eligibility_error is not None else "ineligible" if mode is None else "eligible",
+                "error_type": type(eligibility_error).__name__ if eligibility_error is not None else None,
+            },
+            require_identity=False,
+        )
+        resolution_scope = "BF16 HWR AllGather" if coordinator is not None else "Host Weight Runtime"
+        failed_ranks = [record.get("group_rank") for record in eligibility_records if record.get("status") == "error"]
+        if failed_ranks:
+            if coordinator is None and eligibility_error is not None:
+                raise eligibility_error
+            raise RuntimeError(
+                f"{resolution_scope} eligibility failed on group ranks {failed_ranks}"
+            ) from eligibility_error
+        ineligible_ranks = [
+            record.get("group_rank") for record in eligibility_records if record.get("status") == "ineligible"
+        ]
+        if ineligible_ranks:
+            if len(ineligible_ranks) == len(eligibility_records):
+                return None
+            raise RuntimeError(f"BF16 HWR AllGather eligibility differs across ranks: ineligible={ineligible_ranks}")
         assert isinstance(mode, RuntimeMode)
+        if coordinator is not None:
+            return self._resolve_hwr_allgather_source_plan(
+                model,
+                modules,
+                coordinator=coordinator,
+                mode=mode,
+                load_format=load_format,
+                sources=sources,
+            )
+
         expected_prefixes = frozenset(f"{name}." for name in getattr(modules, "dit_names", ()))
         available_prefixes = frozenset(getattr(source, "prefix", "") for source in sources)
         if not expected_prefixes <= available_prefixes:
@@ -428,12 +780,15 @@ class HWRLoaderMixin:
                 "Host Weight Runtime committed restore could not establish its startup ownership boundary"
             ) from exc
         source_metadata = context.identity.source.metadata.to_value()
-        target_bindings = source_metadata.get("target_bindings") if isinstance(source_metadata, dict) else None
-        planned_prefixes = frozenset(
-            binding["source_prefix"]
-            for binding in (target_bindings or ())
-            if isinstance(binding, dict) and isinstance(binding.get("source_prefix"), str)
-        )
+        target_bindings_value = source_metadata.get("target_bindings") if isinstance(source_metadata, dict) else None
+        target_bindings = target_bindings_value if isinstance(target_bindings_value, list) else []
+        planned_prefix_values: set[str] = set()
+        for binding in target_bindings:
+            if isinstance(binding, dict):
+                source_prefix = binding.get("source_prefix")
+                if isinstance(source_prefix, str):
+                    planned_prefix_values.add(source_prefix)
+        planned_prefixes = frozenset(planned_prefix_values)
         if not planned_prefixes:
             lease.close()
             raise _HWRCommitError("Host Weight Runtime identity did not record owned canonical source prefixes")
@@ -453,18 +808,18 @@ class HWRLoaderMixin:
         request = dict(self._last_load_request)
         self._force_canonical_load = True
         try:
-            return self.load_model(**cast(dict[str, object], request))
+            return self.load_model(**request)
         finally:
             self._force_canonical_load = False
 
     def _publish_hwr_after_load(self, model: nn.Module, modules: object, state: dict[str, object] | None) -> None:
         from vllm_omni.diffusion.model_loader.host_weights import FinalLayoutBF16Producer
-        from vllm_omni.host_weight_runtime import PostLoadPublicationOutcome, ResolutionOutcome
+        from vllm_omni.host_weight_runtime import HostWeightRuntime, PostLoadPublicationOutcome, ResolutionOutcome
 
         if state is None or state.get("outcome") is not ResolutionOutcome.CANONICAL_FALLBACK:
             return
-        context = state["context"]
-        runtime = state["runtime"]
+        context = cast("FinalLayoutIdentityContext", state["context"])
+        runtime = cast(HostWeightRuntime, state["runtime"])
         dit_modules = tuple(zip(getattr(modules, "dit_names", ()), getattr(modules, "dits", ())))
         try:
             producer = FinalLayoutBF16Producer(context, model, dit_modules)

@@ -137,6 +137,33 @@ class TestDistributedLayerwiseOffloadHook:
         assert shard.numel() == 4
         assert torch.equal(shard, _make_values(10.0))
 
+    def test_runtime_lease_sharding_copies_only_local_range_and_releases_source(self):
+        weight = nn.Parameter(torch.arange(12, dtype=torch.bfloat16).reshape(3, 4), requires_grad=False)
+        released: list[int] = []
+
+        shards, metadata = DistributedLayerwiseOffloadHook._shard_and_pin(
+            {"weight": weight},
+            {},
+            dp_size=2,
+            rank=1,
+            pin_memory=False,
+            runtime_lease_storage=True,
+            release_source_pages=lambda tensor: released.append(id(tensor)),
+        )
+
+        assert torch.equal(shards[torch.bfloat16], torch.arange(6, 12, dtype=torch.bfloat16))
+        assert metadata[torch.bfloat16] == [
+            {
+                "name": "weight",
+                "offset": 0,
+                "numel": 12,
+                "shape": torch.Size((3, 4)),
+                "stride": (4, 1),
+            }
+        ]
+        assert released == [id(weight)]
+        assert weight.numel() == 0
+
     def test_prefetch_preserves_transposed_weight_stride(
         self,
         dist_group,
@@ -712,9 +739,17 @@ class _HWRPipeline(nn.Module):
 class _FakeHostWeightLease:
     def __init__(self, resolution_id: str, events: list[str] | None = None):
         self.closed = False
-        self.provenance = SimpleNamespace(resolution_id=resolution_id)
+        self.provenance = SimpleNamespace(
+            resolution_id=resolution_id,
+            identity_digest="identity-digest",
+            artifact_content_sha256="content-digest",
+        )
         self.mapped_regions = (MappedHostRegion("weights.safetensors", 0x1000, 4096),)
         self._events = events
+        self.released_tensor_ids: list[int] = []
+
+    def release_tensor_pages(self, tensor: torch.Tensor):
+        self.released_tensor_ids.append(id(tensor))
 
     def close(self):
         if self._events is not None:
@@ -1111,6 +1146,72 @@ class TestMmapWeightLoading:
         assert all(hook.rank_local_mmap for group in backend._all_hook_groups for hook in group)
         backend.disable()
 
+    def test_source_backed_hwr_plan_uses_checkpoint_mmap_and_source_guard(
+        self,
+        tmp_path,
+        patched_offload_runtime,
+    ):
+        class Transformer(nn.Module):
+            _layerwise_offload_blocks_attrs = ["blocks"]
+
+            def __init__(self):
+                super().__init__()
+                self.blocks = nn.ModuleList([nn.Linear(2, 2, bias=False) for _ in range(2)])
+
+        class Pipeline(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.transformer = Transformer()
+
+            @staticmethod
+            def _remap_ckpt_key(key):
+                return key
+
+        pipeline = Pipeline()
+        checkpoint_file = tmp_path / "model.safetensors"
+        save_file({name: torch.ones_like(param) for name, param in pipeline.named_parameters()}, str(checkpoint_file))
+        result = build_checkpoint_mmap_plan(
+            pipeline,
+            dit_modules=(("transformer", pipeline.transformer),),
+            sources=(),
+            model_path=str(tmp_path),
+            tensor_parallel_size=1,
+            use_hsdp=False,
+            online_quantization=False,
+        )
+        assert result.plan is not None
+        guard_calls = 0
+
+        def source_guard():
+            nonlocal guard_calls
+            guard_calls += 1
+
+        source_plan = HostWeightPlan(
+            backing_kind="host_weight_runtime_source",
+            bindings=result.plan.bindings,
+            planned_source_prefixes=result.plan.planned_source_prefixes,
+            identity_digest="identity-digest",
+            content_digest="content-digest",
+            source_guard=source_guard,
+        )
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                pin_cpu_memory=False,
+                dp_size=1,
+                dlo_use_allgather=True,
+            ),
+            torch.device("cpu"),
+            host_weight_plan=source_plan,
+        )
+
+        backend.enable(pipeline)
+
+        assert guard_calls == 2
+        assert backend._host_weight_lease is None
+        assert backend._using_rank_local_mmap
+        backend.disable()
+
     def test_hwr_carrier_is_taken_and_released_after_bounded_staging(self, patched_offload_runtime):
         """A warm HWR plan uses the existing two-slot rank-local transport."""
         pipeline, backend, carrier, lease = _hwr_backend()
@@ -1175,6 +1276,173 @@ class TestMmapWeightLoading:
 
         backend.disable()
         assert lease.closed
+
+    def test_hwr_allgather_extracts_local_shards_and_releases_lease(
+        self,
+        monkeypatch,
+        patched_offload_runtime,
+    ):
+        pipeline = _HWRPipeline()
+        plan, carrier, lease = _fake_hwr_plan()
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                pin_cpu_memory=False,
+                dp_size=2,
+                dlo_use_allgather=True,
+            ),
+            torch.device("cpu"),
+            host_weight_plan=plan,
+        )
+
+        def init_group():
+            backend.dp_group = object()  # type: ignore[assignment]
+            backend.rank = 0
+            backend._group_ranks = (0, 1)
+
+        def gather_object(output, local, *, group):
+            assert group is backend.dp_group
+            output[0] = local
+            output[1] = {**local, "group_rank": 1}
+
+        def allgather(output, local_shard, *, group):
+            assert group is backend.dp_group
+            output[: local_shard.numel()].copy_(local_shard)
+            output[local_shard.numel() :].copy_(local_shard)
+
+        monkeypatch.setattr(backend, "_init_dp_group", init_group)
+        monkeypatch.setattr(torch.distributed, "all_gather_object", gather_object)
+        monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", allgather)
+
+        backend.enable(pipeline)
+
+        assert carrier.taken
+        assert backend._using_runtime_lease
+        assert not backend._using_rank_local_mmap
+        assert all(hook.runtime_lease_storage for group in backend._all_hook_groups for hook in group)
+        assert all(hook.release_source_pages is None for group in backend._all_hook_groups for hook in group)
+        assert len(lease.released_tensor_ids) == 3
+        assert lease.closed
+
+        all_hooks = [hook for group in backend._all_hook_groups for hook in group]
+        backend._module_paths_by_id = {id(module): name for name, module in pipeline.named_modules()}
+        ordered_digest = backend._transport_plan_digest(all_hooks)
+        first_id, second_id = (id(hook.next_block) for hook in all_hooks[:2])
+        backend._module_paths_by_id[first_id], backend._module_paths_by_id[second_id] = (
+            backend._module_paths_by_id[second_id],
+            backend._module_paths_by_id[first_id],
+        )
+        assert backend._transport_plan_digest(all_hooks) != ordered_digest
+
+        backend.disable()
+
+    def test_hwr_allgather_transport_mismatch_rolls_back_before_weight_collective(
+        self,
+        monkeypatch,
+        patched_offload_runtime,
+    ):
+        pipeline = _HWRPipeline()
+        plan, carrier, lease = _fake_hwr_plan()
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                pin_cpu_memory=False,
+                dp_size=2,
+                dlo_use_allgather=True,
+            ),
+            torch.device("cpu"),
+            host_weight_plan=plan,
+        )
+
+        def init_group():
+            backend.dp_group = object()  # type: ignore[assignment]
+            backend.rank = 0
+            backend._group_ranks = (0, 1)
+
+        def mismatch(output, local, *, group):
+            assert group is backend.dp_group
+            output[0] = local
+            output[1] = {
+                **local,
+                "group_rank": 1,
+                "transport_digest": "different-transport-plan",
+            }
+
+        monkeypatch.setattr(backend, "_init_dp_group", init_group)
+        monkeypatch.setattr(torch.distributed, "all_gather_object", mismatch)
+        monkeypatch.setattr(
+            torch.distributed,
+            "all_gather_into_tensor",
+            lambda *_args, **_kwargs: pytest.fail("weight collective started before transport consensus"),
+        )
+
+        with pytest.raises(RuntimeError, match="transport plan differs"):
+            backend.enable(pipeline)
+
+        assert carrier.taken
+        assert lease.closed
+        assert not backend.enabled
+        assert not backend._blocks
+        assert not backend._all_hook_groups
+
+    def test_hwr_allgather_local_setup_failure_notifies_peers_and_closes_lease(
+        self,
+        monkeypatch,
+        patched_offload_runtime,
+    ):
+        pipeline = _HWRPipeline()
+        plan, carrier, lease = _fake_hwr_plan()
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                pin_cpu_memory=False,
+                dp_size=2,
+                dlo_use_allgather=True,
+            ),
+            torch.device("cpu"),
+            host_weight_plan=plan,
+        )
+        statuses: list[str] = []
+
+        def init_group():
+            backend.dp_group = object()  # type: ignore[assignment]
+            backend.rank = 0
+            backend._group_ranks = (0, 1)
+
+        def gather_object(output, local, *, group):
+            assert group is backend.dp_group
+            statuses.append(local["status"])
+            output[0] = local
+            output[1] = {
+                **local,
+                "status": "ready",
+                "error_type": None,
+                "group_rank": 1,
+                "transport_digest": "peer-plan",
+            }
+
+        monkeypatch.setattr(backend, "_init_dp_group", init_group)
+        monkeypatch.setattr(torch.distributed, "all_gather_object", gather_object)
+        monkeypatch.setattr(
+            backend,
+            "_allocate_shared_buffers",
+            lambda _hooks: (_ for _ in ()).throw(RuntimeError("device buffer allocation failed")),
+        )
+        monkeypatch.setattr(
+            torch.distributed,
+            "all_gather_into_tensor",
+            lambda *_args, **_kwargs: pytest.fail("weight collective started after local setup failure"),
+        )
+
+        with pytest.raises(RuntimeError, match="device buffer allocation failed"):
+            backend.enable(pipeline)
+
+        assert statuses == ["error"]
+        assert carrier.taken
+        assert lease.closed
+        assert not backend.enabled
+        assert not backend._blocks
+        assert not backend._all_hook_groups
 
     def test_hwr_backend_failure_drains_partial_setup_before_lease_close(
         self,
