@@ -203,7 +203,10 @@ def hwr_artifact_case(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Simple
             "_init_from_load_format",
             lambda *_args, **_kwargs: _HWRPipeline(canonical_root),
         )
-        loader.load_model(load_device="cpu", device=torch.device("cpu"))
+        model = loader.load_model(load_device="cpu", device=torch.device("cpu"))
+        startup = take_offload_startup_state(model)
+        assert startup is not None
+        startup.finish_loader_work()
 
     return SimpleNamespace(
         canonical_root=canonical_root,
@@ -270,9 +273,13 @@ def test_hwr_selects_exact_artifact_for_rank_local_and_allgather(
     first_loader, first_models = hwr_artifact_case.make_loader(use_allgather=use_allgather)
     first = first_loader.load_model(load_device="cpu", device=torch.device("cpu"))
     assert first is first_models[0]
-    assert first.load_count == 1
-    assert first_loader._hwr_state is not None
-    assert take_offload_startup_state(first) is None
+    assert first.load_count == 0
+    assert first_loader._hwr_state is None
+    first_weight = first.transformer.weight.detach().clone()
+    first_startup = take_offload_startup_state(first)
+    assert first_startup is not None
+    assert first_startup.host_weight_plan.backing_kind == "checkpoint_mmap"
+    first_startup.finish_loader_work()
     assert tuple((hwr_artifact_case.store_root / "artifacts").glob("*"))
 
     second_loader, second_models = hwr_artifact_case.make_loader(use_allgather=use_allgather)
@@ -285,7 +292,7 @@ def test_hwr_selects_exact_artifact_for_rank_local_and_allgather(
 
     assert second is second_models[0]
     assert second.load_count == 0
-    assert torch.equal(second.transformer.weight, first.transformer.weight)
+    assert torch.equal(second.transformer.weight, first_weight)
     startup_state = take_offload_startup_state(second)
     assert startup_state is not None
     second_plan = startup_state.host_weight_plan
@@ -395,7 +402,7 @@ def test_hwr_allgather_preflight_failure_notifies_group(
     assert models[0].load_count == 0
 
 
-def test_preferred_hwr_allgather_mixed_hit_and_miss_falls_back_as_one_group(
+def test_preferred_hwr_allgather_mixed_hit_and_miss_rejoins_production(
     hwr_artifact_case: SimpleNamespace,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -409,9 +416,12 @@ def test_preferred_hwr_allgather_mixed_hit_and_miss_falls_back_as_one_group(
 
     loaded = loader.load_model(load_device="cpu", device=torch.device("cpu"))
     assert loaded is models[0]
-    assert loaded.load_count == 1
-    assert take_offload_startup_state(loaded) is None
-    assert phases == ["eligibility", "artifact_resolution"]
+    assert loaded.load_count == 0
+    startup = take_offload_startup_state(loaded)
+    assert startup is not None
+    assert startup.host_weight_plan.backing_kind == "checkpoint_mmap"
+    startup.finish_loader_work()
+    assert phases[-1] == "checkpoint_plan"
 
 
 @pytest.mark.parametrize(

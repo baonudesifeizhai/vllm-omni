@@ -199,21 +199,21 @@ FINAL_LAYOUT_BF16_POLICY = FinalLayoutBF16Policy()
 
 
 def _split_shards(
-    records: Sequence[RuntimeTensorTarget],
+    specs: Sequence[TensorWriteSpec],
     max_shard_bytes: int,
-) -> tuple[tuple[RuntimeTensorTarget, ...], ...]:
+) -> tuple[tuple[TensorWriteSpec, ...], ...]:
     if max_shard_bytes <= 0:
         raise ValueError("final-layout BF16 shard size must be positive")
-    shards: list[tuple[RuntimeTensorTarget, ...]] = []
-    current: list[RuntimeTensorTarget] = []
+    shards: list[tuple[TensorWriteSpec, ...]] = []
+    current: list[TensorWriteSpec] = []
     current_bytes = 0
-    for record in records:
-        if current and current_bytes + record.nbytes > max_shard_bytes:
+    for spec in specs:
+        if current and current_bytes + spec.nbytes > max_shard_bytes:
             shards.append(tuple(current))
             current = []
             current_bytes = 0
-        current.append(record)
-        current_bytes += record.nbytes
+        current.append(spec)
+        current_bytes += spec.nbytes
     if current:
         shards.append(tuple(current))
     return tuple(shards)
@@ -221,28 +221,31 @@ def _split_shards(
 
 def _write_shards(
     writer: ArtifactWriter,
-    records: Sequence[RuntimeTensorTarget],
+    specs: Sequence[TensorWriteSpec],
     *,
     max_shard_bytes: int,
-    tensor_for: Callable[[RuntimeTensorTarget], torch.Tensor],
+    tensor_for: Callable[[str], torch.Tensor],
 ) -> None:
-    shards = _split_shards(records, max_shard_bytes)
+    shards = _split_shards(specs, max_shard_bytes)
     shard_count = len(shards)
     for index, shard in enumerate(shards, start=1):
-        specs = tuple(
-            TensorWriteSpec(
-                name=record.name,
-                shape=tuple(record.tensor.shape),
-                dtype=record.tensor.dtype,
-                kind=record.kind,
-                role=record.role,
-            )
-            for record in shard
-        )
         file_name = f"model-{index:05d}-of-{shard_count:05d}.safetensors"
-        with writer.open_tensor_file(file_name, specs, ordered=True) as output:
-            for record in shard:
-                output.write_tensor(record.name, tensor_for(record))
+        with writer.open_tensor_file(file_name, shard, ordered=True) as output:
+            for spec in shard:
+                output.write_tensor(spec.name, tensor_for(spec.name))
+
+
+def _tensor_specs(records: Sequence[RuntimeTensorTarget]) -> tuple[TensorWriteSpec, ...]:
+    return tuple(
+        TensorWriteSpec(
+            name=record.name,
+            shape=tuple(record.tensor.shape),
+            dtype=record.tensor.dtype,
+            kind=record.kind,
+            role=record.role,
+        )
+        for record in records
+    )
 
 
 def _production_metadata(
@@ -320,11 +323,12 @@ class FinalLayoutBF16Producer:
         for binding in bindings:
             binding.validator()
 
+        tensors = {record.name: record.tensor.detach() for record in records}
         _write_shards(
             writer,
-            records,
+            _tensor_specs(records),
             max_shard_bytes=self._max_shard_bytes,
-            tensor_for=lambda record: record.tensor.detach(),
+            tensor_for=tensors.__getitem__,
         )
 
         self._context.ensure_sources_unchanged()
@@ -353,7 +357,7 @@ class CheckpointPlanBF16Producer:
             require_materialized=False,
         )
         self._contract_digest = validate_final_layout_identity(context, records)
-        self._records = records
+        self._tensor_specs = _tensor_specs(records)
         self._spec = WeightProductionSpec(
             producer_id=FINAL_LAYOUT_BF16_PRODUCER_ID,
             outputs=(context.identity,),
@@ -381,8 +385,8 @@ class CheckpointPlanBF16Producer:
                 for file_path in sorted({binding.file_path for binding in self._plan.bindings.values()})
             }
 
-            def checkpoint_tensor(record: RuntimeTensorTarget) -> torch.Tensor:
-                binding = self._plan.bindings[record.name]
+            def checkpoint_tensor(name: str) -> torch.Tensor:
+                binding = self._plan.bindings[name]
                 tensor = handles[binding.file_path].get_tensor(binding.checkpoint_key)
                 if binding.transform is not None:
                     tensor = binding.transform(tensor)
@@ -390,13 +394,13 @@ class CheckpointPlanBF16Producer:
 
             _write_shards(
                 writer,
-                self._records,
+                self._tensor_specs,
                 max_shard_bytes=self._max_shard_bytes,
                 tensor_for=checkpoint_tensor,
             )
 
         self._context.ensure_sources_unchanged()
-        return _production_metadata(self._context, self._contract_digest, len(self._records))
+        return _production_metadata(self._context, self._contract_digest, len(self._tensor_specs))
 
 
 __all__ = [

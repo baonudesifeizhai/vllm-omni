@@ -81,6 +81,7 @@ class _HWRState:
     coordinator: _AllGatherCoordinator | None = None
     artifact_content_digest: str | None = None
     plan: HostWeightPlan | None = None
+    allow_checkpoint_production: bool = True
 
 
 class HWRLoaderMixin:
@@ -645,9 +646,9 @@ class HWRLoaderMixin:
         model: nn.Module,
         state: _HWRState,
         lease: HostWeightLease,
-    ) -> _HWRState | None:
+    ) -> _HWRState:
         from vllm_omni.diffusion.model_loader.host_weights import FinalLayoutTensorRestorer
-        from vllm_omni.host_weight_runtime import RuntimeMode
+        from vllm_omni.host_weight_runtime import ResolutionOutcome, RuntimeMode
 
         restore_plan, error, failed = self._run_hwr_phase(
             state,
@@ -657,8 +658,10 @@ class HWRLoaderMixin:
         if failed:
             lease.close()
             if state.mode is RuntimeMode.PREFERRED:
+                state.outcome = ResolutionOutcome.CANONICAL_FALLBACK
+                state.allow_checkpoint_production = False
                 logger.warning("HWR restore planning failed on ranks %s; using canonical loading", failed)
-                return None
+                return state
             if state.coordinator is None:
                 raise cast(Exception, error)
             raise RuntimeError(f"required Host Weight Runtime restore planning failed on group ranks {failed}")
@@ -707,13 +710,15 @@ class HWRLoaderMixin:
         modules: object,
         state: _HWRState,
         plan: HostWeightPlan,
-    ) -> Callable[[], None]:
-        from vllm_omni.diffusion.model_loader.host_weights.producers.final_layout_bf16 import (
-            CheckpointPlanBF16Producer,
-        )
+    ) -> Callable[[], None] | None:
+        from vllm_omni.diffusion.model_loader.host_weights import CheckpointPlanBF16Producer
 
-        dit_modules = tuple(zip(getattr(modules, "dit_names", ()), getattr(modules, "dits", ())))
-        producer = CheckpointPlanBF16Producer(state.context, model, dit_modules, plan)
+        try:
+            dit_modules = tuple(zip(getattr(modules, "dit_names", ()), getattr(modules, "dits", ())))
+            producer = CheckpointPlanBF16Producer(state.context, model, dit_modules, plan)
+        except Exception:
+            logger.warning("Direct checkpoint HWR publication setup failed", exc_info=True)
+            return None
 
         def publish() -> None:
             resolution = state.runtime.resolve(state.context.identity, producer=producer)
@@ -745,6 +750,8 @@ class HWRLoaderMixin:
     ) -> tuple[_HWRState | None, HostWeightPlan | None]:
         if state is None:
             return None, plan
+        if not state.allow_checkpoint_production:
+            return None, None
         plan = self._checkpoint_plan_for_group(state, plan, fallback_reason)
         if plan is None:
             return state, None
