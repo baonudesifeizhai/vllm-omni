@@ -35,15 +35,7 @@ from .inspection import (
     DomainInspection,
     HostWeightInspector,
 )
-from .lease import (
-    HostWeightDerivationLease,
-    HostWeightLease,
-    HostWeightLeaseCarrier,
-    LeaseProvenance,
-    MappedHostRegion,
-    SourceDerivationProvenance,
-    SourceDerivationSpec,
-)
+from .lease import HostWeightLease, HostWeightLeaseCarrier, LeaseProvenance, MappedHostRegion
 from .manifest import (
     FileManifestEntry,
     ManifestValidationError,
@@ -99,7 +91,6 @@ __all__ = [
     "FileManifestEntry",
     "HostWeightError",
     "HostWeightFailure",
-    "HostWeightDerivationLease",
     "HostWeightLease",
     "HostWeightLeaseCarrier",
     "HostWeightResolution",
@@ -134,8 +125,6 @@ __all__ = [
     "StorageClass",
     "StorageDomainPolicy",
     "StorageScope",
-    "SourceDerivationProvenance",
-    "SourceDerivationSpec",
     "StoreResult",
     "StoreStatus",
     "TensorFileWriter",

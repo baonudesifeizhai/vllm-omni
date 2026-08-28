@@ -196,142 +196,80 @@ adopt it.
 
 ### BF16 Host Weight Runtime consumers
 
-BF16 uses two HWR materialization points because the DLO transports have
-different lifetime requirements. The canonical checkpoint is upstream of the
-optional runtime-ready artifact; it is not a peer artifact backing.
-
-#### AllGather: deferred checkpoint derivation
-
-Native BF16 safetensors already contain the representation that DLO AllGather
-needs. Creating another final-layout BF16 artifact would add a complete
-checkpoint-sized read and write without removing a quantization or layout
-conversion. The AllGather path therefore does not publish or restore a copied
-BF16 artifact.
-
-When HWR is enabled for a multi-rank AllGather cohort, the loader:
-
-1. validates the ordinary BF16 HWR eligibility gates;
-2. resolves an exact source identity for every owned DiT checkpoint file;
-3. builds the existing checkpoint-mmap bindings, including any bounded
-   loader-owned transforms;
-4. exchanges the source identity, source-content digest, and binding-plan
-   digest across the DLO DP-or-SP group;
-5. asks HWR to resolve that exact pre-artifact `SourceDerivationSpec`; and
-6. hands the resulting `HostWeightDerivationLease` and a
-   `host_weight_runtime_derivation` plan to DLO.
-
-DLO then maps those files through the existing checkpoint-mmap loader, copies
-only the rank's padded AllGather shard into persistent CPU storage, and releases
-the source mappings after coordinated setup. No HWR payload safetensors,
-`manifest.json`, `READY.json`, or final-layout restore is involved. The small
-process-local derivation lease expresses identity, validation, and lifetime; it
-is closed after the checkpoint mappings are released.
-
-The current model-declared BF16 boundary covers MiniMax H3 and
-`black-forest-labs/FLUX.2-klein-4B`. The FLUX.2-klein contract covers both
-transformer block stacks, constructor-stable packed QKV mapping state, BF16
-parameters, and persistent loader-owned `beta`/`eps` buffers. The shared HWR
-machinery supports TP1 and TP2 rank identities plus SP layout identities;
-FLUX.2-klein evidence is currently TP1-only, while its TP2/SP layouts remain
-unmeasured.
-
-`preferred` permits an ineligible derivation plan or retryable derivation
-failure to use the ordinary canonical DLO path. `required` requires an exact
-derivation lease and fails the complete group if source identity, checkpoint
-bindings, source validation, or group consensus cannot be established. Unlike
-the artifact-backed no-AllGather path, `required` AllGather does not require a
-pre-populated HWR artifact.
-
-The HWR root remains meaningful for node-shared source-digest records.
-Content-addressed Hugging Face snapshot blobs are used directly. Local files
-are hashed in parallel and cached under the HWR root; cache reuse requires the
-same path, inode, size, timestamps, symlink target, and record checksum.
-
-The process-local derivation lease checks those observations immediately before
-and after checkpoint mmap realization. Before the first weight collective,
-every rank also exchanges a transport digest covering group membership, hook
-order, dtypes, tensor names, shapes, strides, offsets, padding, shard sizes, and
-collective output sizes. Any mismatch or local setup failure rolls the complete
-cohort back before it enters a mismatched weight collective.
-
-This arrangement keeps AllGather startup close to the existing BF16
-checkpoint-mmap baseline:
-
-```text
-original BF16 checkpoint mmap
-  -> resolve HWR derivation identity and binding consensus
-  -> copy only this rank's DLO shard
-  -> release source mappings
-```
-
-It deliberately avoids the former path:
-
-```text
-ordinary full-model load
-  -> write a second full BF16 artifact
-  -> map the artifact on every rank
-  -> copy each rank's DLO shard
-```
-
-#### No-AllGather: final-layout artifact lease
-
-No-AllGather retains the existing final-layout HWR contract from
+Both DLO transports consume the same immutable final-layout HWR artifact. The
+integration retains the final-layout contract from
 [PR #6486](https://github.com/vllm-project/vllm-omni/pull/6486) and registered
 mmap transport from
 [PR #6591](https://github.com/vllm-project/vllm-omni/pull/6591).
 
-On an exact local hit, the loader transactionally restores the final-layout
-artifact and transfers its lease to DLO. DLO keeps the mapping as the host
-master through service, using registered direct H2D when available and
-otherwise two bounded host staging slots.
+On an exact local hit, every rank resolves the same artifact identity and
+content digest, validates a restore plan without mutation, commits only after
+the complete cohort reports ready, and transfers its `HostWeightLease` to DLO.
+Warm finalization is also coordinated before any rank may enter backend setup.
+Any rank-local lookup, restore, commit, or finalization failure therefore causes
+the complete group to fall back or fail before a mismatched weight collective.
 
 On a miss, `preferred` uses canonical loading and may publish the finalized
 artifact after load for a later startup. `required` is consume-only and fails
-when the exact artifact is absent or unusable. Operators that use required
-no-AllGather therefore still populate each node-local storage domain with a
-matching preferred producer cohort.
+when the exact artifact is absent or unusable on any rank. Operators populate
+each node-local storage domain with a matching preferred producer cohort before
+using required mode. Mixed hit/miss cohorts in preferred mode close any acquired
+leases and use canonical loading on every rank.
 
-No-AllGather lease ownership remains:
+After handoff, multi-rank AllGather copies one persistent padded CPU shard per
+rank, releases the artifact pages as they are consumed, and closes the lease
+before the first weight collective. No-AllGather keeps the artifact mapping as
+the host master through service and copies complete blocks through registered
+mmap or two bounded host staging slots.
+
+The current AllGather promotion target is MiniMax H3 BF16 on DP2/TP1. The
+FLUX.2-klein-4B final-layout artifact contract is validated independently, but
+its AllGather transport is not claimed as an end-to-end promotion target until
+model-specific CUDA evidence is added. Neither model requires a direct
+checkpoint-mmap adapter on an HWR hit because restoration consumes finalized
+artifact tensor names rather than checkpoint loader callbacks.
+
+Lease ownership is:
 
 ```text
 loader owns lease
   -> restore plan validates and commits
   -> carrier transfers ownership once
-  -> backend owns the mapping through service
-  -> drain H2D
-  -> remove hooks and source references
-  -> unregister mapped ranges
-  -> close lease
+  -> backend owns the mapping during setup or service
+  -> AllGather copies its persistent CPU shard and closes the lease
+     OR no-AllGather feeds requests from registered mmap/bounded staging
+  -> no-AllGather drains H2D and unregisters mapped ranges
+  -> close any retained lease
 ```
 
 A partial CUDA registration that cannot be rolled back aborts startup and keeps
-the mapping and lease alive for cleanup retry. A safely rolled-back
-registration error selects bounded staging. The optional
-`--dlo-host-registration-limit-gib` ceiling applies only to this
-artifact-backed registered transport.
+the mapping and lease alive for cleanup retry. A safely rolled-back registration
+error selects bounded staging. The optional
+`--dlo-host-registration-limit-gib` ceiling applies only to the registered
+no-AllGather HWR transport.
 
 #### Shared eligibility and fallback rules
 
 Both BF16 paths require default loading, no quantization, no static/merged LoRA,
-TP-compatible checkpoint bindings, non-HSDP ownership, and model-declared host
-weight contracts. HWR-disabled or DLO-disabled configurations stop before
-source identity or store interaction.
+non-HSDP ownership, and model-declared host-weight contracts. HWR-disabled or
+DLO-disabled configurations stop before source identity or store interaction.
 
 The loader continues to load VAE, text encoders, and other components outside
-the owned DiT source prefixes normally. Any plan that skips ordinary DiT
-materialization must cover every required parameter and persistent buffer;
-otherwise startup fails closed before DLO can consume a partial plan.
+the owned DiT source prefixes normally. An HWR hit must cover every required
+parameter and persistent buffer; otherwise restore planning fails without
+mutating the model and the complete cohort follows policy together.
 
-Promotion checks for the checkpoint-derivation AllGather path are:
+Promotion checks for artifact-backed AllGather are:
 
-- no copied checkpoint-sized payload appears below the HWR root;
-- all ranks agree on source identity, source content, checkpoint bindings, and
+- required mode rejects an empty or mismatched HWR store;
+- preferred cold startup publishes a validated artifact and required warm
+  startup restores it without ordinary DiT loading;
+- all ranks agree on artifact identity, artifact content, restore status, and
   the final transport plan;
-- each rank retains only its persistent padded CPU shard after setup;
-- source files changed after identity resolution are rejected;
+- each rank keeps only its persistent padded CPU shard and releases its artifact
+  mapping before the first weight collective;
 - disabled and ineligible configurations preserve the existing canonical path;
-- DP2/SP2 and DP4/SP1 produce output parity with HWR-disabled checkpoint mmap;
-  and
+- DP2/SP2 and DP4/SP1 produce output parity with HWR-disabled DLO; and
 - startup latency, aggregate PSS/RSS, HBM, and shutdown residue are measured
   against that same-topology baseline.
 

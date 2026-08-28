@@ -12,12 +12,7 @@ from collections.abc import Callable
 from .config import HostWeightRuntimeConfig, RemoteOnMiss, RuntimeMode
 from .errors import FailureCode, HostWeightError, HostWeightFailure, ResolutionAction, ResolutionStage
 from .identity import CanonicalJson, WeightArtifactIdentity
-from .lease import (
-    HostWeightDerivationLease,
-    HostWeightLease,
-    SourceDerivationProvenance,
-    SourceDerivationSpec,
-)
+from .lease import HostWeightLease
 from .outcomes import (
     AttemptResult,
     HostWeightResolution,
@@ -240,91 +235,6 @@ class HostWeightRuntime:
 
         return self._finish_terminal(tuple(attempts), started)
 
-    def resolve_derivation(self, spec: SourceDerivationSpec) -> HostWeightResolution:
-        """Authorize deferred derivation before optional artifact materialization."""
-        started = time.monotonic()
-        resolution_id = uuid.uuid4().hex
-        if not self.enabled:
-            return self._finish(
-                ResolutionReport(
-                    resolution_id=resolution_id,
-                    outcome=ResolutionOutcome.CANONICAL_DIRECT,
-                    attempts=(),
-                    elapsed_seconds=time.monotonic() - started,
-                )
-            )
-        if self._initialization_failure is not None:
-            failure = self._initialization_failure
-            return self._finish_terminal(
-                (
-                    ResolutionAttempt(
-                        stage=failure.stage,
-                        result=AttemptResult.ERROR,
-                        action=self._action_for_failure(failure),
-                        elapsed_seconds=time.monotonic() - started,
-                        failure=failure,
-                    ),
-                ),
-                started,
-            )
-
-        validation_started = time.monotonic()
-        validation_failure: HostWeightFailure | None
-        try:
-            spec.validate_source()
-        except HostWeightError as exc:
-            validation_failure = exc.failure
-        except Exception as exc:
-            validation_failure = HostWeightFailure(
-                stage=ResolutionStage.VALIDATION,
-                code=FailureCode.CANONICAL_SOURCE_FAILED,
-                retryable=True,
-                message=f"canonical source derivation validation failed: {exc}",
-                details=CanonicalJson.from_value({"exception_type": type(exc).__name__}),
-            )
-        else:
-            validation_failure = None
-        if validation_failure is not None:
-            return self._finish_terminal(
-                (
-                    ResolutionAttempt(
-                        stage=validation_failure.stage,
-                        result=AttemptResult.ERROR,
-                        action=self._action_for_failure(validation_failure),
-                        elapsed_seconds=time.monotonic() - validation_started,
-                        failure=validation_failure,
-                    ),
-                ),
-                started,
-            )
-
-        lease = HostWeightDerivationLease(
-            spec,
-            SourceDerivationProvenance(
-                resolution_id=resolution_id,
-                identity_digest=spec.identity.key,
-                source_content_digest=spec.source_content_digest,
-                plan_digest=spec.plan_digest,
-                validation_level=self.config.integrity.local_lookup.value,
-            ),
-        )
-        return self._finish(
-            ResolutionReport(
-                resolution_id=resolution_id,
-                outcome=ResolutionOutcome.SOURCE_DERIVATION,
-                attempts=(
-                    ResolutionAttempt(
-                        stage=ResolutionStage.VALIDATION,
-                        result=AttemptResult.HIT,
-                        action=ResolutionAction.RETURN_LEASE,
-                        elapsed_seconds=time.monotonic() - validation_started,
-                    ),
-                ),
-                elapsed_seconds=time.monotonic() - started,
-            ),
-            lease=lease,
-        )
-
     def publish_after_load(
         self,
         identity: WeightArtifactIdentity | None = None,
@@ -535,7 +445,7 @@ class HostWeightRuntime:
         self,
         report: ResolutionReport,
         *,
-        lease: HostWeightLease | HostWeightDerivationLease | None = None,
+        lease: HostWeightLease | None = None,
     ) -> HostWeightResolution:
         if self._observer is not None:
             try:

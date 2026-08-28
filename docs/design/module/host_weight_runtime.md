@@ -22,52 +22,35 @@ last_reviewed: 2026-08-25
 # Host Weight Runtime
 
 The Host Weight Runtime is a loader-adjacent, transport-independent foundation
-for managing immutable weights from canonical source through an optional
-runtime-ready artifact. It separates the semantic question—"can this source or
-artifact derive exactly the weights this loader requested?"—from the physical
-question—"when and where is the validated representation materialized?"
+for reusing immutable, runtime-ready model weights. It separates the semantic
+question—"are these exactly the weights this loader requested?"—from the
+physical question—"where is the validated host representation stored?"
 
 The runtime can save repeated checkpoint loading, transformation, and peak host
 memory when several workers need the same final representation. It also creates
 a second, versioned path for reconstructing a valid model, so a cache miss or
 recoverable store failure normally falls back to the canonical loader.
 
-This module does not enable host-weight reuse for any model by itself. Every
-model integration must provide an exact identity. An artifact integration also
-provides a producer/restorer contract, while a pre-artifact integration
-provides an exact derivation plan and source validator. For feature behavior
-and consumer integration requirements, see the
+This module does not enable host-weight caching for any model by itself. A model
+integration must still provide an exact identity, a producer, and a restorer.
+For feature behavior and consumer integration requirements, see the
 [Host Weight Runtime feature design](../feature/host_weight_runtime.md).
 
 ## Component boundary
 
 ```mermaid
 flowchart LR
-    CS["Canonical model source"] --> DS["Exact identity + derivation semantics"]
-    LA["Model loader adapter"] --> DS
-    DS -->|"defer materialization"| RTD["HostWeightRuntime.resolve_derivation"]
-    DS -->|"artifact identity"| RTA["HostWeightRuntime.resolve"]
-    DS -->|"materialize final layout"| PR["WeightProducer"]
-    RTA -->|"lookup / get_or_build"| ST["HostWeightStore"]
-    PR -->|"runtime-ready tensors"| ST
+    LA["Model loader adapter"] -->|"exact identity + policy"| RT["HostWeightRuntime"]
+    RT -->|"lookup / get_or_build"| ST["HostWeightStore"]
+    PR["WeightProducer"] -->|"runtime-ready tensors"| ST
     ST -->|"validated mmap views"| LE["HostWeightLease"]
     LE --> RE["WeightRestorer"]
     RE --> MO["Restored host model"]
     MO --> TR["DLO or another GPU transport"]
-    RTD -->|"validated pre-artifact lifetime"| DL["HostWeightDerivationLease"]
-    DL --> TR
+
+    CS["Canonical model source"] --> PR
     LA -. "fallback" .-> CS
 ```
-
-This is one derivation lineage with two materialization points:
-
-```text
-canonical source -> exact derivation -> optional runtime-ready artifact
-```
-
-`HostWeightDerivationLease` stops before full artifact materialization;
-`HostWeightLease` starts after it. They are alternative resolution results for
-different consumers, but the underlying source and artifact are not peers.
 
 The contracts have deliberately narrow ownership:
 
@@ -80,10 +63,6 @@ The contracts have deliberately narrow ownership:
   publication, validation, quarantine, and lifecycle.
 - `HostWeightLease` owns process-local tensor views, mapped-file resources, and
   the shared artifact lock that stabilizes their lifetime.
-- `HostWeightDerivationLease` owns the pre-artifact authorization boundary for
-  one exact source-content and binding-plan digest. The consumer owns its
-  model-specific plan and source mappings, validates the lease around mmap
-  realization, and closes it after releasing those mappings.
 - `WeightProducer` creates one declared final-layout representation. It writes
   only through a store-scoped writer and cannot publish paths directly.
 - `WeightRestorer` validates a lease-to-model plan without mutation. Its
@@ -109,10 +88,8 @@ Loader integrations may persist content digests for canonical source shards in
 the selected storage domain. Reuse requires the same path, inode, size,
 timestamps, symlink target, and cache-record checksum. Corrupt records are
 rebuilt, and coordination or cache-I/O failure falls back to hashing the
-canonical source directly. The digest cache is not a second source of truth.
-For an artifact consumer it remains identity-computation metadata; for a
-derivation consumer the digest and an exact binding-plan fingerprint become the
-validated input to a process-local derivation lease.
+canonical source directly. This is an identity-computation optimization, not a
+second source of truth or an artifact substitution rule.
 
 The identity excludes transfer policy such as registered mmap versus private
 pinned staging. Those paths move the same host representation and must not
@@ -133,7 +110,7 @@ adapter is a distinct artifact identity with its own fingerprint.
 ## Deterministic resolution
 
 The loader first resolves the canonical source and computes the exact requested
-identity. Artifact consumers then follow this order:
+identity. The runtime then follows this order:
 
 ```text
 validated local artifact
@@ -146,21 +123,12 @@ An already published local artifact wins because it avoids network transfer and
 is already in node-accessible storage. "Wins" means the highest-priority valid
 representation, not whichever backing responds first.
 
-A derivation-capable consumer operates one stage earlier. It constructs a
-`SourceDerivationSpec` containing the exact representation identity, canonical
-source-content digest, binding/transform-plan digest, and source validator.
-`resolve_derivation()` applies the same preferred/required failure policy and
-returns `SOURCE_DERIVATION` plus `HostWeightDerivationLease`; it neither looks
-up nor publishes an artifact. This is a controlled shortcut around full
-materialization, not a peer source store or an artifact substitution.
-
 Configuration modes are:
 
 - `disabled`: return the canonical-direct outcome without probing a root,
   credentials, topology, or identity;
 - `preferred`: recoverable store failures may return canonical fallback; and
-- `required`: fail when the selected artifact or derivation path cannot acquire
-  its exact lease.
+- `required`: fail when no exact lease can be acquired.
 
 Failure-to-action policy is centralized in `HostWeightRuntime`. A clean miss or
 invalid cache artifact may fall back in preferred mode. A typed failure may do
@@ -307,9 +275,8 @@ transport controls registration or page locking.
 
 ## First implementation scope
 
-The foundation implements process-local source-derivation resolution, a CPU
-local filesystem store, and `SINGLE_PROCESS` production for one exact artifact.
-It intentionally adds no:
+The foundation implements a CPU local filesystem store and
+`SINGLE_PROCESS` production for one exact artifact. It intentionally adds no:
 
 - public CLI or DLO configuration;
 - BF16, FP8, or model-specific producer/restorer;

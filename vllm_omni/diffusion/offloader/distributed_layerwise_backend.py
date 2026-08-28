@@ -36,7 +36,6 @@ from vllm_omni.diffusion.model_loader.host_weight_plan import (
 )
 from vllm_omni.host_weight_runtime import (
     CanonicalJson,
-    HostWeightDerivationLease,
     HostWeightLease,
 )
 from vllm_omni.platforms import current_omni_platform
@@ -1043,7 +1042,8 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self._using_runtime_lease = False
         self.host_weight_plan = host_weight_plan
         self._host_weight_lease: HostWeightLease | None = None
-        self._host_weight_derivation_lease: HostWeightDerivationLease | None = None
+        self._hwr_identity_digest: str | None = None
+        self._hwr_content_digest: str | None = None
         self._host_registration: HostRegistration | None = None
         self._release_runtime_source_pages: Callable[[torch.Tensor], None] | None = None
         self._mmap_transforms_by_tensor_id: dict[int, Any] = {}
@@ -1439,7 +1439,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         plan = self.host_weight_plan
         return bool(
             plan is not None
-            and plan.backing_kind in {"host_weight_runtime", "host_weight_runtime_derivation"}
+            and plan.backing_kind == "host_weight_runtime"
             and self.config.dlo_use_allgather
             and self.dp_size > 1
         )
@@ -1448,18 +1448,14 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         """Hash the collective contract that must be identical on every rank."""
 
         def hook_layout(hook: DistributedLayerwiseOffloadHook) -> dict[str, object]:
-            module_path = self._module_paths_by_id.get(id(hook.next_block))
-            if module_path is None:
-                raise RuntimeError("BF16 HWR AllGather could not resolve a hooked block's module path")
             dtypes: list[dict[str, object]] = []
             for dtype in sorted(hook.metadata, key=str):
                 metadata = hook.metadata[dtype]
-                shard = hook.cpu_shards.get(dtype)
                 dtypes.append(
                     {
                         "dtype": str(dtype),
-                        "shard_numel": shard.numel() if shard is not None else None,
-                        "allgather_output_numel": hook._ag_output_sizes.get(dtype),
+                        "shard_numel": hook.cpu_shards[dtype].numel(),
+                        "allgather_output_numel": hook._ag_output_sizes[dtype],
                         "tensors": [
                             {
                                 "name": item["name"],
@@ -1473,7 +1469,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                     }
                 )
             return {
-                "module_path": module_path,
+                "module_path": self._module_paths_by_id[id(hook.next_block)],
                 "dtypes": dtypes,
             }
 
@@ -1498,30 +1494,14 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         digest = None
         if error is None:
             digest = self._transport_plan_digest(hooks or [])
-        artifact_lease = self._host_weight_lease
-        derivation_lease = self._host_weight_derivation_lease
-        artifact_provenance = artifact_lease.provenance if artifact_lease is not None else None
-        derivation_provenance = derivation_lease.provenance if derivation_lease is not None else None
         local = {
             "status": "ready" if error is None else "error",
             "error_type": None if error is None else type(error).__name__,
             "group_size": self.dp_size,
             "group_rank": self.rank,
             "group_ranks": list(self._group_ranks),
-            "identity_digest": (
-                artifact_provenance.identity_digest
-                if artifact_provenance is not None
-                else derivation_provenance.identity_digest
-                if derivation_provenance is not None
-                else None
-            ),
-            "content_digest": (
-                artifact_provenance.artifact_content_sha256
-                if artifact_provenance is not None
-                else derivation_provenance.source_content_digest
-                if derivation_provenance is not None
-                else None
-            ),
+            "identity_digest": self._hwr_identity_digest,
+            "content_digest": self._hwr_content_digest,
             "transport_digest": digest,
         }
         gathered: list[object] = [None] * self.dp_size
@@ -1532,29 +1512,23 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         )
         self._hwr_setup_consensus_finished = True
 
-        records = [record for record in gathered if isinstance(record, dict)]
-        if len(records) != self.dp_size:
-            raise RuntimeError("BF16 HWR AllGather setup consensus returned malformed rank records")
-        expected_group = list(self._group_ranks)
-        if (
-            any(record.get("group_size") != self.dp_size for record in records)
-            or any(record.get("group_ranks") != expected_group for record in records)
-            or {record.get("group_rank") for record in records} != set(range(self.dp_size))
-        ):
-            raise RuntimeError("BF16 HWR AllGather process-group resolution differs across ranks")
-
-        failed = [record.get("group_rank") for record in records if record.get("status") != "ready"]
+        records = cast(list[dict[str, object]], gathered)
+        failed = [record["group_rank"] for record in records if record["status"] != "ready"]
         if failed:
             raise RuntimeError(f"BF16 HWR AllGather setup failed on group ranks {failed}; rolling back all ranks")
 
-        for field, label in (
-            ("identity_digest", "weight identity"),
-            ("content_digest", "weight content"),
-            ("transport_digest", "transport plan"),
-        ):
-            values = {record.get(field) for record in records}
-            if len(values) != 1 or None in values:
-                raise RuntimeError(f"BF16 HWR AllGather {label} differs across ranks")
+        contracts = {
+            (
+                record["group_size"],
+                tuple(cast(list[int], record["group_ranks"])),
+                record["identity_digest"],
+                record["content_digest"],
+                record["transport_digest"],
+            )
+            for record in records
+        }
+        if len(contracts) != 1:
+            raise RuntimeError("BF16 HWR AllGather setup contract differs across ranks")
 
         logger.info("BF16 HWR AllGather setup consensus passed: transport=%s", digest)
 
@@ -1877,6 +1851,8 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 self._host_weight_lease = cast(HostWeightLease, carrier.take())
                 if self._host_weight_lease.closed:
                     raise RuntimeError("DLO received a closed Host Weight Runtime lease")
+                self._hwr_identity_digest = self._host_weight_lease.provenance.identity_digest
+                self._hwr_content_digest = self._host_weight_lease.provenance.artifact_content_sha256
                 # The final-layout restorer has already rebound the model to
                 # immutable host tensors. Single-rank DLO selects registered
                 # direct H2D or bounded staging; multi-rank DLO extracts one
@@ -1890,31 +1866,13 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                     self._host_weight_lease.provenance.resolution_id,
                     "bounded rank-local staging" if self._using_rank_local_mmap else "sharded AllGather",
                 )
-            elif host_weight_plan.backing_kind in {"checkpoint_mmap", "host_weight_runtime_derivation"}:
-                if host_weight_plan.backing_kind == "host_weight_runtime_derivation":
-                    carrier = host_weight_plan.lease_carrier
-                    if carrier is None:
-                        raise RuntimeError("DLO received an HWR derivation plan without a lease carrier")
-                    lease = carrier.take()
-                    if not isinstance(lease, HostWeightDerivationLease):
-                        lease.close()
-                        raise TypeError("DLO derivation plan received a non-derivation HWR lease")
-                    self._host_weight_derivation_lease = lease
-                    self._using_runtime_lease = True
-                    lease.ensure_source_unchanged()
+            elif host_weight_plan.backing_kind == "checkpoint_mmap":
                 self._using_rank_local_mmap = self.dp_size <= 1
                 self._load_weights_via_mmap(
                     pipeline,
                     modules,
                     host_weight_plan,
                 )
-                if host_weight_plan.backing_kind == "host_weight_runtime_derivation":
-                    assert self._host_weight_derivation_lease is not None
-                    self._host_weight_derivation_lease.ensure_source_unchanged()
-                    logger.info(
-                        "DLO consuming BF16 HWR derivation lease %s via sharded AllGather",
-                        self._host_weight_derivation_lease.provenance.resolution_id,
-                    )
             else:
                 raise ValueError(f"Unsupported DLO host-weight backing: {host_weight_plan.backing_kind}")
             if self._using_rank_local_mmap:
@@ -2103,8 +2061,14 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self._configure_hwr_transfer(all_hooks)
 
         if not self._all_hook_groups:
+            if self._using_runtime_lease:
+                self._release_mmap_handles()
+            # A peer may have discovered a different hook topology or failed
+            # while constructing it.  Join the same pre-collective decision
+            # before this rank takes the otherwise-valid early return.
+            self._coordinate_hwr_allgather_setup(None, all_hooks)
             self.enabled = bool(self._resident_blocks)
-            if self._using_runtime_lease or (self._using_mmap and not self.enabled):
+            if self._using_mmap and not self._using_runtime_lease and not self.enabled:
                 self._release_mmap_handles()
             self._module_paths_by_id.clear()
             return
@@ -2149,10 +2113,17 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 hook._group_id = group_idx
                 hook._shared_slot_group = shared_slot_group
 
+        if self._using_runtime_lease:
+            # Local setup has copied every artifact-backed tensor into its
+            # persistent shard. Release before the final rendezvous so a close
+            # failure is reported to peers instead of letting them enter the
+            # first weight collective.
+            self._release_mmap_handles()
         # No rank may enter the first weight collective until every rank has
-        # extracted compatible local shards and allocated the same buffers.
-        # A local exception reaches the same rendezvous from enable()'s error
-        # path, so successful peers roll back instead of hanging in prefetch.
+        # extracted compatible local shards, released its artifact mapping,
+        # and allocated the same buffers. A local exception reaches the same
+        # rendezvous from enable()'s error path, so successful peers roll back
+        # instead of hanging in prefetch.
         self._coordinate_hwr_allgather_setup(None, all_hooks)
         self._module_paths_by_id.clear()
 
@@ -2164,11 +2135,10 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # pre_forward will sync-prefetch on-demand via the is_materialized
         # check — by which point the first group's forward has completed
         # and its buffer slots are free.
-        if self._all_hook_groups:
-            group = self._all_hook_groups[0]
-            first_slot = group[0].current_slot
-            group[-1].prefetch_layer(slot=first_slot, non_blocking=False)
-            group[-1].get_weights(first_slot)
+        group = self._all_hook_groups[0]
+        first_slot = group[0].current_slot
+        group[-1].prefetch_layer(slot=first_slot, non_blocking=False)
+        group[-1].get_weights(first_slot)
 
         total_blocks = sum(len(b) for b in self._blocks)
         logger.info(
@@ -2179,7 +2149,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
 
         self.enabled = True
 
-        if self._using_mmap and not self._using_rank_local_mmap:
+        if self._using_mmap and not self._using_rank_local_mmap and not self._using_runtime_lease:
             # AllGather mode copied each rank's persistent shard, so the source
             # mappings are no longer needed. Rank-local mode retains them as
             # the node-shared host master until disable().
@@ -2218,15 +2188,10 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 hook.release_source_pages = None
         lease = self._host_weight_lease
         self._host_weight_lease = None
-        derivation_lease = self._host_weight_derivation_lease
-        self._host_weight_derivation_lease = None
         self._release_runtime_source_pages = None
         if lease is not None and not lease.closed:
             lease.close()
             logger.info("Released Host Weight Runtime lease %s", lease.provenance.resolution_id)
-        if derivation_lease is not None and not derivation_lease.closed:
-            derivation_lease.close()
-            logger.info("Released Host Weight Runtime derivation lease %s", derivation_lease.provenance.resolution_id)
         if self.host_weight_plan is not None and self.host_weight_plan.lease_carrier is not None:
             self.host_weight_plan.lease_carrier.close()
 
@@ -2244,12 +2209,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             pass
 
     def disable(self) -> None:
-        has_open_lease = (
-            self._host_weight_lease is not None
-            and not self._host_weight_lease.closed
-            or self._host_weight_derivation_lease is not None
-            and not self._host_weight_derivation_lease.closed
-        )
+        has_open_lease = self._host_weight_lease is not None and not self._host_weight_lease.closed
         has_registration = self._host_registration is not None
         has_carrier = (
             self.host_weight_plan is not None
@@ -2295,6 +2255,8 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self._using_rank_local_mmap = False
         self._using_registered_mmap = False
         self._using_runtime_lease = False
+        self._hwr_identity_digest = None
+        self._hwr_content_digest = None
         self._module_paths_by_id.clear()
         self._hwr_setup_consensus_finished = False
         self.enabled = False

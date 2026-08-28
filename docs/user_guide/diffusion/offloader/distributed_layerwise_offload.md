@@ -1,11 +1,11 @@
 # Distributed Layerwise Offloading
 
 Distributed layerwise offloading (DLO) extends block streaming to multi-device
-deployments. With AllGather enabled, each rank stores roughly `1 / dp_size` of
-the host weights and reconstructs each layer at runtime. Without AllGather,
-each rank streams a complete block independently. Compatible TP1 deployments
-can share checkpoint-backed host pages among processes on the same node;
-otherwise DLO streams the ordinary loader's rank-local tensors.
+deployments. With AllGather enabled, each rank supplies roughly `1 / dp_size`
+of a block from persistent host memory and reconstructs it at runtime. Without
+AllGather, each rank streams a complete block independently.
+Compatible TP1 deployments can share mmap-backed host pages among processes on
+the same node; otherwise DLO streams the ordinary loader's rank-local tensors.
 
 See the [DLO feature design](../../../design/feature/offloader/distributed_layerwise_offload.md)
 for the implementation contract and compatibility matrix.
@@ -63,7 +63,7 @@ omni = Omni(
 | `--dlo-use-allgather` | Shard host weights and reconstruct with AllGather | `true` |
 | `--dlo-no-use-allgather` | Stream complete rank-local blocks without a DLO weight collective | `false` |
 | `--dlo-resident-layers N` | Keep N leading main-DiT blocks on device; requires no-AllGather and model-declared resident paths | `0` |
-| `--host-weight-runtime-mode {disabled,preferred,required}` | HWR policy: disabled, prefer an exact derivation/artifact with fallback, or require it | `disabled` |
+| `--host-weight-runtime-mode {disabled,preferred,required}` | HWR policy: disabled, prefer an exact artifact with fallback, or require an exact artifact | `disabled` |
 | `--host-weight-runtime-root PATH` | Writable node-local HWR store shared by workers in one storage domain; required for `preferred` and `required` | unset |
 | `--dlo-host-registration-limit-gib N` | Optional per-worker ceiling for registering an HWR mmap; zero adds no ceiling | `0` |
 
@@ -109,13 +109,13 @@ perform a collective and uses the same rank-local transfer behavior.
 
 ### BF16 Host Weight Runtime
 
-HWR is opt-in for models that declare the BF16 host-weight contract:
-
-The validated BF16 model contracts currently cover MiniMax H3 and
-`black-forest-labs/FLUX.2-klein-4B`. FLUX.2-klein-9B shares the same model
-class but has not been validated against this contract. FLUX.2-dev, online
-FP8, HSDP, LoRA/adapted weights, and non-default load formats remain outside
-the validated scope.
+HWR is opt-in for models that declare the BF16 final-layout artifact contract.
+The current AllGather promotion target is MiniMax H3 on DP2/TP1.
+FLUX.2-klein-4B declares and validates the same artifact contract, but its
+AllGather transport remains outside the promoted end-to-end scope until
+model-specific CUDA evidence is added. FLUX.2-klein-9B, FLUX.2-dev, online FP8,
+HSDP, LoRA/adapted weights, and non-default load formats remain outside the
+validated scope.
 
 ```bash
 vllm serve /path/to/model --omni \
@@ -124,47 +124,36 @@ vllm serve /path/to/model --omni \
   --host-weight-runtime-root /var/cache/vllm-omni/hwr
 ```
 
-BF16 selects where to materialize runtime-ready weights according to the DLO
-transfer. The checkpoint source precedes the optional HWR artifact; it is not a
-parallel artifact format.
+Both DLO transports consume the same finalized HWR artifact:
+
+| DLO transfer | Exact-hit behavior |
+| --- | --- |
+| AllGather with more than one rank | Copy one persistent padded CPU shard per rank, release the artifact mapping during setup, and reconstruct complete blocks with the existing collective |
+| No-AllGather | Restore the artifact and retain its mapping as the host master through service |
+
+The policy is identical for both transports:
+
+- `preferred` restores an exact hit; on a miss the complete cohort uses
+  canonical loading and may publish an artifact for the next startup;
+- `required` consumes only an existing exact artifact and fails the complete
+  cohort if any rank misses or cannot validate/restore it.
+
+Populate every node-local HWR storage domain with a matching preferred startup
+before switching to required:
 
 ```text
-checkpoint source -> exact derivation plan
-                  -> AllGather derives shards on demand
-                  -> no-AllGather may consume a materialized HWR artifact
+preferred cold startup -> canonical load -> publish final-layout artifact
+required warm startup  -> exact artifact hit -> restore -> DLO transport
 ```
 
-| DLO transfer | HWR resolution | Startup behavior |
-| --- | --- | --- |
-| AllGather with more than one rank | Pre-artifact checkpoint derivation lease | Validate one exact binding plan across the group, mmap the original files, retain only each rank's DLO shard, then release the mappings and lease |
-| No-AllGather | Final-layout HWR artifact | Restore an exact artifact lease and retain its mapping through service |
+Every AllGather rank must agree on eligibility, artifact identity and content,
+restore planning, commit, warm finalization, and final transport layout. A
+rank-local failure is reported at the same rendezvous by every peer, so no rank
+returns early while another enters a collective.
 
-For AllGather, HWR does not create a second BF16 checkpoint. The HWR root stores
-only small source-digest records; it must not contain copied payload
-`.safetensors` files. `required` means that source identity, mmap bindings,
-derivation resolution, and group consensus must all succeed. It does not
-require a prior preferred startup or a pre-populated artifact.
-
-For no-AllGather, the existing artifact modes remain unchanged:
-
-- `preferred` restores an exact hit, or canonically loads and may publish an
-  artifact for the next startup;
-- `required` consumes only an existing exact artifact and fails on a miss.
-
-The AllGather derivation plan recognizes immutable Hugging Face snapshot blobs.
-Local checkpoint files are hashed once and their digests are reused only while
-file identity and timestamps remain unchanged.
-
-Every AllGather rank must agree on the source identity, source-content digest,
-checkpoint bindings, and final DLO transport layout before the first weight
-collective. A mismatch fails the complete group. After setup, source
-safetensors handles are closed and only the persistent local DLO shard remains.
-
-Registered direct H2D and
-`--dlo-host-registration-limit-gib` apply to artifact-backed no-AllGather
-leases. The checkpoint-derivation AllGather path uses the existing
-shard-and-AllGather transport and does not register or retain a full-model HWR
-artifact mapping.
+Registered direct H2D and `--dlo-host-registration-limit-gib` apply only to the
+no-AllGather HWR transport. AllGather closes the artifact lease after extracting
+its persistent rank-local CPU shard during backend setup.
 
 ## Declarative topology
 

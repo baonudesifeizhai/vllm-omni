@@ -1,10 +1,10 @@
 # Host Weight Runtime
 
-The Host Weight Runtime is a loader-facing feature for managing the path from
-an immutable canonical source to runtime-ready model weights on one host. A
-consumer may acquire a previously materialized artifact, or hold a validated
-source-derivation lease and defer bounded transformations to transport. The
-canonical model source remains authoritative in both cases.
+The Host Weight Runtime is a loader-facing feature for reusing immutable,
+runtime-ready model weights across workers on one host. It lets a model
+integration replace repeated checkpoint loading and transformation with an
+exact lookup of a previously published host representation, while keeping the
+canonical model source authoritative.
 
 This feature is shared infrastructure. Diffusion, autoregressive, speech, and
 future model integrations may depend on the top-level
@@ -18,17 +18,18 @@ The implementation provides contracts and a CPU local-filesystem store. The
 diffusion consumer additionally defines typed,
 representation-independent final-layout identity/restoration mechanics plus a
 concrete BF16-with-preserved-FP32 policy for MiniMax H3 and
-`black-forest-labs/FLUX.2-klein-4B`. No-AllGather DLO consumes materialized
-artifacts; BF16 multi-rank AllGather consumes a validated pre-artifact
-derivation from the original checkpoint.
+`black-forest-labs/FLUX.2-klein-4B`. The opt-in DLO integration selects,
+publishes, restores, and transfers these artifacts. Multi-rank AllGather copies
+one persistent rank-local shard from the validated artifact before releasing
+its mapping; no-AllGather retains the artifact mapping through service. The
+promoted AllGather consumer is currently MiniMax H3 BF16; FLUX.2-klein-4B does
+not claim AllGather end-to-end support without model-specific CUDA evidence.
 
 V1 includes:
 
 - exact runtime-weight identity and immutable manifests;
 - coordinated local lookup and one-producer publication;
 - descriptor-backed safetensors mmap leases;
-- process-local source-derivation leases for consumers that can defer
-  deterministic transforms without materializing a second full artifact;
 - preferred and required resolution policy;
 - explicit, separately reported post-load publication;
 - validation, deny, quarantine, cleanup, and capacity controls; and
@@ -38,7 +39,6 @@ V1 does not include:
 
 - default-on activation or consumers outside DLO;
 - online FP8, quantized, merged-adaptation, or additional model producers;
-- source derivation for models other than the declared BF16 DLO consumers;
 - a remote artifact provider or cross-node coordination;
 - automatic eviction; or
 - a change to DLO collective or execution behavior.
@@ -65,11 +65,10 @@ Typical consumers include same-node diffusion replicas, DLO host-weight
 sources, and future transformed or quantized model loaders. Request routing and
 replica orchestration remain outside this feature.
 
-This feature is not zero-copy GPU execution. An artifact lease exposes stable
-CPU tensor views and mapped ranges. A derivation lease instead validates one
-exact source and transform plan while the consumer owns any checkpoint
-mappings. A separate transport still decides whether to use registered mmap,
-private pinned staging, synchronous copies, or asynchronous H2D transfer.
+This feature is not zero-copy GPU execution. A lease exposes stable CPU tensor
+views and mapped ranges. A separate transport still decides whether to use
+registered mmap, private pinned staging, synchronous copies, or asynchronous
+H2D transfer.
 
 ## Resolution behavior
 
@@ -78,14 +77,10 @@ requested identity before asking the runtime for a representation.
 
 ```mermaid
 flowchart TD
-    L["Loader resolves canonical source"] --> I["Compute exact identity and derivation semantics"]
+    L["Loader resolves canonical source"] --> I["Compute exact WeightArtifactIdentity"]
     I --> M{"Runtime mode"}
     M -->|"disabled"| C["Canonical loader"]
-    M -->|"preferred or required"| SD{"Defer full materialization?"}
-    SD -->|"yes"| V["Validate source and exact derivation plan"]
-    V -->|"valid"| DL["Return HostWeightDerivationLease"]
-    V -->|"invalid"| F
-    SD -->|"no"| A{"Validated local artifact?"}
+    M -->|"preferred or required"| A{"Validated local artifact?"}
     A -->|"yes"| R["Return HostWeightLease"]
     A -->|"no"| X["Remote exact artifact (future)"]
     X --> P{"Registered producer available?"}
@@ -99,30 +94,17 @@ flowchart TD
     W -->|"yes"| B2["Publish final model through POST_LOAD_ONLY producer"]
     B2 --> CL["Close validated publication lease"]
     CL --> R2["Return separate publication report"]
-    R2 --> K
-    W -->|"no"| K["Keep canonical model"]
+    R2 --> D
+    W -->|"no"| D["Keep canonical model"]
 ```
-
-The source and artifact are consecutive stages, not peer backing formats:
-
-```text
-canonical checkpoint source
-  -> exact identity plus derivation semantics
-     -> defer full materialization: HostWeightDerivationLease
-     -> optionally materialize final layout: artifact -> HostWeightLease
-```
-
-The consumer selects the materialization point before resolution. HWR applies
-policy and validates the selected path; it does not dynamically race a source
-derivation against an artifact lookup.
 
 The modes are:
 
 | Mode | Observable behavior |
 | --- | --- |
 | `disabled` | Use canonical loading directly without probing storage, identity, credentials, or topology. |
-| `preferred` | Return an exact artifact or derivation lease when available; otherwise use canonical fallback only for a miss, invalid input, or typed retryable failure. |
-| `required` | Fail when the selected path cannot acquire an exact artifact or derivation lease. |
+| `preferred` | Return an exact lease when available; otherwise use canonical fallback only for a miss, invalid cache entry, or typed retryable failure. |
+| `required` | Fail when an exact lease cannot be acquired. |
 
 During pre-load resolution, an unsupported capability, semantic identity
 collision, producer failure, or publication failure is nonretryable and remains
@@ -134,12 +116,7 @@ miss.
 ## Loader and restoration sequence
 
 The model integration owns the end-to-end loading transaction. The runtime
-does not construct a model, build model-specific checkpoint bindings, or invoke
-the canonical loader. A derivation-capable consumer first constructs and
-fingerprints its exact binding/transform plan, then calls
-`resolve_derivation()`. A successful resolution returns a process-local lease;
-the consumer validates it immediately before and after realizing checkpoint
-mappings and closes it only after those mappings are released.
+does not construct a model or invoke the canonical loader.
 
 ```mermaid
 sequenceDiagram
@@ -151,52 +128,39 @@ sequenceDiagram
     participant T as GPU transport
 
     L->>L: Resolve canonical revision and exact identity
-    alt defer full materialization
-        L->>R: resolve_derivation(exact source and plan)
-        R->>R: validate canonical source
-        alt valid source derivation
-            R-->>L: HostWeightDerivationLease and SOURCE_DERIVATION
-        else retryable failure in preferred mode
-            R-->>L: CANONICAL_FALLBACK
-            L->>L: Run canonical loader
-        else required or nonretryable failure
-            R-->>L: FAILED report
-        end
-    else resolve materialized artifact
-        L->>R: resolve(identity, producer)
-        R->>S: lookup(exact identity)
-        alt validated hit
-            S-->>R: HostWeightLease
-            R-->>L: lease and LOCAL_HIT report
-            L->>X: plan_restore(model, lease)
-            X-->>L: validation-only restore plan
-            L->>X: commit() once
-        else miss with allowed producer
+    L->>R: resolve(identity, producer)
+    R->>S: lookup(exact identity)
+    alt validated hit
+        S-->>R: HostWeightLease
+        R-->>L: lease and LOCAL_HIT report
+        L->>X: plan_restore(model, lease)
+        X-->>L: validation-only restore plan
+        L->>X: commit() once
+    else miss with allowed producer
+        R->>S: get_or_build(identity, producer)
+        S->>P: produce(store-scoped writer)
+        P-->>S: final-layout tensors and metadata
+        S-->>R: validated HostWeightLease
+        R-->>L: lease and LOCAL_PRODUCTION report
+        L->>X: plan_restore(model, lease)
+        X-->>L: validation-only restore plan
+        L->>X: commit() once
+    else policy permits canonical fallback
+        R-->>L: CANONICAL_FALLBACK
+        L->>L: Run canonical loader
+        opt explicit post-load publication enabled
+            L->>R: publish_after_load(identity, POST_LOAD_ONLY producer)
             R->>S: get_or_build(identity, producer)
-            S->>P: produce(store-scoped writer)
-            P-->>S: final-layout tensors and metadata
-            S-->>R: validated HostWeightLease
-            R-->>L: lease and LOCAL_PRODUCTION report
-            L->>X: plan_restore(model, lease)
-            X-->>L: validation-only restore plan
-            L->>X: commit() once
-        else policy permits canonical fallback
-            R-->>L: CANONICAL_FALLBACK
-            L->>L: Run canonical loader
-            opt explicit post-load publication enabled
-                L->>R: publish_after_load(identity, POST_LOAD_ONLY producer)
-                R->>S: get_or_build(identity, producer)
-                S-->>R: validated HostWeightLease or typed failure
-                R->>R: close publication lease
-                R-->>L: separate publication report
-            end
-        else required or nonretryable failure
-            R-->>L: FAILED report
+            S-->>R: validated HostWeightLease or typed failure
+            R->>R: close publication lease
+            R-->>L: separate publication report
         end
+    else required or nonretryable failure
+        R-->>L: FAILED report
     end
-    L->>T: hand off selected plan and lease
-    T->>T: release mappings after their last transfer
-    T->>T: close acquired lease
+    L->>T: consume final CPU tensors and any lease
+    T-->>L: transfer teardown complete
+    L->>L: close lease when one was acquired
 ```
 
 `plan_restore()` must not mutate the model or lease. `commit() -> None` is the
@@ -227,11 +191,9 @@ Identity includes:
 - static adaptation identity; and
 - producer implementation, manifest, and restorer schema versions.
 
-The requested representation is selected by the loader. An artifact consumer
-asks the store for a validated local artifact, future remote materialization,
-or a registered producer. A derivation consumer instead binds the same exact
-identity to a source-content digest and binding-plan digest before transport
-derives runtime tensors.
+The requested representation is selected by the loader. The store chooses
+where to obtain that exact representation: validated local artifact, future
+remote materialization, or a registered producer.
 
 ### Parallelism
 
@@ -284,7 +246,7 @@ The contract is intentionally separate from loader activation:
   publication. A hash-looking symlink basename is trusted only for an explicit
   Hugging Face Hub source whose repository ID and
   `models--.../snapshots/<revision> -> blobs/<hash>` topology validate; every
-  local or otherwise unverified source is content-hashed.
+  local or otherwise unverified symlink target is content-hashed.
 - the tensor ownership digest records exact runtime names, kinds, shapes,
   semantic roles, dtypes, and strides from a CPU or meta model skeleton;
 - `FinalLayoutTensorRestorer` accepts only an exact lease identity, validates
@@ -391,20 +353,15 @@ A consumer PR must:
 1. Resolve an immutable canonical model source before cache lookup.
 2. Construct the exact final representation identity, including relevant
    parallel, quantization, and adaptation semantics.
-3. Select its materialization point explicitly: either construct an exact
-   source-derivation specification, or request a materialized artifact.
-4. For the artifact path, register a deterministic producer or use lookup-only
-   operation and provide a validation-only restorer with a one-shot commit.
-5. For the derivation path, fingerprint the complete binding/transform plan,
-   validate the source around mapping realization, and keep model-specific
-   mappings outside HWR.
-6. Keep GPU transport outside the producer, store, restorer, and derivation
-   contracts.
-7. Handle preferred fallback and required failure without reusing a model after
+3. Register a deterministic producer for that identity or support lookup-only
+   operation.
+4. Provide a validation-only restorer with a one-shot commit.
+5. Keep GPU transport outside the producer, store, and restorer contracts.
+6. Handle preferred fallback and required failure without reusing a model after
    a failed restore commit.
-8. Retain an artifact lease until mapped-memory transport completes; release
-   derivation source mappings before closing their derivation lease.
-9. Emit and test the terminal resolution report and any separate post-load
+7. Retain the lease until every transport operation that may access mapped
+   memory has completed.
+8. Emit and test the terminal resolution report and any separate post-load
    publication report.
 
 Consumer validation must prove:
@@ -414,8 +371,7 @@ Consumer validation must prove:
 - correct TP/SP/PP/EP ownership and layout identity;
 - correct BF16, FP8, quantized, or adaptation semantics;
 - shared-backing evidence when host-memory savings are claimed;
-- clean source/artifact unmapping, lease closure, unregistration, and
-  artifact-lock release; and
+- clean unmapping, unregistration, and artifact-lock release; and
 - startup, host-memory, and transport effects for the claimed deployment.
 
 ## Rollout
@@ -424,9 +380,8 @@ The rollout is intentionally staged:
 
 1. Land the neutral contracts and local filesystem store.
 2. Add one model-specific producer/restorer integration with parity evidence.
-3. Connect eligible DLO or other transport paths at the appropriate derivation
-   or artifact materialization point without moving transport ownership into
-   the runtime.
+3. Connect eligible DLO or other transport paths without moving transport
+   ownership into the runtime.
 4. Add additional final-layout and quantized producers independently.
 5. Introduce remote materialization only through the same local lease contract.
 

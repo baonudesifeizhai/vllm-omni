@@ -29,7 +29,6 @@ from vllm_omni.diffusion.models.helios import HeliosPipeline
 from vllm_omni.diffusion.models.host_weight_contract import FinalLayoutModelContract
 from vllm_omni.diffusion.offloader.startup import take_offload_startup_state
 from vllm_omni.diffusion.registry import initialize_model
-from vllm_omni.host_weight_runtime import HostWeightDerivationLease
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -153,6 +152,85 @@ def _hwr_config(
     )
 
 
+@pytest.fixture
+def hwr_artifact_case(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    canonical_root = tmp_path / "canonical"
+    canonical_root.mkdir()
+    save_file(
+        {"weight": torch.arange(4, dtype=torch.float32).to(torch.bfloat16).reshape(2, 2)},
+        str(canonical_root / "model.safetensors"),
+    )
+    store_root = tmp_path / "store"
+    coordinator = SimpleNamespace(
+        world_size=2,
+        rank_in_group=0,
+        ranks=(0, 1),
+        cpu_group=object(),
+        device_group=object(),
+    )
+
+    def make_loader(
+        *,
+        mode: str = "preferred",
+        use_allgather: bool = True,
+    ) -> tuple[DiffusersPipelineLoader, list[_HWRPipeline]]:
+        loader = DiffusersPipelineLoader(
+            LoadConfig(),
+            _hwr_config(
+                canonical_root,
+                store_root,
+                mode=mode,
+                use_allgather=use_allgather,
+                data_parallel_size=2 if use_allgather else 1,
+            ),
+        )
+        models: list[_HWRPipeline] = []
+
+        def init_model(*_args, **_kwargs):
+            model = _HWRPipeline(canonical_root)
+            models.append(model)
+            return model
+
+        monkeypatch.setattr(loader, "_init_from_load_format", init_model)
+        if use_allgather:
+            monkeypatch.setattr(loader, "_resolve_hwr_allgather_coordinator", lambda _enabled: coordinator)
+        return loader, models
+
+    def populate() -> None:
+        loader = DiffusersPipelineLoader(LoadConfig(), _hwr_config(canonical_root, store_root))
+        monkeypatch.setattr(
+            loader,
+            "_init_from_load_format",
+            lambda *_args, **_kwargs: _HWRPipeline(canonical_root),
+        )
+        loader.load_model(load_device="cpu", device=torch.device("cpu"))
+
+    return SimpleNamespace(
+        canonical_root=canonical_root,
+        store_root=store_root,
+        coordinator=coordinator,
+        make_loader=make_loader,
+        populate=populate,
+    )
+
+
+def _mock_hwr_peer(
+    monkeypatch: pytest.MonkeyPatch,
+    coordinator: SimpleNamespace,
+    updates: dict[str, dict[str, object]] | None = None,
+) -> list[str]:
+    phases: list[str] = []
+
+    def gather(output, local, *, group):
+        assert group is coordinator.cpu_group
+        phases.append(local["phase"])
+        output[0] = local
+        output[1] = {**local, "group_rank": 1, **(updates or {}).get(local["phase"], {})}
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
+    return phases
+
+
 def _make_loader_with_weights(weight_names: list[str]) -> DiffusersPipelineLoader:
     od_config = SimpleNamespace(
         dtype=torch.float32,
@@ -173,18 +251,11 @@ def _make_loader_with_weights(weight_names: list[str]) -> DiffusersPipelineLoade
 
 
 @pytest.mark.parametrize("use_allgather", [False, True])
-def test_hwr_selects_artifact_restore_or_checkpoint_derivation_allgather(
-    tmp_path: Path,
-    monkeypatch,
+def test_hwr_selects_exact_artifact_for_rank_local_and_allgather(
+    hwr_artifact_case: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
     use_allgather: bool,
-):
-    canonical_root = tmp_path / "canonical"
-    canonical_root.mkdir()
-    save_file(
-        {"weight": torch.arange(4, dtype=torch.float32).to(torch.bfloat16).reshape(2, 2)},
-        str(canonical_root / "model.safetensors"),
-    )
-    store_root = tmp_path / "hwr-store"
+) -> None:
     hash_calls = 0
     original_sha256 = source_identity_module._sha256_file
 
@@ -194,53 +265,17 @@ def test_hwr_selects_artifact_restore_or_checkpoint_derivation_allgather(
         return original_sha256(path, state)  # type: ignore[arg-type]
 
     monkeypatch.setattr(source_identity_module, "_sha256_file", counted_sha256)
-    consensus_phases: list[str] = []
+    phases = _mock_hwr_peer(monkeypatch, hwr_artifact_case.coordinator) if use_allgather else []
 
-    if use_allgather:
-        coordinator = SimpleNamespace(
-            world_size=2,
-            rank_in_group=0,
-            ranks=(0, 1),
-            cpu_group=object(),
-            device_group=object(),
-        )
-
-        def gather_object(output, local, *, group):
-            assert group is coordinator.cpu_group
-            consensus_phases.append(local["phase"])
-            output[0] = local
-            output[1] = {**local, "group_rank": 1}
-
-        monkeypatch.setattr(torch.distributed, "all_gather_object", gather_object)
-
-    def make_loader() -> tuple[DiffusersPipelineLoader, _HWRPipeline]:
-        loader = DiffusersPipelineLoader(
-            LoadConfig(),
-            _hwr_config(
-                canonical_root,
-                store_root,
-                use_allgather=use_allgather,
-                data_parallel_size=2 if use_allgather else 1,
-            ),
-        )
-        if use_allgather:
-            monkeypatch.setattr(loader, "_resolve_hwr_allgather_coordinator", lambda _enabled: coordinator)
-        pipeline = _HWRPipeline(canonical_root)
-        monkeypatch.setattr(loader, "_init_from_load_format", lambda *args, **kwargs: pipeline)
-        return loader, pipeline
-
-    first_loader, first_model = make_loader()
+    first_loader, first_models = hwr_artifact_case.make_loader(use_allgather=use_allgather)
     first = first_loader.load_model(load_device="cpu", device=torch.device("cpu"))
-    assert first is first_model
-    assert first_model.load_count == (0 if use_allgather else 1)
+    assert first is first_models[0]
+    assert first.load_count == 1
     assert first_loader._hwr_state is not None
-    if use_allgather:
-        first_startup = take_offload_startup_state(first)
-        assert first_startup is not None
-        assert first_startup.host_weight_plan.lease_carrier is not None
-        first_startup.host_weight_plan.lease_carrier.close()
+    assert take_offload_startup_state(first) is None
+    assert tuple((hwr_artifact_case.store_root / "artifacts").glob("*"))
 
-    second_loader, second_model = make_loader()
+    second_loader, second_models = hwr_artifact_case.make_loader(use_allgather=use_allgather)
     monkeypatch.setattr(
         second_loader,
         "_process_weights_after_loading",
@@ -248,28 +283,20 @@ def test_hwr_selects_artifact_restore_or_checkpoint_derivation_allgather(
     )
     second = second_loader.load_model(load_device="cpu", device=torch.device("cpu"))
 
-    assert second is second_model
-    assert second_model.load_count == 0
-    assert torch.equal(second_model.transformer.weight, first_model.transformer.weight)
+    assert second is second_models[0]
+    assert second.load_count == 0
+    assert torch.equal(second.transformer.weight, first.transformer.weight)
     startup_state = take_offload_startup_state(second)
     assert startup_state is not None
     second_plan = startup_state.host_weight_plan
     assert second_plan is not None
-    if use_allgather:
-        assert second_plan.backing_kind == "host_weight_runtime_derivation"
-        assert second_plan.lease_carrier is not None
-        derivation_lease = second_plan.lease_carrier.take()
-        assert isinstance(derivation_lease, HostWeightDerivationLease)
-        derivation_lease.close()
-        assert set(second_plan.bindings) == {"transformer.weight"}
-        assert not tuple((store_root / "artifacts").glob("*"))
-    else:
-        assert second_plan.backing_kind == "host_weight_runtime"
-        assert second_plan.lease_carrier is not None
-        second_plan.lease_carrier.close()
+    assert second_plan.backing_kind == "host_weight_runtime"
+    assert second_plan.lease_carrier is not None
+    assert set(second_plan.bindings) == {"transformer.weight"}
+    second_plan.lease_carrier.close()
     assert hash_calls == 1
-    assert len(tuple((store_root / "source-digests-v1" / "entries").glob("*.json"))) == 1
-    assert consensus_phases == (["derivation_plan", "derivation_plan"] if use_allgather else [])
+    assert len(tuple((hwr_artifact_case.store_root / "source-digests-v1" / "entries").glob("*.json"))) == 1
+    assert phases[-1:] == (["warm_finalization"] if use_allgather else [])
 
 
 def test_hwr_commit_failure_discards_model_and_reloads_without_hwr_or_mmap(tmp_path: Path, monkeypatch):
@@ -303,98 +330,129 @@ def test_hwr_commit_failure_discards_model_and_reloads_without_hwr_or_mmap(tmp_p
 
 
 def test_required_hwr_empty_store_reports_typed_resolution_failure(
-    tmp_path: Path,
+    hwr_artifact_case: SimpleNamespace,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    canonical_root = tmp_path / "canonical"
-    canonical_root.mkdir()
-    save_file(
-        {"weight": torch.arange(4, dtype=torch.float32).to(torch.bfloat16).reshape(2, 2)},
-        str(canonical_root / "model.safetensors"),
-    )
-    loader = DiffusersPipelineLoader(
-        LoadConfig(),
-        _hwr_config(canonical_root, tmp_path / "empty-store", mode="required"),
-    )
-    model = _HWRPipeline(canonical_root)
-    monkeypatch.setattr(loader, "_init_from_load_format", lambda *_args, **_kwargs: model)
+    loader, models = hwr_artifact_case.make_loader(mode="required", use_allgather=False)
 
     with pytest.raises(RuntimeError, match="resolution failed.*no allowed producer"):
         loader.load_model(load_device="cpu", device=torch.device("cpu"))
 
-    assert model.load_count == 0
+    assert models[0].load_count == 0
     assert loader.take_host_weight_plan() is None
 
 
-def test_hwr_allgather_rejects_different_derivation_plans(
-    tmp_path: Path,
+def test_required_hwr_allgather_empty_store_fails_the_complete_group(
+    hwr_artifact_case: SimpleNamespace,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    canonical_root = tmp_path / "canonical"
-    canonical_root.mkdir()
-    save_file(
-        {"weight": torch.arange(4, dtype=torch.float32).to(torch.bfloat16).reshape(2, 2)},
-        str(canonical_root / "model.safetensors"),
-    )
-    store_root = tmp_path / "store"
-    coordinator = SimpleNamespace(
-        world_size=2,
-        rank_in_group=0,
-        ranks=(0, 1),
-        cpu_group=object(),
-        device_group=object(),
-    )
-    warm_loader = DiffusersPipelineLoader(
-        LoadConfig(),
-        _hwr_config(canonical_root, store_root, use_allgather=True, data_parallel_size=2),
-    )
-    warm_model = _HWRPipeline(canonical_root)
-    monkeypatch.setattr(warm_loader, "_init_from_load_format", lambda *_args, **_kwargs: warm_model)
-    monkeypatch.setattr(warm_loader, "_resolve_hwr_allgather_coordinator", lambda _enabled: coordinator)
+    loader, models = hwr_artifact_case.make_loader(mode="required")
+    phases = _mock_hwr_peer(monkeypatch, hwr_artifact_case.coordinator)
 
-    def mismatched_derivation_plan(output, local, *, group):
-        assert group is coordinator.cpu_group
-        assert local["phase"] == "derivation_plan"
-        output[0] = local
-        output[1] = {
-            **local,
-            "group_rank": 1,
-            "plan_digest": "different-plan",
-        }
-
-    monkeypatch.setattr(torch.distributed, "all_gather_object", mismatched_derivation_plan)
-
-    with pytest.raises(RuntimeError, match="plan_digest differs across ranks"):
-        warm_loader.load_model(load_device="cpu", device=torch.device("cpu"))
-    assert warm_model.load_count == 0
+    with pytest.raises(RuntimeError, match=r"artifact resolution failed on group ranks \[0, 1\]"):
+        loader.load_model(load_device="cpu", device=torch.device("cpu"))
+    assert phases == ["eligibility", "artifact_resolution"]
+    assert models[0].load_count == 0
+    assert loader.take_host_weight_plan() is None
 
 
-def test_hwr_group_consensus_rejects_different_group_membership(monkeypatch: pytest.MonkeyPatch) -> None:
-    coordinator = SimpleNamespace(
-        world_size=2,
-        rank_in_group=0,
-        ranks=(0, 1),
-        cpu_group=object(),
-        device_group=object(),
+def test_hwr_allgather_rejects_mixed_eligibility_before_store_interaction(
+    hwr_artifact_case: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader, models = hwr_artifact_case.make_loader()
+    _mock_hwr_peer(
+        monkeypatch,
+        hwr_artifact_case.coordinator,
+        {"eligibility": {"status": "ineligible"}},
     )
 
-    def mismatched_group(output, local, *, group):
-        assert group is coordinator.cpu_group
-        output[0] = local
-        output[1] = {**local, "group_rank": 1, "group_ranks": [0, 2]}
+    with pytest.raises(RuntimeError, match="eligibility differs across ranks"):
+        loader.load_model(load_device="cpu", device=torch.device("cpu"))
+    assert not hwr_artifact_case.store_root.exists()
+    assert models[0].load_count == 0
 
-    monkeypatch.setattr(torch.distributed, "all_gather_object", mismatched_group)
 
-    with pytest.raises(RuntimeError, match="process-group resolution differs"):
-        DiffusersPipelineLoader._coordinate_hwr_group(
-            coordinator,
-            "resolution",
-            {
-                "identity_digest": "identity",
-                "status": "resolved",
-                "outcome": "local_hit",
-            },
-        )
+def test_hwr_allgather_preflight_failure_notifies_group(
+    hwr_artifact_case: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader, models = hwr_artifact_case.make_loader()
+    monkeypatch.setattr(
+        loader,
+        "_build_hwr_context",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("source identity failed")),
+    )
+    phases = _mock_hwr_peer(
+        monkeypatch,
+        hwr_artifact_case.coordinator,
+        {"artifact_resolution": {"status": "ready", "error_type": None}},
+    )
+
+    with pytest.raises(RuntimeError, match=r"artifact resolution failed on group ranks \[0\]"):
+        loader.load_model(load_device="cpu", device=torch.device("cpu"))
+    assert phases == ["eligibility", "artifact_resolution"]
+    assert models[0].load_count == 0
+
+
+def test_preferred_hwr_allgather_mixed_hit_and_miss_falls_back_as_one_group(
+    hwr_artifact_case: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hwr_artifact_case.populate()
+    loader, models = hwr_artifact_case.make_loader()
+    phases = _mock_hwr_peer(
+        monkeypatch,
+        hwr_artifact_case.coordinator,
+        {"artifact_resolution": {"status": "fallback", "content_digest": None}},
+    )
+
+    loaded = loader.load_model(load_device="cpu", device=torch.device("cpu"))
+    assert loaded is models[0]
+    assert loaded.load_count == 1
+    assert take_offload_startup_state(loaded) is None
+    assert phases == ["eligibility", "artifact_resolution"]
+
+
+@pytest.mark.parametrize(
+    ("failed_phase", "expected_phases", "model_count"),
+    [
+        ("restore_plan", ["eligibility", "artifact_resolution", "restore_plan"], 1),
+        ("restore_commit", ["eligibility", "artifact_resolution", "restore_plan", "restore_commit"], 2),
+        (
+            "warm_finalization",
+            [
+                "eligibility",
+                "artifact_resolution",
+                "restore_plan",
+                "restore_commit",
+                "component_loading",
+                "warm_finalization",
+            ],
+            2,
+        ),
+    ],
+)
+def test_preferred_hwr_allgather_peer_failure_uses_group_fallback(
+    hwr_artifact_case: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    failed_phase: str,
+    expected_phases: list[str],
+    model_count: int,
+) -> None:
+    hwr_artifact_case.populate()
+    loader, models = hwr_artifact_case.make_loader()
+    phases = _mock_hwr_peer(
+        monkeypatch,
+        hwr_artifact_case.coordinator,
+        {failed_phase: {"status": "error", "error_type": "RuntimeError"}},
+    )
+
+    returned = loader.load_model(load_device="cpu", device=torch.device("cpu"))
+    assert returned.load_count == 1
+    assert loader.take_host_weight_plan() is None
+    assert len(models) == model_count
+    assert phases == expected_phases
 
 
 @pytest.mark.parametrize(
