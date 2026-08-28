@@ -133,8 +133,10 @@ Both DLO transports consume the same finalized HWR artifact:
 
 The policy is identical for both transports:
 
-- `preferred` restores an exact hit; on a miss the complete cohort uses
-  canonical loading and may publish an artifact for the next startup;
+- `preferred` restores an exact hit; on a miss it uses a complete checkpoint
+  plan for the current startup while publishing the artifact in parallel,
+  falling back to canonical loading and post-load publication only when direct
+  production is unavailable;
 - `required` consumes only an existing exact artifact and fails the complete
   cohort if any rank misses or cannot validate/restore it.
 
@@ -142,7 +144,7 @@ Populate every node-local HWR storage domain with a matching preferred startup
 before switching to required:
 
 ```text
-preferred cold startup -> canonical load -> publish final-layout artifact
+preferred cold startup -> checkpoint plan + parallel final-layout publication
 required warm startup  -> exact artifact hit -> restore -> DLO transport
 ```
 

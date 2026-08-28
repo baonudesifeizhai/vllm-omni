@@ -14,6 +14,7 @@ import dataclasses
 import hashlib
 import os
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar, cast
@@ -93,6 +94,7 @@ class HWRLoaderMixin:
         _hwr_state: _HWRState | None
         _last_load_request: dict[str, object] | None
         _force_canonical_load: bool
+        _checkpoint_publication_waiter: Callable[[], None] | None
 
         def _prepare_weights(
             self,
@@ -471,6 +473,7 @@ class HWRLoaderMixin:
             HostWeightRuntimeConfig,
             ProductionPolicy,
             ResolutionOutcome,
+            RuntimeMode,
             StorageDomainPolicy,
         )
         from vllm_omni.host_weight_runtime.filesystem import detect_storage_class
@@ -481,7 +484,10 @@ class HWRLoaderMixin:
             HostWeightRuntimeConfig(
                 mode=mode,
                 domain=StorageDomainPolicy(root=root, storage_class=detect_storage_class(root)),
-                production=ProductionPolicy(allow_local_build=False, allow_post_load_publish=True),
+                production=ProductionPolicy(
+                    allow_local_build=mode is RuntimeMode.PREFERRED,
+                    allow_post_load_publish=True,
+                ),
             )
         )
         context = self._build_hwr_context(
@@ -639,9 +645,9 @@ class HWRLoaderMixin:
         model: nn.Module,
         state: _HWRState,
         lease: HostWeightLease,
-    ) -> _HWRState:
+    ) -> _HWRState | None:
         from vllm_omni.diffusion.model_loader.host_weights import FinalLayoutTensorRestorer
-        from vllm_omni.host_weight_runtime import ResolutionOutcome, RuntimeMode
+        from vllm_omni.host_weight_runtime import RuntimeMode
 
         restore_plan, error, failed = self._run_hwr_phase(
             state,
@@ -651,9 +657,8 @@ class HWRLoaderMixin:
         if failed:
             lease.close()
             if state.mode is RuntimeMode.PREFERRED:
-                state.outcome = ResolutionOutcome.CANONICAL_FALLBACK
                 logger.warning("HWR restore planning failed on ranks %s; using canonical loading", failed)
-                return state
+                return None
             if state.coordinator is None:
                 raise cast(Exception, error)
             raise RuntimeError(f"required Host Weight Runtime restore planning failed on group ranks {failed}")
@@ -672,6 +677,79 @@ class HWRLoaderMixin:
 
         state.plan = cast(HostWeightPlan, committed)
         return state
+
+    def _checkpoint_plan_for_group(
+        self,
+        state: _HWRState,
+        plan: HostWeightPlan | None,
+        fallback_reason: str | None,
+    ) -> HostWeightPlan | None:
+        records = self._coordinate_hwr_group(
+            state.coordinator,
+            "checkpoint_plan",
+            {
+                "identity_digest": state.context.identity.key,
+                "status": "ready" if plan is not None else "unavailable",
+                "error_type": None,
+            },
+        )
+        unavailable = self._phase_ranks(records, "unavailable")
+        if not unavailable:
+            return cast(HostWeightPlan, plan)
+        if len(unavailable) != len(records):
+            raise RuntimeError(f"BF16 HWR checkpoint plan availability differs across ranks: {unavailable}")
+        logger.info("Direct checkpoint HWR production unavailable; using canonical DLO: %s", fallback_reason)
+        return None
+
+    def _start_checkpoint_publication(
+        self,
+        model: nn.Module,
+        modules: object,
+        state: _HWRState,
+        plan: HostWeightPlan,
+    ) -> Callable[[], None]:
+        from vllm_omni.diffusion.model_loader.host_weights.producers.final_layout_bf16 import (
+            CheckpointPlanBF16Producer,
+        )
+
+        dit_modules = tuple(zip(getattr(modules, "dit_names", ()), getattr(modules, "dits", ())))
+        producer = CheckpointPlanBF16Producer(state.context, model, dit_modules, plan)
+
+        def publish() -> None:
+            resolution = state.runtime.resolve(state.context.identity, producer=producer)
+            if resolution.lease is None:
+                raise RuntimeError(f"direct checkpoint HWR production returned {resolution.report.outcome.value}")
+            resolution.lease.close()
+            logger.info("BF16 HWR artifact published in parallel with checkpoint-backed DLO setup")
+
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="hwr-publish")
+        future = executor.submit(publish)
+
+        def wait() -> None:
+            try:
+                future.result()
+            except Exception:
+                logger.warning("Direct checkpoint HWR publication failed", exc_info=True)
+            finally:
+                executor.shutdown()
+
+        return wait
+
+    def _select_checkpoint_plan(
+        self,
+        model: nn.Module,
+        modules: object,
+        state: _HWRState | None,
+        plan: HostWeightPlan | None,
+        fallback_reason: str | None,
+    ) -> tuple[_HWRState | None, HostWeightPlan | None]:
+        if state is None:
+            return None, plan
+        plan = self._checkpoint_plan_for_group(state, plan, fallback_reason)
+        if plan is None:
+            return state, None
+        self._checkpoint_publication_waiter = self._start_checkpoint_publication(model, modules, state, plan)
+        return None, plan
 
     def _resolve_hwr(
         self,
@@ -717,9 +795,10 @@ class HWRLoaderMixin:
             load_format=load_format,
             sources=sources,
         )
+        if state is not None:
+            state.coordinator = coordinator
         if state is None or lease is None:
             return state
-        state.coordinator = coordinator
         state.artifact_content_digest = lease.provenance.artifact_content_sha256
         return self._restore_hwr_artifact(model, state, lease)
 
@@ -804,5 +883,6 @@ class HWRLoaderMixin:
                 host_weight_plan=self.host_weight_plan,
                 fresh_model_loader=self.load_fresh_canonical_model if allow_retry else None,
                 allow_fresh_retry=allow_retry,
+                after_backend_enable=self._checkpoint_publication_waiter,
             ),
         )

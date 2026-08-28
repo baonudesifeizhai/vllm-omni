@@ -7,7 +7,7 @@ import json
 import os
 import re
 import time
-from collections.abc import Generator, Iterable, Sequence
+from collections.abc import Callable, Generator, Iterable, Sequence
 from pathlib import Path
 from typing import cast
 
@@ -161,6 +161,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         self.parallel_config = od_config.parallel_config
         self.host_weight_plan: HostWeightPlan | None = None
         self._hwr_state: _HWRState | None = None
+        self._checkpoint_publication_waiter: Callable[[], None] | None = None
         self._last_load_request: dict[str, object] | None = None
         self._force_canonical_load = False
 
@@ -519,6 +520,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         """Load a model with the given configurations."""
         self.host_weight_plan = None
         self._hwr_state = None
+        self._checkpoint_publication_waiter = None
         self._last_load_request = {
             "load_device": load_device,
             "load_format": load_format,
@@ -591,10 +593,9 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                         del model
                         return self.load_fresh_canonical_model()
                 self._hwr_state = hwr_state
-                hwr_active = hwr_state is not None
                 if hwr_state is not None:
                     self.host_weight_plan = hwr_state.plan
-                if _dist_offload and not hwr_active and not self._force_canonical_load:
+                if _dist_offload and self.host_weight_plan is None and not self._force_canonical_load:
                     modules = ModuleDiscovery.discover(model)
                     plan_result = build_checkpoint_mmap_plan(
                         model,
@@ -605,7 +606,14 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                         use_hsdp=_use_hsdp,
                         online_quantization=_has_online_quant,
                     )
-                    self.host_weight_plan = plan_result.plan
+                    hwr_state, self.host_weight_plan = self._select_checkpoint_plan(
+                        model,
+                        modules,
+                        hwr_state,
+                        plan_result.plan,
+                        plan_result.fallback_reason,
+                    )
+                    self._hwr_state = hwr_state
 
                 _skip_load = self.host_weight_plan is not None
 

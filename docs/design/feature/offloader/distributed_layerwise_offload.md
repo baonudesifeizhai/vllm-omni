@@ -209,12 +209,13 @@ Warm finalization is also coordinated before any rank may enter backend setup.
 Any rank-local lookup, restore, commit, or finalization failure therefore causes
 the complete group to fall back or fail before a mismatched weight collective.
 
-On a miss, `preferred` uses canonical loading and may publish the finalized
-artifact after load for a later startup. `required` is consume-only and fails
-when the exact artifact is absent or unusable on any rank. Operators populate
-each node-local storage domain with a matching preferred producer cohort before
-using required mode. Mixed hit/miss cohorts in preferred mode close any acquired
-leases and use canonical loading on every rank.
+On a miss, `preferred` uses a complete direct-checkpoint plan for the current
+DLO startup while publishing the final-layout artifact in parallel through the
+node-local HWR store. Backend setup waits for that publication only at its end,
+so artifact construction and rank-shard construction overlap. If no complete
+plan exists, preferred uses canonical loading and post-load publication.
+`required` remains consume-only and fails when the exact artifact is absent or
+unusable on any rank.
 
 After handoff, multi-rank AllGather copies one persistent padded CPU shard per
 rank, releases the artifact pages as they are consumed, and closes the lease
@@ -262,8 +263,9 @@ mutating the model and the complete cohort follows policy together.
 Promotion checks for artifact-backed AllGather are:
 
 - required mode rejects an empty or mismatched HWR store;
-- preferred cold startup publishes a validated artifact and required warm
-  startup restores it without ordinary DiT loading;
+- preferred cold startup uses a validated checkpoint plan while publishing the
+  artifact in parallel, and required warm startup restores it without ordinary
+  DiT loading;
 - all ranks agree on artifact identity, artifact content, restore status, and
   the final transport plan;
 - each rank keeps only its persistent padded CPU shard and releases its artifact
