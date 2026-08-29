@@ -56,13 +56,9 @@ SERVER_ARGS = [
 ]
 
 
-def _hwr_server_args(root: Path, mode: str, *, served_model_name: str | None = None) -> list[str]:
+def _server_args(*, served_model_name: str | None = None) -> list[str]:
     args = [
         *SERVER_ARGS,
-        "--host-weight-runtime-mode",
-        mode,
-        "--host-weight-runtime-root",
-        str(root),
         "--stage-init-timeout",
         "1800",
         "--init-timeout",
@@ -71,6 +67,16 @@ def _hwr_server_args(root: Path, mode: str, *, served_model_name: str | None = N
     if served_model_name is not None:
         args.extend(("--served-model-name", served_model_name))
     return args
+
+
+def _hwr_server_args(root: Path, mode: str, *, served_model_name: str | None = None) -> list[str]:
+    return [
+        *_server_args(served_model_name=served_model_name),
+        "--host-weight-runtime-mode",
+        mode,
+        "--host-weight-runtime-root",
+        str(root),
+    ]
 
 
 def _assert_audio_stream_present(video: bytes) -> None:
@@ -115,6 +121,13 @@ def _run_t2va_request(client: OpenAIClientHandler, seed: int, model: str = MODEL
     return response.content
 
 
+def _run_t2va_requests(server: OmniServer, model: str) -> list[bytes]:
+    client = OpenAIClientHandler(host=server.host, port=server.port)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(_run_t2va_request, client, seed, model) for seed in (1101, 1102)]
+        return [future.result() for future in futures]
+
+
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
@@ -125,11 +138,14 @@ def test_minimax_h3_bf16_hwr_dlo_dp2_t2va(
     tmp_path: Path,
     run_level: str,
 ) -> None:
-    """Populate and consume one exact BF16 HWR artifact with DP2 AllGather."""
+    """Cover baseline, populate, and exact-hit BF16 DLO DP2 AllGather."""
     original_model = get_model_prefix() + MODEL
     server_model = resolve_tiny_model_path(original_model) if run_level == "core_model" else original_model
     served_model_name = original_model if server_model != original_model else None
     hwr_root = tmp_path / "minimax-h3-bf16-hwr"
+
+    with OmniServer(server_model, _server_args(served_model_name=served_model_name)) as server:
+        baseline_videos = _run_t2va_requests(server, original_model)
 
     # A preferred cold startup publishes the finalized representation. Server
     # readiness means publication completed before the producer exits.
@@ -146,11 +162,8 @@ def test_minimax_h3_bf16_hwr_dlo_dp2_t2va(
         server_model,
         _hwr_server_args(hwr_root, "required", served_model_name=served_model_name),
     ) as server:
-        client = OpenAIClientHandler(host=server.host, port=server.port)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            futures = [executor.submit(_run_t2va_request, client, seed, original_model) for seed in (1101, 1102)]
-            videos = [future.result() for future in futures]
+        hwr_videos = _run_t2va_requests(server, original_model)
 
-    for video in videos:
+    for video in (*baseline_videos, *hwr_videos):
         assert_video_valid(video, width=WIDTH, height=HEIGHT, fps=FPS)
         _assert_audio_stream_present(video)

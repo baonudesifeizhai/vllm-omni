@@ -80,7 +80,7 @@ class _DummyPipelineModel(nn.Module):
 
 class _HWRTransformer(nn.Module):
     host_weight_restore_contract = FinalLayoutModelContract(
-        implementation_id="test-hwr-transformer",
+        implementation_id="minimax-h3-dit",
         version="1",
     )
 
@@ -156,8 +156,9 @@ def _hwr_config(
 def hwr_artifact_case(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     canonical_root = tmp_path / "canonical"
     canonical_root.mkdir()
+    checkpoint_weight = (torch.arange(4, dtype=torch.float32) + 10).to(torch.bfloat16).reshape(2, 2)
     save_file(
-        {"weight": torch.arange(4, dtype=torch.float32).to(torch.bfloat16).reshape(2, 2)},
+        {"weight": checkpoint_weight},
         str(canonical_root / "model.safetensors"),
     )
     store_root = tmp_path / "store"
@@ -210,6 +211,7 @@ def hwr_artifact_case(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Simple
 
     return SimpleNamespace(
         canonical_root=canonical_root,
+        checkpoint_weight=checkpoint_weight,
         store_root=store_root,
         coordinator=coordinator,
         make_loader=make_loader,
@@ -275,7 +277,6 @@ def test_hwr_selects_exact_artifact_for_rank_local_and_allgather(
     assert first is first_models[0]
     assert first.load_count == 0
     assert first_loader._hwr_state is None
-    first_weight = first.transformer.weight.detach().clone()
     first_startup = take_offload_startup_state(first)
     assert first_startup is not None
     assert first_startup.host_weight_plan.backing_kind == "checkpoint_mmap"
@@ -292,7 +293,7 @@ def test_hwr_selects_exact_artifact_for_rank_local_and_allgather(
 
     assert second is second_models[0]
     assert second.load_count == 0
-    assert torch.equal(second.transformer.weight, first_weight)
+    assert torch.equal(second.transformer.weight, hwr_artifact_case.checkpoint_weight)
     startup_state = take_offload_startup_state(second)
     assert startup_state is not None
     second_plan = startup_state.host_weight_plan

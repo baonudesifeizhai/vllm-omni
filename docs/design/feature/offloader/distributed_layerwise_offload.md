@@ -218,10 +218,10 @@ plan exists, preferred uses canonical loading and post-load publication.
 unusable on any rank.
 
 After handoff, multi-rank AllGather copies one persistent padded CPU shard per
-rank, releases the artifact pages as they are consumed, and closes the lease
-before the first weight collective. No-AllGather keeps the artifact mapping as
-the host master through service and copies complete blocks through registered
-mmap or two bounded host staging slots.
+rank and closes the artifact lease after all shards are ready and before the
+first weight collective. No-AllGather keeps the artifact mapping as the host
+master through service and copies complete blocks through registered mmap or
+two bounded host staging slots.
 
 The current AllGather promotion target is MiniMax H3 BF16 on DP2/TP1. The
 FLUX.2-klein-4B final-layout artifact contract is validated independently, but

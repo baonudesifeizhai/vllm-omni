@@ -185,6 +185,10 @@ class HWRLoaderMixin:
             for _, dit in dit_modules
         ):
             reasons.append("every owned DiT must declare the final-layout restore contract")
+        elif use_allgather and any(
+            dit.host_weight_restore_contract.implementation_id != "minimax-h3-dit" for _, dit in dit_modules
+        ):
+            reasons.append("AllGather HWR is promoted only for MiniMax H3 BF16")
 
         if reasons:
             message = "; ".join(reasons)
@@ -569,6 +573,8 @@ class HWRLoaderMixin:
         ineligible = self._phase_ranks(records, "ineligible")
         if ineligible:
             if len(ineligible) != len(records):
+                if lease:
+                    lease.close()
                 raise RuntimeError(f"BF16 HWR AllGather artifact eligibility differs across ranks: {ineligible}")
             if mode is RuntimeMode.REQUIRED:
                 raise ValueError(f"required Host Weight Runtime path is ineligible: {ineligible_reason}")

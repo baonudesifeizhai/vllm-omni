@@ -130,7 +130,6 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         rank_local_mmap: bool = False,
         tensor_transforms: dict[int, Any] | None = None,
         runtime_lease_storage: bool = False,
-        release_source_pages: Callable[[torch.Tensor], None] | None = None,
     ):
         assert isinstance(next_block, nn.Module), "transformer block must be type `torch.nn.Module`"
 
@@ -144,7 +143,6 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         self.registered_mmap = False
         self.tensor_transforms = tensor_transforms or {}
         self.runtime_lease_storage = runtime_lease_storage
-        self.release_source_pages = release_source_pages
 
         self.copy_stream = copy_stream or current_omni_platform.Stream()
         self.comm_stream = comm_stream or current_omni_platform.Stream()
@@ -242,7 +240,6 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                 self.pin_memory,
                 self.tensor_transforms,
                 self.runtime_lease_storage,
-                self.release_source_pages,
             )
 
         # Allocate device buffers only if not using shared buffers from backend
@@ -357,7 +354,6 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         pin_memory: bool,
         tensor_transforms: dict[int, Any] | None = None,
         runtime_lease_storage: bool = False,
-        release_source_pages: Callable[[torch.Tensor], None] | None = None,
     ) -> tuple[dict[torch.dtype, torch.Tensor], dict[torch.dtype, list[dict[str, Any]]]]:
         """Flatten params+buffers by dtype, split into DP shards, store local shard.
 
@@ -474,8 +470,6 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                     dst_end = overlap_end - shard_start
                     shard[dst_start:dst_end].copy_(flat_storage[src_start:src_end])
 
-                if release_source_pages is not None:
-                    release_source_pages(original_tensor)
                 # Replace original tensor with placeholder (frees CPU storage)
                 set_tensor_storage(
                     original_tensor,
@@ -605,7 +599,12 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                     ).copy_(source, non_blocking=async_copy)
 
     @torch.compiler.disable
-    def prefetch_layer(self, slot: int, non_blocking: bool = True) -> None:
+    def prefetch_layer(
+        self,
+        slot: int,
+        non_blocking: bool = True,
+        before_allgather: Callable[[], None] | None = None,
+    ) -> None:
         """Prepare next block's weights into the shared device buffer for *slot*.
 
         Uses the pre-allocated ``self.gpu_buffers[slot]`` instead of
@@ -652,6 +651,11 @@ class DistributedLayerwiseOffloadHook(ModelHook):
 
             self.comm_stream.wait_stream(self.copy_stream)
             with current_omni_platform.stream(self.comm_stream):
+                if before_allgather is not None:
+                    copy_done = current_omni_platform.Event()
+                    copy_done.record(self.copy_stream)
+                    copy_done.synchronize()
+                    before_allgather()
                 for dtype, local_shard in gpu_shards.items():
                     # Slice the shared (max-sized) output buffer down to this
                     # block's actual AllGather output size. The buffers are
@@ -792,7 +796,6 @@ def apply_distributed_block_hook(
     rank_local_mmap: bool = False,
     tensor_transforms: dict[int, Any] | None = None,
     runtime_lease_storage: bool = False,
-    release_source_pages: Callable[[torch.Tensor], None] | None = None,
 ) -> DistributedLayerwiseOffloadHook:
     """Register a DistributedLayerwiseOffloadHook on *module*."""
     registry = HookRegistry.get_or_create(module)
@@ -809,7 +812,6 @@ def apply_distributed_block_hook(
         rank_local_mmap=rank_local_mmap,
         tensor_transforms=tensor_transforms,
         runtime_lease_storage=runtime_lease_storage,
-        release_source_pages=release_source_pages,
     )
     registry.register_hook(DistributedLayerwiseOffloadHook._HOOK_NAME, hook)
     return hook
@@ -852,7 +854,6 @@ class PinnedResidentLayerGroup:
         defer_staging: bool = False,
         tensor_transforms: dict[int, Any] | None = None,
         runtime_lease_storage: bool = False,
-        release_source_pages: Callable[[torch.Tensor], None] | None = None,
     ) -> None:
         self.device = device
         self.copy_stream = copy_stream
@@ -883,7 +884,6 @@ class PinnedResidentLayerGroup:
                     pin_memory=pin_memory,
                     tensor_transforms=tensor_transforms,
                     runtime_lease_storage=runtime_lease_storage,
-                    release_source_pages=release_source_pages,
                 )
                 cpu_sources = {}
             self._states.append(
@@ -1045,9 +1045,9 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self._hwr_identity_digest: str | None = None
         self._hwr_content_digest: str | None = None
         self._host_registration: HostRegistration | None = None
-        self._release_runtime_source_pages: Callable[[torch.Tensor], None] | None = None
         self._mmap_transforms_by_tensor_id: dict[int, Any] = {}
         self._module_paths_by_id: dict[int, str] = {}
+        self._hwr_setup_ready = False
         self._hwr_setup_consensus_finished = False
 
     def load_resident_layers(self) -> None:
@@ -1487,16 +1487,16 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         error: BaseException | None,
         hooks: list[DistributedLayerwiseOffloadHook] | None = None,
     ) -> None:
-        """Reach one pre-collective decision for setup success or rollback."""
+        """Agree that every rank is ready to enter the first collective."""
         if self._hwr_setup_consensus_finished or not self._uses_hwr_allgather() or self.dp_group is None:
             return
+        if self._hwr_setup_ready:
+            self._coordinate_hwr_first_prefetch(error)
+            return
 
-        digest = None
-        if error is None:
-            digest = self._transport_plan_digest(hooks or [])
+        digest = self._transport_plan_digest(hooks or []) if error is None else None
         local = {
             "status": "ready" if error is None else "error",
-            "error_type": None if error is None else type(error).__name__,
             "group_size": self.dp_size,
             "group_rank": self.rank,
             "group_ranks": list(self._group_ranks),
@@ -1510,11 +1510,11 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             local,
             group=self._coordination_group or self.dp_group,
         )
-        self._hwr_setup_consensus_finished = True
 
         records = cast(list[dict[str, object]], gathered)
         failed = [record["group_rank"] for record in records if record["status"] != "ready"]
         if failed:
+            self._hwr_setup_consensus_finished = True
             raise RuntimeError(f"BF16 HWR AllGather setup failed on group ranks {failed}; rolling back all ranks")
 
         contracts = {
@@ -1528,9 +1528,43 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             for record in records
         }
         if len(contracts) != 1:
-            raise RuntimeError("BF16 HWR AllGather setup contract differs across ranks")
+            self._hwr_setup_consensus_finished = True
+            raise RuntimeError("BF16 HWR AllGather transport plan differs across ranks")
 
-        logger.info("BF16 HWR AllGather setup consensus passed: transport=%s", digest)
+        self._hwr_setup_ready = True
+        logger.info("BF16 HWR AllGather transport consensus passed: %s", digest)
+
+    def _coordinate_hwr_first_prefetch(self, error: BaseException | None) -> None:
+        local = {"status": "ready" if error is None else "error", "group_rank": self.rank}
+        gathered: list[object] = [None] * self.dp_size
+        torch.distributed.all_gather_object(
+            gathered,
+            local,
+            group=self._coordination_group or self.dp_group,
+        )
+        self._hwr_setup_consensus_finished = True
+
+        failed = [
+            record["group_rank"] for record in cast(list[dict[str, object]], gathered) if record["status"] != "ready"
+        ]
+        if failed:
+            raise RuntimeError(f"BF16 HWR AllGather initial prefetch failed on group ranks {failed}")
+        logger.info("BF16 HWR AllGather initial prefetch consensus passed")
+
+    def _prefetch_first_hwr_block(
+        self,
+        hook: DistributedLayerwiseOffloadHook,
+        slot: int,
+        hooks: list[DistributedLayerwiseOffloadHook],
+    ) -> None:
+        hook.prefetch_layer(
+            slot,
+            non_blocking=False,
+            before_allgather=lambda: self._coordinate_hwr_allgather_setup(None, hooks),
+        )
+        hook.ready_events[slot].synchronize()
+        hook.get_weights(slot)
+        self._coordinate_hwr_first_prefetch(None)
 
     def _register_on_demand_hook(self, module: nn.Module, label: str, *, stage_on_demand: bool = False) -> None:
         """Prepare a pipeline-managed stage component or keep it resident.
@@ -1675,7 +1709,6 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             rank_local_mmap=self._using_rank_local_mmap,
             tensor_transforms=self._mmap_transforms_by_tensor_id,
             runtime_lease_storage=self._using_runtime_lease,
-            release_source_pages=self._release_runtime_source_pages,
         )
         sub_hooks = [last_hook]
         for i, block in enumerate(blocks[:-1]):
@@ -1694,7 +1727,6 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 rank_local_mmap=self._using_rank_local_mmap,
                 tensor_transforms=self._mmap_transforms_by_tensor_id,
                 runtime_lease_storage=self._using_runtime_lease,
-                release_source_pages=self._release_runtime_source_pages,
             )
             sub_hooks.append(hook)
 
@@ -1859,8 +1891,6 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 # persistent local shard for the existing AllGather path.
                 self._using_rank_local_mmap = self.dp_size <= 1
                 self._using_runtime_lease = not self._using_rank_local_mmap
-                if self._using_runtime_lease:
-                    self._release_runtime_source_pages = self._host_weight_lease.release_tensor_pages
                 logger.info(
                     "DLO consuming final-layout Host Weight Runtime lease %s via %s",
                     self._host_weight_lease.provenance.resolution_id,
@@ -2000,7 +2030,6 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 rank_local_mmap=self._using_rank_local_mmap,
                 tensor_transforms=self._mmap_transforms_by_tensor_id,
                 runtime_lease_storage=self._using_runtime_lease,
-                release_source_pages=self._release_runtime_source_pages,
             )
 
             block_hooks: list[DistributedLayerwiseOffloadHook] = [last_hook]
@@ -2020,7 +2049,6 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                     rank_local_mmap=self._using_rank_local_mmap,
                     tensor_transforms=self._mmap_transforms_by_tensor_id,
                     runtime_lease_storage=self._using_runtime_lease,
-                    release_source_pages=self._release_runtime_source_pages,
                 )
                 block_hooks.append(hook)
 
@@ -2053,7 +2081,6 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 defer_staging=bool(self._all_hook_groups),
                 tensor_transforms=self._mmap_transforms_by_tensor_id,
                 runtime_lease_storage=self._using_runtime_lease,
-                release_source_pages=self._release_runtime_source_pages,
             )
             pipeline._dlo_residency_controller = self
 
@@ -2066,7 +2093,9 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             # A peer may have discovered a different hook topology or failed
             # while constructing it.  Join the same pre-collective decision
             # before this rank takes the otherwise-valid early return.
-            self._coordinate_hwr_allgather_setup(None, all_hooks)
+            if self._uses_hwr_allgather():
+                self._coordinate_hwr_allgather_setup(None, all_hooks)
+                self._hwr_setup_consensus_finished = True
             self.enabled = bool(self._resident_blocks)
             if self._using_mmap and not self._using_runtime_lease and not self.enabled:
                 self._release_mmap_handles()
@@ -2124,9 +2153,6 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # and allocated the same buffers. A local exception reaches the same
         # rendezvous from enable()'s error path, so successful peers roll back
         # instead of hanging in prefetch.
-        self._coordinate_hwr_allgather_setup(None, all_hooks)
-        self._module_paths_by_id.clear()
-
         # Prefetch first block of the FIRST module group only.
         # Subsequent groups share the same 2 device buffers; prefetching
         # them now would overwrite the first group's data in the shared
@@ -2137,8 +2163,12 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         # and its buffer slots are free.
         group = self._all_hook_groups[0]
         first_slot = group[0].current_slot
-        group[-1].prefetch_layer(slot=first_slot, non_blocking=False)
-        group[-1].get_weights(first_slot)
+        if self._uses_hwr_allgather():
+            self._prefetch_first_hwr_block(group[-1], first_slot, all_hooks)
+        else:
+            group[-1].prefetch_layer(slot=first_slot, non_blocking=False)
+            group[-1].get_weights(first_slot)
+        self._module_paths_by_id.clear()
 
         total_blocks = sum(len(b) for b in self._blocks)
         logger.info(
@@ -2183,12 +2213,8 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             self._mmap_file_cache.clear()
             del self._mmap_file_cache
             logger.info("Released safetensors mmap file handles")
-        for group in self._all_hook_groups:
-            for hook in group:
-                hook.release_source_pages = None
         lease = self._host_weight_lease
         self._host_weight_lease = None
-        self._release_runtime_source_pages = None
         if lease is not None and not lease.closed:
             lease.close()
             logger.info("Released Host Weight Runtime lease %s", lease.provenance.resolution_id)
@@ -2258,6 +2284,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self._hwr_identity_digest = None
         self._hwr_content_digest = None
         self._module_paths_by_id.clear()
+        self._hwr_setup_ready = False
         self._hwr_setup_consensus_finished = False
         self.enabled = False
         logger.info("Distributed layer-wise offloading disabled")
