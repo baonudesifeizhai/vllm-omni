@@ -28,9 +28,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # local rank of the process in the distributed setting, used to determine
     # the GPU device id
     "LOCAL_RANK": lambda: int(os.environ.get("LOCAL_RANK", "0")),
-    # Use fused permute-free all-to-all over NCCL symmetric memory for every
-    # compatible Ulysses Q/K/V/output exchange. Default 0 (off).
-    "VLLM_OMNI_ULYSSES_A2A_PERMUTE": lambda: bool(int(os.getenv("VLLM_OMNI_ULYSSES_A2A_PERMUTE", "0"))),
 }
 
 
