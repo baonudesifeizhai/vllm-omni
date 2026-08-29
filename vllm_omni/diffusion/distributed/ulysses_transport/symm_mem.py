@@ -101,6 +101,11 @@ class SymmetricMemoryUlyssesTransport:
         self._windows: dict[tuple[UlyssesBufferSlot, torch.dtype, torch.device], _SymmetricWindow] = {}
         self._retired_windows: list[_SymmetricWindow] = []
         self._window_lock = threading.Lock()
+        _, highest_priority = torch.cuda.Stream.priority_range()
+        self._overlap_stream = torch.cuda.Stream(
+            device=torch.device("cuda", torch.accelerator.current_device_index()),
+            priority=highest_priority,
+        )
 
         if self._world_size > 8:
             raise ValueError(
@@ -239,6 +244,98 @@ class SymmetricMemoryUlyssesTransport:
         if self._use_sync:
             current_omni_platform.synchronize()
         return key_out, value_out
+
+    def stage_scatter_heads(
+        self,
+        x: torch.Tensor,
+        *,
+        slot: Literal["q", "k", "v"],
+        start: bool = False,
+        finish: bool = False,
+    ) -> torch.Tensor:
+        """Enqueue one Q/K/V scatter while projection continues on the caller stream.
+
+        A staged group starts through ``begin_staged_scatter`` or ``start=True``
+        and finishes with one collective barrier. Every rank must enqueue the
+        same stages in the same order.
+        """
+        if x.ndim != 4:
+            raise ValueError(f"Ulysses scatter expects a 4-D tensor, got shape {tuple(x.shape)}.")
+        if not x.is_cuda:
+            raise ValueError("The symm_mem Ulysses transport only accepts CUDA tensors.")
+        if not x.is_contiguous():
+            x = x.contiguous()
+
+        batch, seq_local, heads, head_dim = x.shape
+        if heads <= 0:
+            raise ValueError("Overlapped Ulysses projection requires at least one head.")
+        if heads % self._world_size == 0:
+            heads_local = heads // self._world_size
+        elif self._world_size % heads == 0:
+            heads_local = 1
+        else:
+            raise ValueError(
+                "Overlapped Ulysses projection requires nested head/rank partitions: "
+                f"got heads={heads}, world_size={self._world_size}."
+            )
+        output_shape = (
+            batch,
+            seq_local * self._world_size,
+            heads_local,
+            head_dim,
+        )
+        output = self._window(slot=slot, shape=output_shape, dtype=x.dtype, device=x.device)
+
+        caller = torch.cuda.current_stream(x.device)
+        self._overlap_stream.wait_stream(caller)
+        with torch.cuda.stream(self._overlap_stream):
+            torch.ops.vllm_omni_symm_mem.ce_ulysses_scatter_stage_(
+                x,
+                output,
+                start,
+                finish,
+                self._group_name,
+            )
+        x.record_stream(self._overlap_stream)
+        if finish:
+            caller.wait_stream(self._overlap_stream)
+            if self._use_sync:
+                current_omni_platform.synchronize()
+        return output
+
+    def begin_staged_scatter(self, x: torch.Tensor) -> None:
+        """Start the reuse barrier before the first staged payload is ready."""
+        if x.ndim != 4:
+            raise ValueError(f"Ulysses scatter expects a 4-D tensor, got shape {tuple(x.shape)}.")
+        if not x.is_cuda:
+            raise ValueError("The symm_mem Ulysses transport only accepts CUDA tensors.")
+
+        batch, seq_local, heads, head_dim = x.shape
+        if heads <= 0:
+            raise ValueError("Overlapped Ulysses projection requires at least one head.")
+        if heads % self._world_size == 0:
+            heads_local = heads // self._world_size
+        elif self._world_size % heads == 0:
+            heads_local = 1
+        else:
+            raise ValueError(
+                "Overlapped Ulysses projection requires nested head/rank partitions: "
+                f"got heads={heads}, world_size={self._world_size}."
+            )
+        output = self._window(
+            slot="q",
+            shape=(batch, seq_local * self._world_size, heads_local, head_dim),
+            dtype=x.dtype,
+            device=x.device,
+        )
+
+        caller = torch.cuda.current_stream(x.device)
+        self._overlap_stream.wait_stream(caller)
+        with torch.cuda.stream(self._overlap_stream):
+            torch.ops.vllm_omni_symm_mem.ce_ulysses_scatter_begin_(
+                output,
+                self._group_name,
+            )
 
     def gather_heads(self, x: torch.Tensor, *, slot: UlyssesBufferSlot = "o") -> torch.Tensor:
         if x.ndim != 4:

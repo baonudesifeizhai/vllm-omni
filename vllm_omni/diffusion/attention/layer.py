@@ -19,7 +19,10 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
 from vllm_omni.diffusion.attention.parallel import build_parallel_attention_strategy
-from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
+from vllm_omni.diffusion.attention.parallel.base import (
+    NoParallelAttention,
+    ParallelAttentionContext,
+)
 from vllm_omni.diffusion.attention.parallel.ring import RingParallelAttention
 from vllm_omni.diffusion.attention.selector import get_attn_backend_for_role
 from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
@@ -368,6 +371,32 @@ class Attention(nn.Module):
         out = strategy.post_attention(out, ctx)
 
         return out
+
+    def forward_prepared(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None,
+        parallel_ctx: ParallelAttentionContext | None,
+    ) -> torch.Tensor:
+        """Run attention after a parallel strategy has prepared its Q/K/V inputs."""
+        strategy = self._get_active_parallel_strategy()
+        if parallel_ctx is None or parallel_ctx.name != strategy.name:
+            raise ValueError(
+                "Prepared attention context does not match the active parallel "
+                f"strategy: context={getattr(parallel_ctx, 'name', None)!r}, "
+                f"strategy={strategy.name!r}"
+            )
+        if self.is_paged_kv_active():
+            raise NotImplementedError("Prepared Q/K/V inputs do not support Scheduler-managed paged KV")
+
+        attn_metadata = self._with_kv_cache_dtype(attn_metadata)
+        if self.use_ring:
+            out = self._run_ring_attention(query, key, value, attn_metadata)
+        else:
+            out = self._run_local_attention(query, key, value, attn_metadata)
+        return strategy.post_attention(out, parallel_ctx)
 
     @staticmethod
     def _active_paged_kv_adapter():

@@ -136,13 +136,21 @@ def _fused_cuda_supported(
     head_dim: int,
     rotary_dim: int,
 ) -> bool:
+    return _fused_cuda_tensor_supported(q, head_dim, rotary_dim) and _fused_cuda_tensor_supported(
+        k, head_dim, rotary_dim
+    )
+
+
+def _fused_cuda_tensor_supported(
+    x: torch.Tensor,
+    head_dim: int,
+    rotary_dim: int,
+) -> bool:
     return (
         HAS_TRITON
         and current_platform.is_cuda()
-        and q.is_cuda
-        and k.is_cuda
-        and q.dtype == torch.bfloat16
-        and k.dtype == torch.bfloat16
+        and x.is_cuda
+        and x.dtype == torch.bfloat16
         and head_dim == _FUSED_HEAD_DIM
         and rotary_dim == _FUSED_ROTARY_DIM
     )
@@ -223,6 +231,32 @@ def _fused_qk_norm_rope_fake(
     return torch.empty_like(q), torch.empty_like(k)
 
 
+def _fused_rms_norm_rope_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    rope_table: torch.Tensor,
+    eps: float,
+    head_dim: int,
+    rotary_dim: int,
+) -> torch.Tensor:
+    if not _fused_cuda_tensor_supported(x, head_dim, rotary_dim):
+        normalized = F.rms_norm(x, (head_dim,), weight, eps)
+        return _apply_rope_table(normalized, rope_table, rotary_dim)
+    return _launch_fused_rms_norm_rope(x, weight, rope_table, eps)
+
+
+def _fused_rms_norm_rope_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    rope_table: torch.Tensor,
+    eps: float,
+    head_dim: int,
+    rotary_dim: int,
+) -> torch.Tensor:
+    del weight, rope_table, eps, head_dim, rotary_dim
+    return torch.empty_like(x)
+
+
 _OMNI_OP_LIB = Library("vllm_omni", "FRAGMENT")
 if not hasattr(torch.ops.vllm_omni, "fused_qk_norm_rope"):
     direct_register_custom_op(
@@ -231,6 +265,65 @@ if not hasattr(torch.ops.vllm_omni, "fused_qk_norm_rope"):
         fake_impl=_fused_qk_norm_rope_fake,
         mutates_args=[],
         target_lib=_OMNI_OP_LIB,
+    )
+if not hasattr(torch.ops.vllm_omni, "fused_rms_norm_rope"):
+    direct_register_custom_op(
+        op_name="fused_rms_norm_rope",
+        op_func=_fused_rms_norm_rope_impl,
+        fake_impl=_fused_rms_norm_rope_fake,
+        mutates_args=[],
+        target_lib=_OMNI_OP_LIB,
+    )
+
+
+def fused_rms_norm_rope(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    rope_table: torch.Tensor,
+    eps: float,
+    *,
+    head_dim: int | None = None,
+    rotary_dim: int | None = None,
+) -> torch.Tensor:
+    """Apply RMSNorm and packed non-interleaved RoPE to one Q or K tensor."""
+    if x.ndim != 3:
+        raise ValueError(f"x must be [tokens, heads, head_dim], got {x.shape}")
+    if x.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        raise TypeError(f"Fused RMSNorm/RoPE requires floating input, got {x.dtype}")
+
+    head_dim = x.shape[-1] if head_dim is None else head_dim
+    rotary_dim = rope_table.shape[-1] if rotary_dim is None else rotary_dim
+    if x.shape[-1] != head_dim:
+        raise ValueError(f"Expected head_dim={head_dim}, got {x.shape[-1]}")
+    if rotary_dim <= 0 or rotary_dim > head_dim or rotary_dim % 2:
+        raise ValueError(f"rotary_dim must be even and in [2, {head_dim}], got {rotary_dim}")
+    if weight.shape != (head_dim,):
+        raise ValueError(f"Expected norm weight [{head_dim}], got {tuple(weight.shape)}")
+    if weight.device != x.device:
+        raise ValueError("Norm weight must be on the activation device")
+    if rope_table.device != x.device or rope_table.dtype != x.dtype:
+        raise ValueError("rope_table must have the same dtype and device as x")
+    if rope_table.shape != (x.shape[0], rotary_dim):
+        raise ValueError(f"Expected rope_table [{x.shape[0]}, {rotary_dim}], got {tuple(rope_table.shape)}")
+
+    weight = weight.contiguous()
+    rope_table = rope_table.contiguous()
+    if not _fused_cuda_tensor_supported(x, head_dim, rotary_dim):
+        return _fused_rms_norm_rope_impl(
+            x,
+            weight,
+            rope_table,
+            eps,
+            head_dim,
+            rotary_dim,
+        )
+    return torch.ops.vllm_omni.fused_rms_norm_rope(
+        x,
+        weight,
+        rope_table,
+        eps,
+        head_dim,
+        rotary_dim,
     )
 
 
@@ -296,4 +389,4 @@ def fused_qk_norm_rope(
     )
 
 
-__all__ = ["fused_qk_norm_rope"]
+__all__ = ["fused_qk_norm_rope", "fused_rms_norm_rope"]

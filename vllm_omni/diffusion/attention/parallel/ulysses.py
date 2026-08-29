@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import torch
 import torch.distributed as dist
@@ -221,6 +221,38 @@ class UlyssesParallelAttention:
     @property
     def name(self) -> str:
         return "ulysses"
+
+    @property
+    def supports_staged_projection(self) -> bool:
+        return (
+            self._fast_ulysses
+            and get_ulysses_mode(default="strict") == "strict"
+            and self._sp_group.ring_world_size == 1
+        )
+
+    @torch.compiler.disable
+    def begin_projection_scatter(self, tensor: torch.Tensor) -> None:
+        if not self.supports_staged_projection:
+            raise RuntimeError("Staged projection requires pure strict-mode Fast Ulysses")
+        self._get_transport().begin_staged_scatter(tensor)
+
+    @torch.compiler.disable
+    def stage_projection_scatter(
+        self,
+        tensor: torch.Tensor,
+        *,
+        slot: Literal["q", "k", "v"],
+        start: bool = False,
+        finish: bool = False,
+    ) -> torch.Tensor:
+        if not self.supports_staged_projection:
+            raise RuntimeError("Staged projection requires pure strict-mode Fast Ulysses")
+        return self._get_transport().stage_scatter_heads(
+            tensor,
+            slot=slot,
+            start=start,
+            finish=finish,
+        )
 
     def pre_attention(
         self,
@@ -477,6 +509,56 @@ class UlyssesParallelAttention:
                     f"attn_mask length: {attn_metadata.attn_mask.shape[1]} != query length: {query.shape[1]}"
                 )
                 attn_metadata.attn_mask = attn_metadata.attn_mask.bool().contiguous()
+        return query, key, value, attn_metadata, ctx
+
+    def complete_staged_pre_attention(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, AttentionMetadata | None, _UlyssesCtx]:
+        """Finalize strict Ulysses inputs scattered by projection-side stages."""
+        if not self._fast_ulysses or get_ulysses_mode(default="strict") != "strict":
+            raise RuntimeError("Staged Ulysses inputs require fast_ulysses in strict mode")
+        if self._sp_group.ring_world_size > 1:
+            raise RuntimeError("Staged Ulysses inputs do not support hybrid Ring attention")
+        if attn_metadata is not None and any(
+            tensor is not None
+            for tensor in (
+                attn_metadata.joint_query,
+                attn_metadata.joint_key,
+                attn_metadata.joint_value,
+            )
+        ):
+            raise RuntimeError("Staged Ulysses inputs do not support joint attention")
+
+        batch = query.shape[0]
+        seq_len = query.shape[1]
+        head_dim = query.shape[3]
+        for name, tensor in (("key", key), ("value", value)):
+            if tensor.shape[0] != batch or tensor.shape[1] != seq_len or tensor.shape[3] != head_dim:
+                raise ValueError(
+                    f"Staged Ulysses {name} shape {tuple(tensor.shape)} is incompatible "
+                    f"with query shape {tuple(query.shape)}"
+                )
+
+        if attn_metadata is not None and attn_metadata.attn_mask is not None:
+            if attn_metadata.attn_mask.ndim == 2:
+                if attn_metadata.attn_mask.shape[1] != seq_len:
+                    raise ValueError(
+                        "Staged Ulysses attention-mask length must match the global "
+                        f"sequence length: {attn_metadata.attn_mask.shape[1]} != {seq_len}"
+                    )
+                attn_metadata.attn_mask = attn_metadata.attn_mask.bool().contiguous()
+
+        ctx = _UlyssesCtx(
+            name=self.name,
+            ulysses_pg=self._ulysses_pg,
+            scatter_idx=self._scatter_idx,
+            gather_idx=self._gather_idx,
+            use_sync=self._use_sync,
+        )
         return query, key, value, attn_metadata, ctx
 
     def post_attention(self, attn_output: torch.Tensor, ctx: ParallelAttentionContext | None) -> torch.Tensor:

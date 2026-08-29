@@ -362,6 +362,58 @@ void ce_ulysses_scatter_kv_(
   launch_barrier(caller, signal_pad_ptrs, rank, world_size);
 }
 
+void ce_ulysses_scatter_begin_(
+    at::Tensor& output,
+    const std::string& group_name) {
+  auto handle = get_window_handle(output, group_name);
+  const int rank = handle->get_rank();
+  const int world_size = handle->get_world_size();
+
+  c10::cuda::CUDAGuard device_guard(output.device());
+  const cudaStream_t caller =
+      at::cuda::getCurrentCUDAStream(output.get_device());
+  launch_barrier(
+      caller,
+      handle->get_signal_pad_ptrs(),
+      rank,
+      world_size);
+}
+
+void ce_ulysses_scatter_stage_(
+    const at::Tensor& input,
+    at::Tensor& output,
+    bool open_barrier,
+    bool close_barrier,
+    const std::string& group_name) {
+  auto handle = get_window_handle(output, group_name);
+  const int rank = handle->get_rank();
+  const int world_size = handle->get_world_size();
+  validate_scatter_shapes(input, output, world_size);
+
+  c10::cuda::CUDAGuard device_guard(input.device());
+  const int device_index = input.get_device();
+  const cudaStream_t caller = at::cuda::getCurrentCUDAStream(device_index);
+  const cudaStream_t transfer = get_transfer_stream(device_index);
+  const auto signal_pad_ptrs = handle->get_signal_pad_ptrs();
+
+  if (open_barrier) {
+    launch_barrier(caller, signal_pad_ptrs, rank, world_size);
+  }
+
+  const Event ready;
+  const Event done;
+  C10_CUDA_CHECK(cudaEventRecord(ready, caller));
+  C10_CUDA_CHECK(cudaStreamWaitEvent(transfer, ready, 0));
+  emit_scatter_remote_peers(input, handle, transfer);
+  emit_scatter_peer(input, handle, rank, caller);
+  C10_CUDA_CHECK(cudaEventRecord(done, transfer));
+  C10_CUDA_CHECK(cudaStreamWaitEvent(caller, done, 0));
+
+  if (close_barrier) {
+    launch_barrier(caller, signal_pad_ptrs, rank, world_size);
+  }
+}
+
 void ce_ulysses_a2a(
     const at::Tensor& input,
     at::Tensor& output,
@@ -536,12 +588,19 @@ TORCH_LIBRARY_FRAGMENT(vllm_omni_symm_mem, m) {
   m.def(
       "ce_ulysses_scatter_kv_(Tensor key, Tensor value, Tensor(a!) key_output, "
       "Tensor(b!) value_output, str group_name) -> ()");
+  m.def(
+      "ce_ulysses_scatter_begin_(Tensor(a!) output, str group_name) -> ()");
+  m.def(
+      "ce_ulysses_scatter_stage_(Tensor input, Tensor(a!) output, "
+      "bool open_barrier, bool close_barrier, str group_name) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(vllm_omni_symm_mem, CUDA, m) {
   m.impl("init_ulysses_window_", TORCH_FN(init_ulysses_window_));
   m.impl("ce_ulysses_a2a", TORCH_FN(ce_ulysses_a2a));
   m.impl("ce_ulysses_scatter_kv_", TORCH_FN(ce_ulysses_scatter_kv_));
+  m.impl("ce_ulysses_scatter_begin_", TORCH_FN(ce_ulysses_scatter_begin_));
+  m.impl("ce_ulysses_scatter_stage_", TORCH_FN(ce_ulysses_scatter_stage_));
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {}

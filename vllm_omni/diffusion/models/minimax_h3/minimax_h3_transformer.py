@@ -45,7 +45,10 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelOutput,
 )
 from vllm_omni.diffusion.layers.activation import SiluAndMul
-from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qk_norm_rope
+from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
+    fused_qk_norm_rope,
+    fused_rms_norm_rope,
+)
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.host_weight_contract import FinalLayoutModelContract
@@ -433,6 +436,14 @@ class MiniMaxH3Attention(nn.Module):
             skip_sequence_parallel=skip_sequence_parallel,
             prefix=prefix,
         )
+        parallel_strategy = self.attention.parallel_strategy
+        self._staged_projection_strategy = (
+            parallel_strategy
+            if not skip_sequence_parallel
+            and quant_config is None
+            and getattr(parallel_strategy, "supports_staged_projection", False)
+            else None
+        )
 
     def _apply_rope(self, x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
         """Rotate the first rot_dim head dims; pass the rest through.
@@ -459,6 +470,7 @@ class MiniMaxH3Attention(nn.Module):
         packed_total: int,
         num_requests: int = 1,
         video_layout: VideoTokenLayout | None = None,
+        staged_strategy: Any | None = None,
     ) -> torch.Tensor:
         """Run packed attention as a small eager island.
 
@@ -540,12 +552,93 @@ class MiniMaxH3Attention(nn.Module):
             },
             video_layout=video_layout,
         )
-        return self.attention(
-            q.unsqueeze(0),
-            k.unsqueeze(0),
-            v.unsqueeze(0),
+        query = q.unsqueeze(0)
+        key = k.unsqueeze(0)
+        value = v.unsqueeze(0)
+        if staged_strategy is None:
+            return self.attention(query, key, value, metadata).squeeze(0)
+
+        query, key, value, metadata, parallel_ctx = staged_strategy.complete_staged_pre_attention(
+            query,
+            key,
+            value,
             metadata,
+        )
+        return self.attention.forward_prepared(
+            query,
+            key,
+            value,
+            metadata,
+            parallel_ctx,
         ).squeeze(0)
+
+    def _run_staged_projection_attention(
+        self,
+        x: torch.Tensor,
+        *,
+        rope_table: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        packed_total: int,
+        num_requests: int,
+        video_layout: VideoTokenLayout | None,
+    ) -> torch.Tensor:
+        """Pipeline separate Q/K/V projections with Q/K/V resharding."""
+        strategy = self._staged_projection_strategy
+        if strategy is None:
+            raise RuntimeError("Staged projection is not available for this attention layer")
+
+        total = x.shape[0]
+        q_size = self.num_heads * self.head_dim
+        kv_size = self.num_kv_heads * self.head_dim
+        weight = self.qkv_proj.weight
+
+        query = torch.nn.functional.linear(x, weight[:q_size])
+        query = query.view(total, self.num_heads, self.head_dim)
+        strategy.begin_projection_scatter(query.unsqueeze(0))
+        query = fused_rms_norm_rope(
+            query,
+            self.q_norm.weight,
+            rope_table,
+            self.q_norm.variance_epsilon,
+        )
+        query = strategy.stage_projection_scatter(
+            query.unsqueeze(0),
+            slot="q",
+        ).squeeze(0)
+
+        key = torch.nn.functional.linear(x, weight[q_size : q_size + kv_size])
+        key = key.view(total, self.num_kv_heads, self.head_dim)
+        key = fused_rms_norm_rope(
+            key,
+            self.k_norm.weight,
+            rope_table,
+            self.q_norm.variance_epsilon,
+        )
+        key = strategy.stage_projection_scatter(
+            key.unsqueeze(0),
+            slot="k",
+        ).squeeze(0)
+
+        value = torch.nn.functional.linear(x, weight[q_size + kv_size :])
+        value = value.view(total, self.num_kv_heads, self.head_dim)
+        value = strategy.stage_projection_scatter(
+            value.unsqueeze(0),
+            slot="v",
+            finish=True,
+        ).squeeze(0)
+
+        return self._run_packed_attention(
+            query,
+            key,
+            value,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            packed_total=packed_total,
+            num_requests=num_requests,
+            video_layout=video_layout,
+            staged_strategy=strategy,
+        )
 
     def forward(
         self,
@@ -561,8 +654,8 @@ class MiniMaxH3Attention(nn.Module):
     ) -> torch.Tensor:
         """x: [T, hidden] packed thd rows -> [T, hidden].
 
-        Operation order: fused qkv projection -> per-head q/k RMSNorm -> RoPE
-        on q/k -> variable-length non-causal flash attention -> output projection.
+        Operation order: Q/K/V projection -> per-head Q/K RMSNorm -> RoPE on
+        Q/K -> variable-length non-causal attention -> output projection.
 
         With Ulysses sequence parallelism, x holds this rank's row shard;
         qkv/norm/RoPE run locally, an all-to-all trades sequence for heads.
@@ -571,6 +664,24 @@ class MiniMaxH3Attention(nn.Module):
         all-to-all restores the row shard before the output projection.
         """
         total = x.shape[0]
+        effective_packed_total = packed_total if packed_total is not None else total
+        # Slicing the base weight bypasses wrappers that augment the projection
+        # forward, so wrapped layers retain the standard fused-QKV path.
+        qkv_is_wrapped = hasattr(self.qkv_proj, "base_layer")
+        if rope_table is not None and self._staged_projection_strategy is not None and not qkv_is_wrapped:
+            out = self._run_staged_projection_attention(
+                x,
+                rope_table=rope_table,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                packed_total=effective_packed_total,
+                num_requests=num_requests,
+                video_layout=video_layout,
+            )
+            out = out.reshape(total, self.num_heads * self.head_dim)
+            out, _ = self.out_proj(out)
+            return out
+
         qkv, _ = self.qkv_proj(x)
         q_size = self.num_heads * self.head_dim
         kv_size = self.num_kv_heads * self.head_dim
@@ -603,7 +714,7 @@ class MiniMaxH3Attention(nn.Module):
             # Before Ulysses, q contains only this rank's row shard. The
             # backend receives the global sequence after all-to-all, so carry
             # its Python length explicitly instead of inferring it from q.
-            packed_total=packed_total if packed_total is not None else q.shape[0],
+            packed_total=effective_packed_total,
             num_requests=num_requests,
             video_layout=video_layout,
         )

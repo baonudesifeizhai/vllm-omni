@@ -41,6 +41,7 @@ def _reference(q, k, q_weight, k_weight, rope_table):
 def test_fused_qk_norm_rope_matches_bf16_reference(seq_len):
     from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
         fused_qk_norm_rope,
+        fused_rms_norm_rope,
     )
 
     torch.manual_seed(17)
@@ -77,6 +78,10 @@ def test_fused_qk_norm_rope_matches_bf16_reference(seq_len):
         rope_table,
         _EPS,
     )
+    staged_q = fused_rms_norm_rope(q, q_weight, rope_table, _EPS)
+    staged_k = fused_rms_norm_rope(k, k_weight, rope_table, _EPS)
 
     torch.testing.assert_close(actual_q, expected_q, atol=0.0625, rtol=0.02)
     torch.testing.assert_close(actual_k, expected_k, atol=0.0625, rtol=0.02)
+    torch.testing.assert_close(staged_q, actual_q, atol=0, rtol=0)
+    torch.testing.assert_close(staged_k, actual_k, atol=0, rtol=0)
