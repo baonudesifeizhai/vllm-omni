@@ -194,6 +194,15 @@ class UlyssesParallelAttention:
         self._gather_idx = gather_idx
         self._use_sync = use_sync
         self._ulysses_a2a_permute = ulysses_a2a_permute
+        if _a2a_permute_enabled(
+            ulysses_a2a_permute,
+            scatter_idx,
+            gather_idx,
+            sp_group.ulysses_world_size,
+        ):
+            from vllm_omni.diffusion.distributed.a2a_permute import ensure_a2a_permute_available
+
+            ensure_a2a_permute_available()
 
     @property
     def enabled(self) -> bool:

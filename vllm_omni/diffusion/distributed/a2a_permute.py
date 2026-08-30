@@ -19,9 +19,12 @@ visible buffer mutation, no Python control flow in the traced graph. A
 from __future__ import annotations
 
 import glob
+import math
 import os
 import sysconfig
 import threading
+from dataclasses import dataclass
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -33,8 +36,20 @@ logger = init_logger(__name__)
 
 _BUILD_LOCK = threading.Lock()
 _BUILT = False
-# (symm_shape, dtype, group_name) -> rendezvoused symmetric-memory buffer
-_SYMM_CACHE: dict[tuple, torch.Tensor] = {}
+_WORKSPACE_LOCK = threading.Lock()
+
+
+@dataclass(slots=True)
+class _SymmWorkspace:
+    allocation: torch.Tensor
+    handle: Any
+    capacity_bytes: int
+
+
+# A single grow-only byte workspace per device/process-group. Shape changes
+# reuse a typed view into the workspace instead of retaining one allocation per
+# historical request shape.
+_SYMM_WORKSPACES: dict[tuple[torch.device, str], _SymmWorkspace] = {}
 
 
 def _ensure_built() -> None:
@@ -49,16 +64,20 @@ def _ensure_built() -> None:
 
         here = os.path.dirname(__file__)
         src = os.path.join(here, "csrc", "a2a_permute.cu")
-        sp = sysconfig.get_paths()["purelib"]
-        nccl_dir = os.path.join(sp, "nvidia", "nccl")
-        nccl_inc = os.path.join(nccl_dir, "include")
-        nccl_libs = glob.glob(os.path.join(nccl_dir, "lib", "libnccl.so*"))
+        site_packages = sysconfig.get_paths()["purelib"]
+        nvidia_root = os.path.join(site_packages, "nvidia")
+        include_paths = glob.glob(os.path.join(nvidia_root, "*", "include"))
+        nccl_libs = glob.glob(os.path.join(nvidia_root, "nccl", "lib", "libnccl.so*"))
         if not nccl_libs:
             raise RuntimeError("a2a_permute: could not locate nvidia-nccl libnccl.so")
+        if not any(os.path.isfile(os.path.join(path, "nccl.h")) for path in include_paths):
+            raise RuntimeError("a2a_permute: could not locate nvidia-nccl nccl.h")
         load(
             name="vllm_omni_a2a_permute",
             sources=[src],
-            extra_include_paths=[nccl_inc],
+            # PyTorch wheel-only installations keep headers such as cusparse.h
+            # under nvidia/{cu13,cusparse}/include rather than CUDA_HOME.
+            extra_include_paths=list(include_paths),
             extra_cflags=["-DUSE_NCCL", "-DUSE_C10D_NCCL", "-O3"],
             extra_cuda_cflags=["-DUSE_NCCL", "-DUSE_C10D_NCCL", "-O3", "--expt-relaxed-constexpr"],
             extra_ldflags=[nccl_libs[0]],
@@ -70,27 +89,68 @@ def _ensure_built() -> None:
         _BUILT = True
 
 
+def ensure_a2a_permute_available() -> None:
+    """Build the extension during worker/model initialization, not a request."""
+    _ensure_built()
+
+
+def _required_nbytes(shape: tuple[int, ...], dtype: torch.dtype) -> int:
+    return math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+
+
 def _get_symm_buffer(
     symm_shape: tuple[int, ...], dtype: torch.dtype, device: torch.device, group_name: str
 ) -> torch.Tensor:
-    """Get (or lazily allocate + rendezvous) a symmetric-memory buffer.
+    """Get a typed view from a grow-only symmetric-memory workspace.
 
-    Rendezvous is a collective; on a cache miss every rank hits the same shape in
-    lockstep (SP is symmetric), so they rendezvous together. A one-element
-    all_reduce first guarantees the group's NCCL communicator exists (required
-    before NCCL-symm rendezvous, else it segfaults).
+    Allocation/growth and rendezvous are collective. Every rank reaches them in
+    lockstep because sequence parallel execution is symmetric. Steady-state
+    requests at or below the peak capacity take no synchronization path.
     """
-    key = (symm_shape, dtype, group_name)
-    buf = _SYMM_CACHE.get(key)
-    if buf is None:
-        pg = _resolve_process_group(group_name)
-        warm = torch.ones(1, device=device)
-        dist.all_reduce(warm, group=pg)
-        torch.accelerator.synchronize(device)
-        buf = symm_mem.empty(*symm_shape, dtype=dtype, device=device)
-        symm_mem.rendezvous(buf, group_name)
-        _SYMM_CACHE[key] = buf
-    return buf
+    device = torch.device(device)
+    key = (device, group_name)
+    required_bytes = _required_nbytes(symm_shape, dtype)
+    with _WORKSPACE_LOCK:
+        workspace = _SYMM_WORKSPACES.get(key)
+        if workspace is None or workspace.capacity_bytes < required_bytes:
+            if torch.cuda.is_current_stream_capturing():
+                capacity = 0 if workspace is None else workspace.capacity_bytes
+                raise RuntimeError(
+                    "a2a_permute: cannot grow the symmetric-memory workspace "
+                    f"from {capacity} to {required_bytes} bytes during CUDA graph capture; "
+                    "warm up the maximum request shape before capture"
+                )
+            if workspace is None:
+                # NCCL symmetric-memory rendezvous requires the communicator to
+                # exist before the first allocation.
+                pg = _resolve_process_group(group_name)
+                warm = torch.ones(1, device=device)
+                dist.all_reduce(warm, group=pg)
+            # Growth is rare and must not release the previous allocation while
+            # an earlier kernel is still consuming it.
+            torch.accelerator.synchronize(device)
+            allocation = symm_mem.empty(required_bytes, dtype=torch.uint8, device=device)
+            handle = symm_mem.rendezvous(allocation, group_name)
+            workspace = _SymmWorkspace(
+                allocation=allocation,
+                handle=handle,
+                capacity_bytes=required_bytes,
+            )
+            _SYMM_WORKSPACES[key] = workspace
+        return workspace.handle.get_buffer(workspace.handle.rank, symm_shape, dtype)
+
+
+def clear_a2a_permute_workspaces() -> None:
+    """Release cached symmetric-memory workspaces during worker shutdown."""
+    with _WORKSPACE_LOCK:
+        if not _SYMM_WORKSPACES:
+            return
+        devices = {workspace.allocation.device for workspace in _SYMM_WORKSPACES.values()}
+        for device in devices:
+            torch.accelerator.synchronize(device)
+        count = len(_SYMM_WORKSPACES)
+        _SYMM_WORKSPACES.clear()
+    logger.info("[a2a_permute] Released %d symmetric-memory workspace(s)", count)
 
 
 # ---------------------------------------------------------------------------
