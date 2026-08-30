@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -63,9 +64,15 @@ def test_workspace_reuses_peak_capacity_across_shapes(monkeypatch) -> None:
     allocations: list[_FakeAllocation] = []
     all_reduce_calls: list[object] = []
     synchronize_calls: list[torch.device] = []
+    stream_id = [1]
     a2a_permute._SYMM_WORKSPACES.clear()
 
     monkeypatch.setattr(a2a_permute.torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        a2a_permute.torch.cuda,
+        "current_stream",
+        lambda _device: SimpleNamespace(cuda_stream=stream_id[0]),
+    )
     monkeypatch.setattr(a2a_permute, "_resolve_process_group", lambda _name: object())
     monkeypatch.setattr(a2a_permute.torch, "ones", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(
@@ -100,6 +107,10 @@ def test_workspace_reuses_peak_capacity_across_shapes(monkeypatch) -> None:
     assert len(a2a_permute._SYMM_WORKSPACES) == 1
     assert len(all_reduce_calls) == 1
     assert synchronize_calls == [device, device]
+
+    stream_id[0] = 2
+    with pytest.raises(RuntimeError, match="single CUDA stream"):
+        a2a_permute._get_symm_buffer((1, 4), torch.float16, device, "group")
 
     a2a_permute.clear_a2a_permute_workspaces()
     assert not a2a_permute._SYMM_WORKSPACES

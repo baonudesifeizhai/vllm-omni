@@ -44,6 +44,7 @@ class _SymmWorkspace:
     allocation: torch.Tensor
     handle: Any
     capacity_bytes: int
+    stream_id: int
 
 
 # A single grow-only byte workspace per device/process-group. Shape changes
@@ -110,8 +111,11 @@ def _get_symm_buffer(
     device = torch.device(device)
     key = (device, group_name)
     required_bytes = _required_nbytes(symm_shape, dtype)
+    stream_id = torch.cuda.current_stream(device).cuda_stream
     with _WORKSPACE_LOCK:
         workspace = _SYMM_WORKSPACES.get(key)
+        if workspace is not None and workspace.stream_id != stream_id:
+            raise RuntimeError("a2a_permute workspace must be used from a single CUDA stream")
         if workspace is None or workspace.capacity_bytes < required_bytes:
             if torch.cuda.is_current_stream_capturing():
                 capacity = 0 if workspace is None else workspace.capacity_bytes
@@ -135,6 +139,7 @@ def _get_symm_buffer(
                 allocation=allocation,
                 handle=handle,
                 capacity_bytes=required_bytes,
+                stream_id=stream_id,
             )
             _SYMM_WORKSPACES[key] = workspace
         return workspace.handle.get_buffer(workspace.handle.rank, symm_shape, dtype)
