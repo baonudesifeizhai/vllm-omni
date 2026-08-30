@@ -14,14 +14,17 @@ from vllm_omni.diffusion.distributed import a2a_permute
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def test_jit_build_includes_cuda_headers_from_nvidia_wheels(tmp_path, monkeypatch) -> None:
+def test_jit_build_uses_component_headers_without_shadowing_cuda_toolkit(tmp_path, monkeypatch) -> None:
     cu13_include = tmp_path / "nvidia" / "cu13" / "include"
+    cusparse_include = tmp_path / "nvidia" / "cusparse" / "include"
     nccl_include = tmp_path / "nvidia" / "nccl" / "include"
     nccl_lib = tmp_path / "nvidia" / "nccl" / "lib" / "libnccl.so.2"
     cu13_include.mkdir(parents=True)
+    cusparse_include.mkdir(parents=True)
     nccl_include.mkdir(parents=True)
     nccl_lib.parent.mkdir(parents=True)
-    (cu13_include / "cusparse.h").touch()
+    (cu13_include / "cuda.h").touch()
+    (cusparse_include / "cusparse.h").touch()
     (nccl_include / "nccl.h").touch()
     nccl_lib.touch()
 
@@ -37,7 +40,7 @@ def test_jit_build_includes_cuda_headers_from_nvidia_wheels(tmp_path, monkeypatc
 
     a2a_permute.ensure_a2a_permute_available()
 
-    assert set(load_kwargs["extra_include_paths"]) == {str(cu13_include), str(nccl_include)}
+    assert set(load_kwargs["extra_include_paths"]) == {str(cusparse_include), str(nccl_include)}
     assert load_kwargs["extra_ldflags"] == [str(nccl_lib)]
 
 

@@ -68,6 +68,12 @@ def _ensure_built() -> None:
         site_packages = sysconfig.get_paths()["purelib"]
         nvidia_root = os.path.join(site_packages, "nvidia")
         include_paths = glob.glob(os.path.join(nvidia_root, "*", "include"))
+        # cpp_extension adds CUDA_HOME/include itself. Do not put a separately
+        # packaged CUDA toolkit include directory ahead of it: the wheel and
+        # system nvcc may have different minor versions, and CCCL rejects a
+        # compiler/header mismatch. Keep component headers such as NCCL,
+        # cuSPARSE, and cuDNN, which are not supplied by every CUDA toolkit.
+        include_paths = [path for path in include_paths if not os.path.isfile(os.path.join(path, "cuda.h"))]
         nccl_libs = glob.glob(os.path.join(nvidia_root, "nccl", "lib", "libnccl.so*"))
         if not nccl_libs:
             raise RuntimeError("a2a_permute: could not locate nvidia-nccl libnccl.so")
@@ -142,6 +148,12 @@ def _get_symm_buffer(
                 stream_id=stream_id,
             )
             _SYMM_WORKSPACES[key] = workspace
+        # get_buffer(rank) returns a peer-mapping alias even for the local
+        # rank.  Passing that alias back to SymmetricMemory.rendezvous() in the
+        # C++ op fails allocation lookup because it is not the pointer returned
+        # by symm_mem.empty().  Use a typed view of the original local
+        # allocation; the handle is retained to keep the symmetric window and
+        # peer mappings alive for the kernel.
         return workspace.allocation[:required_bytes].view(dtype).view(symm_shape)
 
 
