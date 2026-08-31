@@ -142,12 +142,6 @@ def _get_symm_buffer(
                 stream_id=stream_id,
             )
             _SYMM_WORKSPACES[key] = workspace
-        # get_buffer(rank) returns a peer-mapping alias even for the local
-        # rank.  Passing that alias back to SymmetricMemory.rendezvous() in the
-        # C++ op fails allocation lookup because it is not the pointer returned
-        # by symm_mem.empty().  Use a typed view of the original local
-        # allocation; the handle is retained to keep the symmetric window and
-        # peer mappings alive for the kernel.
         return workspace.allocation[:required_bytes].view(dtype).view(symm_shape)
 
 
