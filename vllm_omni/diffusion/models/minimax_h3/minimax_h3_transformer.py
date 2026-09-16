@@ -10,11 +10,11 @@ layout.
 from __future__ import annotations
 
 import math
-import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+import regex as re
 import torch
 import torch.nn as nn
 from cache_dit import ForwardPattern
