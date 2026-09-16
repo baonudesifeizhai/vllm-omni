@@ -31,6 +31,7 @@ complete ``[seq, 5120]`` hidden state.
 from __future__ import annotations
 
 import itertools
+import json
 import re
 from collections.abc import Iterable
 from typing import Any
@@ -48,12 +49,13 @@ from vllm_omni.diffusion.offloader.module_residency import (
     BoundedAllocatorCache,
     PinnedModuleStager,
 )
+from vllm_omni.quantization import build_quant_config
 
 MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER = 50
 MINIMAX_H3_QWEN3VL_HIDDEN_DIM = 5120
 
 MINIMAX_H3_TEXT_ENCODER_QUANT_MAPPER = WeightsMapper(
-    orig_to_new_prefix={"model.language_model": "text_model"},
+    orig_to_new_prefix={"model.language_model": "text_encoder.text_model"},
 )
 
 logger = init_logger(__name__)
@@ -176,6 +178,8 @@ class MiniMaxH3Qwen3VLMergedColumnParallelLinear(LinearBase):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
+        self.group = group
+        self.intermediate_size = intermediate_size
         tp_rank, tp_size = _tp_range(group)
         assert intermediate_size % tp_size == 0, (
             f"intermediate_size {intermediate_size} must be divisible by text_encoder_tp_size {tp_size}"
@@ -191,29 +195,8 @@ class MiniMaxH3Qwen3VLMergedColumnParallelLinear(LinearBase):
             prefix=prefix,
             disable_tp=True,
         )
-        self.quant_method.create_weights(
-            self,
-            input_size_per_partition=input_size,
-            output_partition_sizes=[
-                self.intermediate_size_per_partition,
-                self.intermediate_size_per_partition,
-            ],
-            input_size=input_size,
-            output_size=2 * intermediate_size,
-            params_dtype=dtype,
-            weight_loader=self.weight_loader,
-        )
         self._tp_rank = tp_rank
         self._tp_size = tp_size
-        super().__init__(
-            input_size=input_size,
-            output_size=2 * intermediate_size,
-            params_dtype=dtype,
-            quant_config=quant_config,
-            prefix=prefix,
-            return_bias=False,
-            disable_tp=True,
-        )
         _create_linear_weights(
             self,
             input_size_per_partition=input_size,
@@ -266,6 +249,10 @@ class MiniMaxH3Qwen3VLQKVParallelLinear(LinearBase):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
+        self.group = group
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         tp_rank, tp_size = _tp_range(group)
         assert num_heads % tp_size == 0, (
@@ -289,32 +276,14 @@ class MiniMaxH3Qwen3VLQKVParallelLinear(LinearBase):
             prefix=prefix,
             disable_tp=True,
         )
-        self.quant_method.create_weights(
-            self,
-            input_size_per_partition=hidden_size,
-            output_partition_sizes=[q_local, kv_local, kv_local],
-            input_size=hidden_size,
-            output_size=output_size,
-            params_dtype=dtype,
-            weight_loader=self.weight_loader,
-        )
         self._tp_rank = tp_rank
         self._tp_size = tp_size
-        super().__init__(
-            input_size=hidden_size,
-            output_size=(num_heads + 2 * num_kv_heads) * head_dim,
-            params_dtype=dtype,
-            quant_config=quant_config,
-            prefix=prefix,
-            return_bias=False,
-            disable_tp=True,
-        )
         _create_linear_weights(
             self,
             input_size_per_partition=hidden_size,
             output_partition_sizes=[q_local, kv_local, kv_local],
             input_size=hidden_size,
-            output_size=(num_heads + 2 * num_kv_heads) * head_dim,
+            output_size=output_size,
             dtype=dtype,
         )
 
@@ -391,6 +360,7 @@ class MiniMaxH3Qwen3VLRowParallelLinear(LinearBase):
         input_size: int,
         output_size: int,
         dtype: torch.dtype,
+        input_is_parallel: bool = True,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
@@ -409,26 +379,8 @@ class MiniMaxH3Qwen3VLRowParallelLinear(LinearBase):
             prefix=prefix,
             disable_tp=True,
         )
-        self.quant_method.create_weights(
-            self,
-            input_size_per_partition=self.input_size_per_partition,
-            output_partition_sizes=[output_size],
-            input_size=input_size,
-            output_size=output_size,
-            params_dtype=dtype,
-            weight_loader=self.weight_loader,
-        )
         self._tp_rank = tp_rank
         self._tp_size = tp_size
-        super().__init__(
-            input_size=input_size,
-            output_size=output_size,
-            params_dtype=dtype,
-            quant_config=quant_config,
-            prefix=prefix,
-            return_bias=False,
-            disable_tp=True,
-        )
         _create_linear_weights(
             self,
             input_size_per_partition=self.input_size_per_partition,
@@ -439,10 +391,15 @@ class MiniMaxH3Qwen3VLRowParallelLinear(LinearBase):
         )
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
-        if isinstance(self.quant_method, UnquantizedLinearMethod):
-            output_parallel = F.linear(input_, self.weight)
+        if self.input_is_parallel:
+            input_parallel = input_
         else:
-            output_parallel = self.quant_method.apply(self, input_)
+            split_input = input_.split(self.input_size_per_partition, dim=-1)
+            input_parallel = split_input[self._tp_rank].contiguous()
+        if isinstance(self.quant_method, UnquantizedLinearMethod):
+            output_parallel = F.linear(input_parallel, self.weight)
+        else:
+            output_parallel = self.quant_method.apply(self, input_parallel)
         if self._tp_size > 1:
             # Reduce in fp32: the reference path accumulates the full (K=8192)
             # dot product inside a single cuBLAS GEMM before rounding to bf16.
@@ -451,7 +408,7 @@ class MiniMaxH3Qwen3VLRowParallelLinear(LinearBase):
             output_dtype = output_parallel.dtype
             output_parallel = output_parallel.float()
             self.group.all_reduce(output_parallel)
-            output_parallel = output_parallel.to(self.output_dtype)
+            output_parallel = output_parallel.to(output_dtype)
         return output_parallel
 
     def weight_loader(
@@ -1250,7 +1207,7 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
             config.text_config,
             MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER,
             dtype,
-            quant_config=quant_config,
+            quant_config=self.quant_config,
         )
         self.text_model.to(dtype=dtype)
         logger.info(

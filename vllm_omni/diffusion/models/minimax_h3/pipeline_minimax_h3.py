@@ -15,12 +15,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
+import regex as re
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 from transformers import Qwen2TokenizerFast, Qwen3VLProcessor
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.models.utils import WeightsMapper
 
 from vllm_omni.diffusion import envs
 from vllm_omni.diffusion.cache.cachedit import (
@@ -260,6 +262,28 @@ _MINIMAX_H3_QUANT_IGNORE_MAPPER = _MINIMAX_H3_TRANSFORMER_MAPPER | WeightsMapper
         ".ff": ".mlp",
     }
 )
+
+
+def _remap_minimax_h3_checkpoint_key(key: str) -> str | tuple[str, str] | None:
+    """Map a Diffusers H3 key while preserving packed-loader routing."""
+    component, separator, source = key.partition(".")
+    if not separator or component not in {"transformer", "transformers_ref"}:
+        return None
+
+    target = _MINIMAX_H3_TRANSFORMER_MAPPER.apply_list([source])[0]
+    output = target
+
+    qkv_match = re.search(r"\.attn\.to_([qkv])\.(weight|weight_scale|input_scale)$", target)
+    if qkv_match:
+        shard_id, suffix = qkv_match.groups()
+        stem = f"{target[: qkv_match.start()]}.attn.qkv_proj"
+        target, output = f"{stem}.{suffix}", f"{stem}.to_{shard_id}.{suffix}"
+    elif ".ff.net.0.proj." in source and target.endswith((".weight", ".weight_scale")):
+        stem, _, suffix = target.rpartition(".")
+        output = f"{stem}.diffusers_{suffix}"
+
+    target, output = f"{component}.{target}", f"{component}.{output}"
+    return target if target == output else (target, output)
 
 
 _MINIMAX_H3_DENOISE_INPUT_KEYS = (
@@ -605,6 +629,12 @@ class MiniMaxH3Pipeline(
     # Only distilled releases pin a schedule, so the default keeps the legacy
     # uniform path available to partially constructed pipelines.
     _base_schedule_by_partition: ClassVar[Mapping[str, DMD2SigmaSchedule | None]] = {}
+    hf_to_vllm_mapper = _MINIMAX_H3_QUANT_IGNORE_MAPPER
+    packed_modules_mapping: ClassVar[dict[str, list[str]]] = {
+        "qkv_proj": ["to_q", "to_k", "to_v"],
+        "fc1": ["gate_proj", "up_proj"],
+    }
+    remap_checkpoint_key = staticmethod(_remap_minimax_h3_checkpoint_key)
     # Set from --lora-path during construction; absent means no FastH3 adapter.
     _fasth3: FastH3WeightFusion | None = None
 
