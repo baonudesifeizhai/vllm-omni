@@ -53,11 +53,13 @@ from vllm_omni.diffusion.model_loader.host_weights.tensor_layout import (
 from vllm_omni.diffusion.models.host_weight_contract import FinalLayoutModelContract
 from vllm_omni.host_weight_runtime import (
     AdaptationIdentity,
+    FailureCode,
     HostWeightLease,
     HostWeightRuntime,
     HostWeightRuntimeConfig,
     ProductionPolicy,
     ResolutionOutcome,
+    ResolutionStage,
     RuntimeMode,
     StorageDomainPolicy,
     TensorFileWriter,
@@ -384,6 +386,65 @@ def test_tensor_ranges_resolve_exact_safetensors_payload_bytes(tmp_path: Path) -
             expected = tensor.contiguous().view(torch.uint8).numpy().tobytes()
             assert nbytes == len(expected)
             assert handle.read(nbytes) == expected
+
+
+def test_fp8_producer_rejects_source_changed_before_production(tmp_path: Path) -> None:
+    model, _, context, checkpoint_plan = _prepared_fp8_model(tmp_path)
+    checkpoint = Path(next(iter(checkpoint_plan.bindings.values())).file_path)
+    checkpoint.write_bytes(b"source-changed-before-fp8-production")
+    producer = _CPUFinalLayoutFP8Producer(
+        context,
+        model,
+        (("transformer", model.transformer),),
+        checkpoint_plan,
+        device=torch.device("cpu"),
+    )
+    producer._write_fp8_weight = lambda *_args, **_kwargs: pytest.fail(  # type: ignore[method-assign]
+        "production started after the source snapshot changed"
+    )
+    store_root = tmp_path / "store"
+
+    result = _runtime(store_root).resolve(context.identity, producer=producer)
+
+    failure = result.report.attempts[-1].failure
+    assert result.report.outcome is ResolutionOutcome.FAILED
+    assert result.lease is None
+    assert failure is not None
+    assert failure.stage is ResolutionStage.CANONICAL_LOADING
+    assert failure.code is FailureCode.CANONICAL_SOURCE_FAILED
+    assert failure.details.to_value() == {"final_layout_code": "source_changed"}
+    assert not (store_root / "artifacts" / context.identity.key).exists()
+
+
+def test_fp8_producer_rechecks_source_before_publication(tmp_path: Path) -> None:
+    model, _, context, checkpoint_plan = _prepared_fp8_model(tmp_path)
+    checkpoint = Path(next(iter(checkpoint_plan.bindings.values())).file_path)
+
+    class SourceMutatingProducer(_CPUFinalLayoutFP8Producer):
+        def _write_fp8_weight(self, output: TensorFileWriter, record: RuntimeTensorTarget) -> torch.Tensor:
+            scale = super()._write_fp8_weight(output, record)
+            checkpoint.write_bytes(b"source-changed-during-fp8-production")
+            return scale
+
+    producer = SourceMutatingProducer(
+        context,
+        model,
+        (("transformer", model.transformer),),
+        checkpoint_plan,
+        device=torch.device("cpu"),
+    )
+    store_root = tmp_path / "store"
+
+    result = _runtime(store_root).resolve(context.identity, producer=producer)
+
+    failure = result.report.attempts[-1].failure
+    assert result.report.outcome is ResolutionOutcome.FAILED
+    assert result.lease is None
+    assert failure is not None
+    assert failure.stage is ResolutionStage.CANONICAL_LOADING
+    assert failure.code is FailureCode.CANONICAL_SOURCE_FAILED
+    assert failure.details.to_value() == {"final_layout_code": "source_changed"}
+    assert not (store_root / "artifacts" / context.identity.key).exists()
 
 
 def test_fp8_producer_cold_warm_sharding_determinism_and_restore_rejection(tmp_path: Path) -> None:

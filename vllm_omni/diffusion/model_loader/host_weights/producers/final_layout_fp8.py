@@ -111,6 +111,7 @@ class FinalLayoutFP8Producer:
             raise final_layout_producer_error(exc) from exc
 
     def _produce(self, writer: ArtifactWriter) -> ProductionMetadata:
+        self._context.ensure_sources_unchanged()
         records = collect_final_layout_targets(
             self._pipeline,
             self._dit_modules,
@@ -141,6 +142,7 @@ class FinalLayoutFP8Producer:
 
         if generated_scales:
             raise ValueError(f"unwritten FP8 scales: {sorted(generated_scales)[:5]}")
+        self._context.ensure_sources_unchanged()
         return ProductionMetadata(
             producer_schema=FINAL_LAYOUT_FP8_MANIFEST_SCHEMA,
             restorer_schema=FINAL_LAYOUT_TENSOR_RESTORER_SCHEMA,
