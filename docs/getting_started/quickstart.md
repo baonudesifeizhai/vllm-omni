@@ -18,23 +18,28 @@ For installation on GPU from source:
 uv venv --python 3.12 --seed
 source .venv/bin/activate
 
-# On CUDA
-uv pip install vllm==0.28.0 --torch-backend=auto
-
-# On ROCm
-uv pip install vllm==0.28.0+rocm723 --extra-index-url https://wheels.vllm.ai/rocm/0.28.0/rocm723
+# On CUDA (Linux x86_64, CUDA 13.0)
+uv pip install --torch-backend=cu130 \
+  "vllm @ https://wheels.vllm.ai/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm-0.32.0-cp38-abi3-manylinux_2_28_x86_64.whl"
 
 git clone https://github.com/vllm-project/vllm-omni.git
 cd vllm-omni
 uv pip install -e .
 ```
 
-For additional installation methods — please see the [installation guide](installation/README.md).
+These commands install the vLLM 0.32.0 release-branch wheel at the exact
+tested tag commit, with PyTorch 2.13.0 and CUDA 13.0. The
+[vLLM 0.32.0 release](https://github.com/vllm-project/vllm/releases/tag/v0.32.0),
+PyPI wheel and matching ROCm wheel are published. ROCm runtime validation
+with this checkout remains pending. A vLLM-Omni 0.32 wheel is not yet
+published; install Omni from source as shown above. For published
+vLLM-Omni wheels and additional installation methods, see the
+[installation guide](installation/README.md).
 
 !!! note
     It is important to install the same major & minor version of vLLM and vLLM Omni, otherwise things may not work as expected. If the versions are misaligned, you will see a warning when you import vLLM Omni.
 
-    If you are seeing strange behavior with the `vllm` command not handling the `--omni` flag correctly, you most likely have a version mismatch with vLLM < `0.28.0` and vLLM Omni `0.28.0`, as vLLM Omni no longer hijacks the vLLM entrypoint. Updating vLLM should resolve this issue.
+    If the `vllm` command does not handle `--omni` correctly, verify that the active environment contains the matching vLLM release and vLLM-Omni installation. vLLM owns the CLI entrypoint and delegates `--omni` requests to vLLM-Omni.
 
 ## Offline Inference
 
@@ -91,7 +96,7 @@ if __name__ == "__main__":
 
 For more usages, please refer to [offline inference](../user_guide/examples/offline_inference/qwen2_5_omni.md)
 
-## Online Serving with OpenAI-Completions API
+## Online Serving with the API Server
 
 Text-to-image generation quickstart with vLLM-Omni:
 
@@ -100,20 +105,16 @@ vllm serve Tongyi-MAI/Z-Image-Turbo --omni --port 8091
 ```
 
 ```bash
-curl -s http://localhost:8091/v1/chat/completions \
+curl -s http://localhost:8091/v1/images/generations \
   -H "Content-Type: application/json" \
   -d '{
-    "messages": [
-      {"role": "user", "content": "a cup of coffee on the table"}
-    ],
-    "extra_body": {
-      "height": 1024,
-      "width": 1024,
-      "num_inference_steps": 50,
-      "guidance_scale": 4.0,
-      "seed": 42
-    }
-  }' | jq -r '.choices[0].message.content[0].image_url.url' | cut -d',' -f2 | base64 -d > coffee.png
+    "prompt": "a cup of coffee on the table",
+    "size": "1024x1024",
+    "response_format": "b64_json",
+    "seed": 42
+  }' | jq -r '.data[0].b64_json' | base64 -d > coffee.png
 ```
 
-For more details, please refer to [online serving](../user_guide/examples/online_serving/text_to_image.md).
+See the [API Server guide](../serving/README.md) to choose an endpoint. For
+model-specific details, refer to the [text-to-image online serving
+example](../user_guide/examples/online_serving/text_to_image.md).

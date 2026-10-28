@@ -292,6 +292,14 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
             },
         ],
         "platforms": {
+            "rocm": {
+                # ROCm documentation examples request two cards. Share the
+                # Talker's card with Code2Wav and reserve its DiT workspace.
+                "stages": [
+                    {"stage_id": 1, "gpu_memory_utilization": 0.3},
+                    {"stage_id": 2, "devices": "1"},
+                ],
+            },
             "xpu": {
                 "stages": [
                     {
@@ -376,6 +384,40 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
                         "skip_mm_profiling": True,
                         "devices": "5",
                         "default_sampling_params": {"max_tokens": 2000},
+                    },
+                ],
+            },
+        },
+    },
+    "qwen3_omni_moe_colocate_async": {
+        "base_config": "qwen3_omni_moe_thinking.yaml",
+        "stages": [
+            {
+                "stage_id": 0,
+                "enable_sleep_mode": True,
+                "enforce_eager": True,
+                "trust_remote_code": True,
+                "tensor_parallel_size": 1,
+                "devices": "0",
+                "max_num_seqs": 1,
+                "max_model_len": 8192,
+                "max_num_batched_tokens": 8192,
+                "enable_prefix_caching": False,
+                "skip_mm_profiling": True,
+            },
+        ],
+        "platforms": {
+            "rocm": {
+                "stages": [
+                    {
+                        "stage_id": 0,
+                        # This control-plane test needs only 8K tokens. On MI300,
+                        # percentage sizing attempted a ~125 GiB KV allocation
+                        # after the 64.5 GiB model load and then failed while
+                        # allocating the cache. Keep CUDA's existing sizing and
+                        # give only ROCm a bounded cache with ample headroom.
+                        "gpu_memory_utilization": None,
+                        "kv_cache_memory_bytes": 2 * 1024**3,
                     },
                 ],
             },

@@ -21,6 +21,13 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 pytestmark = [pytest.mark.diffusion, pytest.mark.core_model, pytest.mark.cpu]
 
 
+def test_coalesced_events_keep_their_reporting_chunk():
+    output = DiffusionOutput(chunk_index=4, coalesced_event_ids=["superseded"])
+    metadata = output_formatter._stream_metadata_from_diffusion_output(output)
+    assert metadata["coalesced_event_ids"] == ["superseded"]
+    assert metadata["generation_chunk_index"] == 4
+
+
 def _request(
     prompt: str | dict | None = None,
     *,
@@ -443,3 +450,14 @@ def test_format_empty_diffusion_outputs_preserves_empty_response_shape() -> None
     assert [result.prompt for result in results] == ["prompt-0"]
     assert [result.images for result in results] == [[]]
     assert [result.metrics for result in results] == [{}]
+
+
+def test_format_empty_diffusion_outputs_preserves_custom_output() -> None:
+    [result] = format_empty_diffusion_outputs(
+        _request("prompt-0"),
+        finished=False,
+        custom_output={"lifecycle": "started"},
+    )
+
+    assert result.custom_output == {"lifecycle": "started"}
+    assert result.finished is False
